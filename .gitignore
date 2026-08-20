@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Checkpoints and results (large generated files)
+checkpoints/
+results/
+
+# Logs and temporary data
+*.log
+*.tmp
+/tmp/lm2data/
+/tmp/lm3data/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
