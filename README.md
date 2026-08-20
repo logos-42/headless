@@ -1,12 +1,12 @@
-# LMT-twister
+# headless
 
 A production-grade **continuously learning model** system built on SSM (State Space Model) + OML (Optimization-based Meta-Learning) with autonomous data exploration.
 
-> Headless fork of the LMT-twister research project. Established 2026-08-20.
+> Formerly known as LMT-twister. Established 2026-08-20.
 
 ## Continuous Learning
 
-LMT-twister models learn continuously during runtime without forgetting previously acquired knowledge. The system demonstrates:
+headless models learn continuously during runtime without forgetting previously acquired knowledge. The system demonstrates:
 
 - **Zero forgetting across domains** — LM2 on wikitext-2 (3 domains, streaming 500 steps/domain): all domains show **positive transfer** after sequential training (A: 0.429→0.472, B: 0.478→0.488, C: 0.493).
 - **Cross-domain robustness** — LM3 on en→zh→code (BPE, 3 domains): naive sequential training causes catastrophic forgetting (-10.4pp on English), proving **true continuous learning requires mechanisms** (Replay +5.0pp, correct OML via inner-loop adaptation).
