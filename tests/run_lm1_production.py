@@ -39,6 +39,30 @@ N_RESP = 4
 CKPT_DIR = ROOT / 'checkpoints'
 RESULT_DIR = ROOT / 'results'
 
+
+# ============================================================
+# Replay Buffer (抗遗忘：存储已见任务样本，定期回放)
+# ============================================================
+class ReplayBuffer:
+    def __init__(self, capacity=2000):
+        self.capacity = capacity
+        self.buffer = []
+        self.pos = 0
+
+    def add(self, ctx, tgt, task_name):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((ctx, tgt, task_name))
+        else:
+            self.buffer[self.pos] = (ctx, tgt, task_name)
+            self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, n):
+        return random.sample(self.buffer, min(n, len(self.buffer)))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
 # ============================================================
 # S4 价值函数提议器 (自主探索数据生成)
 # ============================================================
@@ -204,7 +228,9 @@ def migrate_eval(learner, d_model, d_state, n_layers, s5_tasks, s5_unseen):
 # ============================================================
 class LM1System:
     def __init__(self, d_model=192, d_state=12, n_layers=2,
-                 iters_per_round=40, n_prop=2, seed=42, proposer='value'):
+                 iters_per_round=40, n_prop=2, seed=42, proposer='value',
+                 use_replay=True, replay_ratio=0.3, replay_capacity=2000,
+                 causal_rl_lr=0.3):
         self.d_model = d_model
         self.d_state = d_state
         self.n_layers = n_layers
@@ -212,6 +238,9 @@ class LM1System:
         self.n_prop = n_prop
         self.seed = seed
         self.proposer_kind = proposer
+        self.use_replay = use_replay
+        self.replay_ratio = replay_ratio
+        self.causal_rl_lr = causal_rl_lr
         self.round = 0
         self.history = []
         # 数据: S4 seen/unseen + S5 迁移集
@@ -235,6 +264,11 @@ class LM1System:
         self.s5_tasks = make_s5_tasks(seed=42)
         self.s5_unseen = [n for n in self.s5_tasks
                           if not self.s5_tasks[n]['seen']]
+        # Replay buffer（抗遗忘）
+        self.replay_buffer = ReplayBuffer(capacity=replay_capacity)
+        self.replay_task_names = list(self.train_names)
+        # 评估反馈记录（因果闭环）
+        self._prop_eval_acc = {}
         self._init_model()
 
     def _init_model(self):
@@ -251,6 +285,10 @@ class LM1System:
             from hibs_lnn.causal import CausalProposer
             self.proposer = CausalProposer(learned, k=self.n_prop,
                                            seed=self.seed)
+        elif self.proposer_kind == 'causal_rl':
+            from hibs_lnn.causal import CausalRLAgent
+            self.proposer = CausalRLAgent(learned, k=self.n_prop,
+                                          seed=self.seed, lr=self.causal_rl_lr)
         else:
             self.proposer = S4ValueProposer(learned, k=self.n_prop)
         # 探索任务槽
@@ -258,7 +296,7 @@ class LM1System:
 
     # ── 探索: 价值函数提议 → 世界生成 (自主数据生成) ──
     def explore(self):
-        ps = self.proposer.propose(n=self.n_prop)
+        ps = self._propose_unified(n=self.n_prop)
         self._prop_keys = []
         for i, p in enumerate(ps):
             key = '__p%d' % i
@@ -268,23 +306,46 @@ class LM1System:
                 self._prop_keys.append(key)
         return len(self._prop_keys)
 
+    def _propose_unified(self, n=None):
+        if hasattr(self.proposer, 'propose'):
+            return self.proposer.propose(n=n)
+        elif hasattr(self.proposer, 'step'):
+            out = []
+            for _ in range(n or self.n_prop):
+                r = self.proposer.step()
+                if r is not None:
+                    out.append(r['perm'])
+            return out
+        return []
+
     def cleanup_props(self):
         for k in self._prop_keys:
             self.tasks.pop(k, None)
         self._prop_keys = []
 
-    # ── 学习: OML 训练 ──
+    def _sample_replay_names(self, n):
+        if not self.replay_task_names:
+            return []
+        return random.sample(self.replay_task_names,
+                             min(n, len(self.replay_task_names)))
+
+    # ── 学习: OML 训练 + Replay ──
     def learn(self):
         t0 = time.time()
         losses = []
         base = self.iters_per_round
         for it in range(base):
             self.learner.meta_iters = self.round * 1000 + it
-            self.explore()          # 每步探索注入 (持续自主生成)
+            self.explore()
+            replay_names = []
+            if self.use_replay and (it + 1) % max(1, base // 4) == 0:
+                n_rep = max(1, int(base * self.replay_ratio / 4))
+                replay_names = self._sample_replay_names(n_rep)
             loss = oml_step(self.learner, self.tasks, self.train_names,
-                            self.round * 1000 + it, extra=self._prop_keys)
-            self.cleanup_props()
+                            self.round * 1000 + it,
+                            extra=self._prop_keys + replay_names)
             losses.append(loss)
+        self.cleanup_props()
         return sum(losses) / len(losses), time.time() - t0
 
     # ── 评估: S4 unseen + 遗忘 + S5 迁移 ──
@@ -324,8 +385,14 @@ class LM1System:
             'rln': self.rln.state_dict(),
             'pln': self.pln.state_dict(),
             'head': self.learner.head.state(),
-            'proposer_freq': self.proposer.freq,
+            'proposer_freq': getattr(self.proposer, 'freq', {}),
             'history': self.history,
+            'proposer_kind': self.proposer_kind,
+            'use_replay': self.use_replay,
+            'replay_ratio': self.replay_ratio,
+            'replay_task_names': self.replay_task_names,
+            'replay_buffer': [(c.cpu(), t.cpu(), n)
+                              for c, t, n in self.replay_buffer.buffer],
         }, path)
         return path
 
@@ -336,11 +403,18 @@ class LM1System:
         self.d_state = ck['d_state']
         self.n_layers = ck['n_layers']
         self.history = ck['history']
+        self.proposer_kind = ck.get('proposer_kind', 'value')
+        self.use_replay = ck.get('use_replay', True)
+        self.replay_ratio = ck.get('replay_ratio', 0.3)
+        self.replay_task_names = ck.get('replay_task_names',
+                                        list(self.train_names))
         self._init_model()
         self.rln.load_state_dict(ck['rln'])
         self.pln.load_state_dict(ck['pln'])
         self.learner.head.load_state(ck['head'])
         self.proposer.freq = ck['proposer_freq']
+        for ctx, tgt, name in ck.get('replay_buffer', []):
+            self.replay_buffer.add(ctx, tgt, name)
         return self.round
 
     # ── 达标检测: unseen ≥ 0.115 且 c4 ≥ 0.09 且遗忘 < 0.05, 连续 2 轮
@@ -358,8 +432,40 @@ class LM1System:
         return ok and streak >= 1
 
     def _after_evaluate(self, rec):
-        """每轮评估后的回调钩子（子类可重写，用于因果反馈等）。默认无操作。"""
+        self._prop_eval_acc = {}
+        for k in list(self._prop_keys):
+            if k in self.tasks:
+                try:
+                    acc = self._eval_task_acc(k, k_adapt=10)
+                    self._prop_eval_acc[k] = acc
+                except Exception:
+                    pass
+        if self.proposer_kind == 'causal' and self._prop_eval_acc:
+            for key, acc in self._prop_eval_acc.items():
+                t = self.tasks.get(key)
+                if t and t.get('perm') is not None:
+                    try:
+                        self.proposer.observe(t['perm'], acc)
+                    except Exception:
+                        pass
+        for k in self._prop_keys:
+            if k in self.tasks and k not in self.replay_task_names:
+                self.replay_task_names.append(k)
+                for ctx, tgt in self.tasks[k].get('support', []):
+                    self.replay_buffer.add(ctx, tgt, k)
+                for ctx, tgt in self.tasks[k].get('query', []):
+                    self.replay_buffer.add(ctx, tgt, k)
+        self.cleanup_props()
         return rec
+
+    def _eval_task_acc(self, task_name, k_adapt=20):
+        t = self.tasks[task_name]
+        with torch.no_grad():
+            m = self.learner._define(t, detach=True)
+        W = self.learner.adapt_graph(t['support'], K=k_adapt, m=m)
+        with torch.no_grad():
+            acc = self.learner._metric([w.detach() for w in W], t, m=m)[1]
+        return acc
 
     # ── 主循环 ──
     def run(self, rounds, with_migrate_every=2):
@@ -441,14 +547,24 @@ def main():
     ap.add_argument('--n-layers', type=int, default=2)
     ap.add_argument('--n-prop', type=int, default=2)
     ap.add_argument('--proposer', type=str, default='value',
-                    choices=['value', 'causal'])
+                    choices=['value', 'causal', 'causal_rl'])
     ap.add_argument('--resume', type=str, default=None)
     ap.add_argument('--migrate-every', type=int, default=2)
+    ap.add_argument('--replay', action='store_true', default=True,
+                    help='启用 replay buffer (默认开启)')
+    ap.add_argument('--no-replay', dest='replay', action='store_false',
+                    help='关闭 replay buffer')
+    ap.add_argument('--replay-ratio', type=float, default=0.3,
+                    help='每轮 replay 任务占比 (0~1)')
+    ap.add_argument('--causal-rl-lr', type=float, default=0.3,
+                    help='CausalRLAgent 学习率 (仅 proposer=causal_rl 时生效)')
     args = ap.parse_args()
 
     sys = LM1System(d_model=args.d_model, d_state=args.d_state,
                     n_layers=args.n_layers, iters_per_round=args.iters_per_round,
-                    n_prop=args.n_prop, proposer=args.proposer)
+                    n_prop=args.n_prop, proposer=args.proposer,
+                    use_replay=args.replay, replay_ratio=args.replay_ratio,
+                    causal_rl_lr=args.causal_rl_lr)
     if args.resume:
         r0 = sys.resume(args.resume)
         print("恢复自 %s (round %d)" % (args.resume, r0))
