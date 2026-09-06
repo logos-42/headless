@@ -18,11 +18,12 @@ from .discovery import CausalDiscovery, ci_test
 
 class CausalProposer:
     def __init__(self, learned_perms, k=2, seed=0, alpha=0.3,
-                 beta=(1.0, 1.0, 1.0, 0.4), tau=1.0, world=None):
+                 beta=(1.0, 1.0, 1.0, 0.4), beta_f=0.6, tau=1.0, world=None):
         self.learned = list(learned_perms)
         self.k = k
         self.tau = tau
         self.beta = beta
+        self.beta_f = beta_f
         self.seed = seed
         self.world = world or S4WorldSCM(seed=seed)
         self.discovery = CausalDiscovery(self.world, alpha=alpha, seed=seed)
@@ -32,6 +33,9 @@ class CausalProposer:
             self.learned_atoms |= {i for i in range(6)
                                    if self.world.sig_bits(p)[i]}
         self.cands = [p for p in _PERMS24 if p not in self.learned]
+        # 真实反馈：观测到的 (perm -> 实际泛化 acc)，供因果持续学习
+        self.real_obs = {}
+        self._feedback_trace = []
 
     # ---- 组件 1：生成元因果新颖性 ----
     def causal_novelty(self, p):
@@ -71,12 +75,38 @@ class CausalProposer:
                                             do_perm=p)
         return max(0.0, y_cf - y_obs)
 
+    # ---- 真实反馈：因果持续学习（用 LM1 实际评估 acc 驱动）----
+    def observe(self, perm, acc):
+        """记录一个 perm 的实际泛化表现，作为因果模型的真实世界观测。"""
+        self.real_obs[perm] = float(acc)
+        self._feedback_trace.append((perm, float(acc)))
+
+    def feedback_value(self, p):
+        """基于真实反馈的因果价值。
+
+        若 p 覆盖的生成元原子，在"已观测但表现低"的 unseen 中出现的越多，
+        则覆盖 p 越能补齐短板（因果缺口大）→ 高价值。这反映模型真实盲区。
+        """
+        if not self.real_obs:
+            return 0.0
+        atoms_p = {i for i in range(6) if self.world.sig_bits(p)[i]}
+        gap = 0.0; cnt = 0
+        for q, acc in self.real_obs.items():
+            shared = atoms_p & {i for i in range(6)
+                                if self.world.sig_bits(q)[i]}
+            if shared:
+                # acc 越低 = 缺口越大；共享原子越多 = 覆盖 p 越对症
+                gap += (1.0 - acc) * (len(shared) / max(1.0, len(atoms_p)))
+                cnt += 1
+        return gap / max(1, cnt)
+
     def value(self, p):
         b1, b2, b3, b4 = self.beta
         v = (b1 * self.causal_novelty(p)
              + b2 * self.do_effect(p)
              + b3 * self.backdoor_causal()
              + b4 * self.counterfactual_value(p))
+        v += self.beta_f * self.feedback_value(p)   # 真实反馈项（因果持续学习）
         v /= (1 + self.freq.get(p, 0))              # 覆盖惩罚
         return v
 

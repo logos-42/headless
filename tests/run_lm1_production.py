@@ -204,13 +204,14 @@ def migrate_eval(learner, d_model, d_state, n_layers, s5_tasks, s5_unseen):
 # ============================================================
 class LM1System:
     def __init__(self, d_model=192, d_state=12, n_layers=2,
-                 iters_per_round=40, n_prop=2, seed=42):
+                 iters_per_round=40, n_prop=2, seed=42, proposer='value'):
         self.d_model = d_model
         self.d_state = d_state
         self.n_layers = n_layers
         self.iters_per_round = iters_per_round
         self.n_prop = n_prop
         self.seed = seed
+        self.proposer_kind = proposer
         self.round = 0
         self.history = []
         # 数据: S4 seen/unseen + S5 迁移集
@@ -246,7 +247,12 @@ class LM1System:
             n_resp=N_RESP, use_intent=True, use_compose=False,
             use_atoms=False)
         learned = [self.tasks[n]['perm'] for n in self.train_names]
-        self.proposer = S4ValueProposer(learned, k=self.n_prop)
+        if self.proposer_kind == 'causal':
+            from hibs_lnn.causal import CausalProposer
+            self.proposer = CausalProposer(learned, k=self.n_prop,
+                                           seed=self.seed)
+        else:
+            self.proposer = S4ValueProposer(learned, k=self.n_prop)
         # 探索任务槽
         self._prop_keys = []
 
@@ -351,6 +357,10 @@ class LM1System:
                 streak += 1
         return ok and streak >= 1
 
+    def _after_evaluate(self, rec):
+        """每轮评估后的回调钩子（子类可重写，用于因果反馈等）。默认无操作。"""
+        return rec
+
     # ── 主循环 ──
     def run(self, rounds, with_migrate_every=2):
         print("=" * 70)
@@ -368,6 +378,7 @@ class LM1System:
             rec['wall_s'] = round(time.time() - t0, 1)
             self.history.append(rec)
             self._log(rec)
+            self._after_evaluate(rec)
             self.save('latest')
             self.save('round%d' % self.round)
             if self.target_met(rec):
@@ -429,13 +440,15 @@ def main():
     ap.add_argument('--d-state', type=int, default=12)
     ap.add_argument('--n-layers', type=int, default=2)
     ap.add_argument('--n-prop', type=int, default=2)
+    ap.add_argument('--proposer', type=str, default='value',
+                    choices=['value', 'causal'])
     ap.add_argument('--resume', type=str, default=None)
     ap.add_argument('--migrate-every', type=int, default=2)
     args = ap.parse_args()
 
     sys = LM1System(d_model=args.d_model, d_state=args.d_state,
                     n_layers=args.n_layers, iters_per_round=args.iters_per_round,
-                    n_prop=args.n_prop)
+                    n_prop=args.n_prop, proposer=args.proposer)
     if args.resume:
         r0 = sys.resume(args.resume)
         print("恢复自 %s (round %d)" % (args.resume, r0))
