@@ -60,7 +60,7 @@ class LM2System:
             if len(x) == CHUNK and len(y) == CHUNK:
                 yield torch.tensor(x), torch.tensor(y)
 
-    def _eval_chunks(self, text, n=400):
+    def _eval_chunks(self, text, n=100):
         ids = self.tok.encode(text)
         n_avail = len(ids) - CHUNK - 1
         if n_avail <= 0: return []

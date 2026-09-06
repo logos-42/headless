@@ -1,0 +1,143 @@
+{
+  "schema_version": 2,
+  "wiki_root": "/Users/apple/Downloads/headless/docs/wiki",
+  "nodes": [
+    {
+      "id": "README.md",
+      "type": "meta",
+      "label": "README.md",
+      "tags": "",
+      "stage": "",
+      "audience": "",
+      "source_file": "docs/wiki/README.md"
+    },
+    {
+      "id": "SCHEMA.md",
+      "type": "meta",
+      "label": "SCHEMA.md",
+      "tags": "",
+      "stage": "",
+      "audience": "",
+      "source_file": "docs/wiki/SCHEMA.md"
+    },
+    {
+      "id": "causal_lm1_experiment.md",
+      "type": "meta",
+      "label": "LM1 因果持续学习对照实验",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/causal_lm1_experiment.md"
+    },
+    {
+      "id": "causal_stack.md",
+      "type": "meta",
+      "label": "causal 因果技术栈落地",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/causal_stack.md"
+    },
+    {
+      "id": "current-status.md",
+      "type": "meta",
+      "label": "current-status",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/current-status.md"
+    },
+    {
+      "id": "github-and-raw-strategy.md",
+      "type": "meta",
+      "label": "github-and-raw-strategy",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/github-and-raw-strategy.md"
+    },
+    {
+      "id": "index.md",
+      "type": "meta",
+      "label": "index.md",
+      "tags": "",
+      "stage": "",
+      "audience": "",
+      "source_file": "docs/wiki/index.md"
+    },
+    {
+      "id": "log.md",
+      "type": "meta",
+      "label": "log.md",
+      "tags": "",
+      "stage": "",
+      "audience": "",
+      "source_file": "docs/wiki/log.md"
+    },
+    {
+      "id": "project-overview.md",
+      "type": "meta",
+      "label": "project-overview",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/project-overview.md"
+    },
+    {
+      "id": "sources-and-data.md",
+      "type": "meta",
+      "label": "sources-and-data",
+      "tags": "",
+      "stage": "draft",
+      "audience": "public",
+      "source_file": "docs/wiki/sources-and-data.md"
+    }
+  ],
+  "edges": [
+    {
+      "from": "index.md",
+      "to": "log.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "causal_stack.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "causal_lm1_experiment.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "current-status.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "github-and-raw-strategy.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "project-overview.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "sources-and-data.md",
+      "type": "references"
+    }
+  ],
+  "stats": {
+    "node_count": 10,
+    "edge_count": 7,
+    "node_types": {
+      "meta": 10
+    },
+    "edge_types": {
+      "references": 7
+    }
+  }
+}

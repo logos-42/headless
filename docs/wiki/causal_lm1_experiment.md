@@ -1,3 +1,13 @@
+---
+title: LM1 因果持续学习对照实验
+source_hash: abcdef1234567890
+source: LMT-twister
+created: 2026-09-06
+last_confirmed: 2026-09-06
+audience: public
+stage: draft
+---
+
 # LM1 因果持续学习对照实验（legacy：诚实记录）
 
 > 日期 2026-09-06 · `tests/run_lm1_causal.py`

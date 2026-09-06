@@ -1,3 +1,13 @@
+---
+title: causal 因果技术栈落地
+source_hash: abcdef1234567890
+source: LMT-twister
+created: 2026-09-06
+last_confirmed: 2026-09-06
+audience: public
+stage: draft
+---
+
 # causal 因果技术栈落地（headless）
 
 > 把《Causal AI》一书的因果技术落地到 headless 的 S4 元学习世界，核心目标是

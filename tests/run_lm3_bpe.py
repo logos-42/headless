@@ -51,14 +51,20 @@ class BPE:
 
     def encode(self, s):
         ids = [self.base[c] for c in s if c in self.base]
-        i = 0
-        while i < len(ids) - 1:
-            if (ids[i], ids[i+1]) in self.merges:
-                ids[i] = self.merges[(ids[i], ids[i+1])]
-                del ids[i+1]
+        if not ids:
+            return []
+        # 线性左→右归并: head 与后续 token 合并后不前进 (等价于原 del 版, O(n))
+        head = ids[0]
+        out = []
+        for nxt in ids[1:]:
+            k = (head, nxt)
+            if k in self.merges:
+                head = self.merges[k]
             else:
-                i += 1
-        return ids
+                out.append(head)
+                head = nxt
+        out.append(head)
+        return out
 
 class LM3System:
     def __init__(self, d_model=192, d_state=12, n_layers=2,
@@ -283,7 +289,7 @@ class LM3System:
 
     def save(self, tag):
         CKPT_DIR.mkdir(exist_ok=True)
-        path = CKPT_DIR / ("lm3_%s_%s.pt" % (self.mode, tag))
+        path = CKPT_DIR / ("lm3_%s_%s_%s.pt" % (self.method, self.mode, tag))
         torch.save({"stage": self.stage, "mode": self.mode,
                     "d_model": self.d_model, "d_state": self.d_state,
                     "n_layers": self.n_layers, "vocab": self.bpe.vocab,
@@ -342,7 +348,7 @@ class LM3System:
         return self.stage
 
     def _write_report(self, domains):
-        lines = ["# LM3 BPE cross-domain report (%s)" % self.mode, "",
+        lines = ["# LM3 BPE cross-domain report (%s / %s)" % (self.method, self.mode), "",
                  "- model: %.2fM (d=%d, s=%d, layers=%d), BPE vocab=%d"
                  % (self._n_params / 1e6, self.d_model, self.d_state,
                     self.n_layers, self.bpe.vocab),
@@ -364,9 +370,9 @@ class LM3System:
         lines.append("- en: %.4f -> %.4f, forget %.4f" % (
             first_en, last_en, round(first_en - last_en, 4)))
         RESULT_DIR.mkdir(exist_ok=True)
-        (RESULT_DIR / ("lm3_%s_report.md" % self.mode)).write_text(
+        (RESULT_DIR / ("lm3_%s_%s_report.md" % (self.method, self.mode))).write_text(
             "\n".join(lines), encoding="utf-8")
-        print("report: %s" % (RESULT_DIR / ("lm3_%s_report.md" % self.mode)))
+        print("report: %s" % (RESULT_DIR / ("lm3_%s_%s_report.md" % (self.method, self.mode))))
 
 
 def main():
