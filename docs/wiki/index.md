@@ -1,9 +1,9 @@
-# index
+# Wiki 索引
 
-- [log](./log.md)
-- [causal_stack](./causal_stack.md)
-- [causal_lm1_experiment](./causal_lm1_experiment.md)
-- [current-status](./current-status.md)
-- [github-and-raw-strategy](./github-and-raw-strategy.md)
-- [project-overview](./project-overview.md)
-- [sources-and-data](./sources-and-data.md)
+- [README.md](./README.md)
+- [SCHEMA.md](./SCHEMA.md)
+- [project-overview.md](./project-overview.md)
+- [current-status.md](./current-status.md)
+- [sources-and-data.md](./sources-and-data.md)
+- [github-and-raw-strategy.md](./github-and-raw-strategy.md)
+- [log.md](./log.md)

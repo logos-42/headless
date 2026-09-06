@@ -1,4 +1,4 @@
-# headless Wiki 索引
+# Sovereign AI Wiki 索引
 
 这套 wiki 解决三个问题：
 

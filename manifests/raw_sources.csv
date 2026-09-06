@@ -1,2 +1,2 @@
 source_id,company,vendor,kind,filename,raw_rel_path,status,compiled_into,filename,content_hash,size_bytes,ingested_at,compiled_at,last_validated_at,confidence,supersedes,lifecycle_stage,crystallized_into,owner,audience,stage,tags,notes,schema_version
-1,headless,,experiment-log,log.md,docs/wiki/log.md,new,,log.md,abc123,6572,2026-09-06,2026-09-06,2026-09-06,high,,draft,,headless,team,draft,"continuous-learning,lm-experiments",Primary experiment log,2
+1,headless,,experiment-log,log.md,docs/wiki/log.md,new,,log.md,d8a4a23a1a848bb5,6572,2026-09-06,2026-09-06,high,,,元木,reader,draft,continuous-learning,Primary experiment log,2

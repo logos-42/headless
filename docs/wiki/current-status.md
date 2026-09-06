@@ -1,19 +1,18 @@
 ---
-title: current-status
-source_hash: abcdef1234567890
-source: headless
+title: Sovereign AI 当前状态
+source: session
 created: 2026-09-06
 last_confirmed: 2026-09-06
-audience: public
+audience: reader
 stage: draft
+tags: [status]
+status: current
 ---
 
-# current-status
-
 ## 最近更新
-- 2026-09-06: 因果技术栈落地
-- 2026-09-06: LM1 因果持续学习对照实验
+
+- 待填写
 
 ## 进行中的实验
-- LM3-OML 对照实验
-- Combo (OML+Replay) 优化
+
+- 待填写

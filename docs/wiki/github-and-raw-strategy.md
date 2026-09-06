@@ -1,20 +1,29 @@
 ---
-title: github-and-raw-strategy
-source_hash: abcdef1234567890
-source: headless
+title: GitHub 与 Raw 仓分工策略
+source: session
 created: 2026-09-06
 last_confirmed: 2026-09-06
-audience: public
+audience: reader
 stage: draft
+tags: [strategy, git]
+status: current
 ---
 
-# github-and-raw-strategy
+## 结论
 
-## raw 文件存储策略
-- 原始数据存入 `headless_raw/` 目录
-- 通过 `intake_filter.py` 进行隐私脱敏
-- 通过 `ingest_raw.py` 注册到 manifest
+- GitHub private repo 放：`code + wiki + manifests + verified_cases`
+- 本地 raw 仓放：`pdf/xlsx/xls/rar/图片/客户原件`
+- memory repo 放：编译后的长期记忆，不放 raw 本体
 
-## Git LFS 建议
-- model checkpoint: *.pt
-- large CSV: data/*.csv
+## 为什么
+
+把全量 raw 塞进 Git，只会让仓库越来越肥，diff 也基本没用。
+
+真正该版本化的是：
+
+- 结论
+- 规则
+- 答案表
+- 清晰的索引
+
+不是一堆二进制原件。
