@@ -39,6 +39,24 @@ LM3（BPE，226 万参数）
 | **SwiftTD** | 逐特征学习率（在线 IDBD） | 防止 bound/decay 下的步长塌缩 |
 | **价值提议器** | 自主数据生成 | 无需人工标注即可持续探索 |
 
+## 因果技术栈（Causal AI，新增）
+
+把《Causal AI》一书的因果方法落地到 S4 元学习世界，用**因果发现改进自主数据提议器**：
+
+| 文件 | 落地 | 对应书章节 |
+|:--|:--|:--|
+| `hibs_lnn/causal/dag.py` | DAG + d-separation | 第 3-4 章 |
+| `hibs_lnn/causal/scm.py` | SCM + do() 干预 + 反事实 | 第 6-9 章 |
+| `hibs_lnn/causal/identification.py` | 后门调整 / g-公式识别 | 第 10-11 章 |
+| `hibs_lnn/causal/discovery.py` | 条件独立检验 + PC 骨架 | 因果发现 |
+| `hibs_lnn/causal/causal_proposer.py` | 因果驱动的提议器（do-效应/反事实） | 自主探索 |
+| `hibs_lnn/causal/causal_rl.py` | Causal RL + 因果 credit assignment | 第 12 章 |
+
+- 演示：`python3 causal_tech_stack_demo.py`（8 步，秒级）
+- 自测：`python3 -m hibs_lnn.causal.self_test`（15/15 passed）
+- 文档：`docs/wiki/causal_stack.md`
+
+**实测**：同样已学集合下，因果提议器每步覆盖新生成元原子 **0.50**，启发式仅 **0.33**。
 ## 项目结构
 
 ```
@@ -53,9 +71,27 @@ hibs_lnn/
 ├── ssm_v30_3.py           — 带内部纠缠的 SSM 层（相位调制）
 ├── swiftd_head.py         — SwiftTD 逐特征步长优化器
 ├── meta_rule_world.py     — 元学习任务分布（S4 排列）
-└── code_world.py          — 寄存器机沙箱（8 条指令，4 个寄存器）
+├── code_world.py          — 寄存器机沙箱（8 条指令，4 个寄存器）
+└── causal/                — Causal AI 技术栈（DoWhy/pgmpy 的轻量等价物）
+    ├── dag.py             — DAG + d-separation
+    ├── scm.py             — 结构因果模型 + do() + 反事实
+    ├── identification.py  — 后门调整 / g-公式识别
+    ├── discovery.py       — 条件独立检验 + PC 骨架
+    ├── causal_proposer.py — 因果驱动的自主数据提议器（改进提议器）
+    └── causal_rl.py       — Causal RL + 因果 credit assignment
 
-docs/wiki/log.md           — 持续学习实验日志
+tests/
+├── run_lm1_production.py  — 生产级自主持续学习模型（checkpoint、评估、推理）
+├── run_lm2_text.py        — 真实文本持续学习（wikitext-2）
+├── run_lm3_bpe.py         — BPE + 跨域持续学习（5 种方法）
+├── lm1_inference_demo.py  — 生产级推理接口（define+adapt+query）
+└── run_v3*.py             — 17 个实验运行脚本（V31-V35 消融套件）
+
+docs/wiki/
+├── log.md                 — 持续学习实验日志
+└── causal_stack.md        — 因果技术栈落地文档
+
+causal_tech_stack_demo.py  — 因果技术栈端到端演示（8 步，秒级）
 ```
 
 ## 快速开始
