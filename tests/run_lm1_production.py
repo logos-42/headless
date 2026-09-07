@@ -545,6 +545,15 @@ def main():
     ap.add_argument('--d-model', type=int, default=192)
     ap.add_argument('--d-state', type=int, default=12)
     ap.add_argument('--n-layers', type=int, default=2)
+    ap.add_argument('--threads', type=int, default=8,
+                    help='CPU 线程数 (torch 小算子任务: 4-8 最优, 48 会慢 750x)')
+    ap.add_argument('--scale', type=str, default=None,
+                    choices=['0.9M', '8M', '24M', '82M', '244M', '532M', '1.2B', '2B'],
+                    help='预置规模档位 (覆盖 --d-model/--d-state/--n-layers): '
+                         '0.9M=d192/s12/l2, 8M=d512/s16/l4, 24M=d768/s24/l6, '
+                         '82M=d1024/s32/l12, 244M=d1536/s64/l16, 532M=d2048/s64/l20, '
+                         '1.2B=d3072/s64/l20(估), 2B=d4096/s64/l18(估). '
+                         '注意: >82M 档位纯 CPU 训练不现实(单步数分钟级), 2B 档需 GPU.')
     ap.add_argument('--n-prop', type=int, default=2)
     ap.add_argument('--proposer', type=str, default='value',
                     choices=['value', 'causal', 'causal_rl'])
@@ -560,8 +569,29 @@ def main():
                     help='CausalRLAgent 学习率 (仅 proposer=causal_rl 时生效)')
     args = ap.parse_args()
 
-    sys = LM1System(d_model=args.d_model, d_state=args.d_state,
-                    n_layers=args.n_layers, iters_per_round=args.iters_per_round,
+    # CPU 线程数 (torch 小算子任务的性能关键: 48 线程反而慢 750x)
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
+
+    # 预置规模档位 (覆盖手动 d_model/d_state/n_layers)
+    SCALES = {
+        '0.9M':  (192, 12, 2),
+        '8M':    (512, 16, 4),
+        '24M':   (768, 24, 6),
+        '82M':   (1024, 32, 12),
+        '244M':  (1536, 64, 16),
+        '532M':  (2048, 64, 20),
+        '1.2B':  (3072, 64, 20),
+        '2B':    (4096, 64, 18),
+    }
+    dm, ds, nl = args.d_model, args.d_state, args.n_layers
+    if args.scale:
+        dm, ds, nl = SCALES[args.scale]
+        print("[scale] %s → d_model=%d, d_state=%d, n_layers=%d" %
+              (args.scale, dm, ds, nl))
+
+    sys = LM1System(d_model=dm, d_state=ds,
+                    n_layers=nl, iters_per_round=args.iters_per_round,
                     n_prop=args.n_prop, proposer=args.proposer,
                     use_replay=args.replay, replay_ratio=args.replay_ratio,
                     causal_rl_lr=args.causal_rl_lr)
