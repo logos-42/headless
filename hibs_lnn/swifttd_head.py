@@ -176,10 +176,11 @@ class SwiftTDHead:
         d, din, n2 = self.d_model, self.input_dim, self.n2
 
         # 各组特征 φ 与误差 δ (IDBD 逐元素形式)
+        dev = hidden.device
         f_w1 = hidden.unsqueeze(0).expand(d, self.input_dim).contiguous()
-        f_b1 = torch.ones(d)
+        f_b1 = torch.ones(d, device=dev)
         f_w2 = x.unsqueeze(0).expand(n2, d).contiguous()        # (n2,d)
-        f_b2 = torch.ones(n2)
+        f_b2 = torch.ones(n2, device=dev)
 
         d_w1 = (w2.t() @ errs) * (1.0 - x * x)                  # (d,) 回传误差
         d_w1 = d_w1.unsqueeze(1).expand(d, self.input_dim).contiguous()
