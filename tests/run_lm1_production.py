@@ -38,6 +38,7 @@ V = 200
 N_RESP = 4
 CKPT_DIR = ROOT / 'checkpoints'
 RESULT_DIR = ROOT / 'results'
+TAG = 'lm1'   # 规模前缀: --tag 可改 (如 lm1_8m), 隔离 checkpoint/报告
 
 
 # ============================================================
@@ -421,7 +422,7 @@ class LM1System:
     # ── checkpoint ──
     def save(self, tag='latest'):
         CKPT_DIR.mkdir(exist_ok=True)
-        path = CKPT_DIR / ('lm1_%s.pt' % tag)
+        path = CKPT_DIR / ('%s_%s.pt' % (TAG, tag))
         # head 状态 (θ/h) 存 CPU 版 (跨 device 加载安全)
         head_st = self.learner.head.state()
         if self.device.type != 'cpu':
@@ -556,7 +557,7 @@ class LM1System:
     def _log(self, rec):
         line = json.dumps(rec, ensure_ascii=False)
         RESULT_DIR.mkdir(exist_ok=True)
-        with open(RESULT_DIR / 'lm1_report.jsonl', 'a') as f:
+        with open(RESULT_DIR / ('%s_report.jsonl' % TAG), 'a') as f:
             f.write(line + '\n')
         print("[R%d] loss=%.4f unseen=%.4f struct=%s seen=%.4f 遗忘=%s "
               "S5迁移=%s (%.0fs)" % (
@@ -584,9 +585,9 @@ class LM1System:
                             sm.get('dbl', '-'), h.get('seen_mean', 0),
                             h.get('forget', '-'), h.get('migrate_s5', '-')))
         RESULT_DIR.mkdir(exist_ok=True)
-        (RESULT_DIR / 'lm1_report.md').write_text('\n'.join(lines),
-                                                  encoding='utf-8')
-        print("报告: %s" % (RESULT_DIR / 'lm1_report.md'))
+        (RESULT_DIR / ('%s_report.md' % TAG)).write_text('\n'.join(lines),
+                                                         encoding='utf-8')
+        print("报告: %s" % (RESULT_DIR / ('%s_report.md' % TAG)))
 
 
 def main():
@@ -600,6 +601,8 @@ def main():
                     help='CPU 线程数 (torch 小算子任务: 4-8 最优, 48 会慢 750x)')
     ap.add_argument('--device', type=str, default='cpu',
                     help='训练设备: cpu / cuda / cuda:1 (GPU 需 cu128 torch)')
+    ap.add_argument('--tag', type=str, default='lm1',
+                    help='规模前缀, 隔离 checkpoint/报告 (如 lm1_8m)')
     ap.add_argument('--scale', type=str, default=None,
                     choices=['0.9M', '8M', '24M', '82M', '244M', '532M', '1.2B', '2B'],
                     help='预置规模档位 (覆盖 --d-model/--d-state/--n-layers): '
@@ -621,6 +624,10 @@ def main():
     ap.add_argument('--causal-rl-lr', type=float, default=0.3,
                     help='CausalRLAgent 学习率 (仅 proposer=causal_rl 时生效)')
     args = ap.parse_args()
+
+    # 规模前缀 (隔离 checkpoint/报告文件)
+    global TAG
+    TAG = args.tag
 
     # CPU 线程数 (torch 小算子任务的性能关键: 48 线程反而慢 750x)
     if args.threads > 0:
