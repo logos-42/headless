@@ -199,15 +199,25 @@ def struct_mean(accs, tasks, u_struct):
     return {k: (sum(v) / len(v) if v else None) for k, v in by.items()}
 
 
-def migrate_eval(learner, d_model, d_state, n_layers, s5_tasks, s5_unseen):
+def migrate_eval(learner, d_model, d_state, n_layers, s5_tasks, s5_unseen,
+                 device='cpu'):
     """S5 迁移评估 (临时副本: deepcopy + head 扩维 4→5, 不影响主模型)."""
     from run_v35_22_s6 import extend_head_n, cycle_type_n
     # 先构造 (触发 V32 意图注入) 再 load 权重 — deepcopy 会 double-inject
     rln2, pln2 = build_model_resp(V, N_RESP, d_model=d_model,
                                   d_state=d_state, n_layers=n_layers)
+    dev = torch.device(device) if isinstance(device, str) else device
+    if dev.type != 'cpu':
+        rln2.to(dev); pln2.to(dev)
     l2 = V35_Learner_A(
         rln2, pln2, V, K=20, seed=42, sleep_iters=2, n_resp=N_RESP,
         use_intent=True, use_compose=False, use_atoms=False)
+    if dev.type != 'cpu':
+        for name, mod in vars(l2).items():
+            if isinstance(mod, nn.Module):
+                mod.to(dev)
+            elif hasattr(mod, 'to') and name == 'head':
+                mod.to(dev)
     l2.rln.load_state_dict(learner.rln.state_dict())
     l2.pln.load_state_dict(learner.pln.state_dict())
     extend_head_n(pln2, l2, N_RESP, 5)
@@ -230,13 +240,14 @@ class LM1System:
     def __init__(self, d_model=192, d_state=12, n_layers=2,
                  iters_per_round=40, n_prop=2, seed=42, proposer='value',
                  use_replay=True, replay_ratio=0.3, replay_capacity=2000,
-                 causal_rl_lr=0.3):
+                 causal_rl_lr=0.3, device='cpu'):
         self.d_model = d_model
         self.d_state = d_state
         self.n_layers = n_layers
         self.iters_per_round = iters_per_round
         self.n_prop = n_prop
         self.seed = seed
+        self.device = torch.device(device) if device else torch.device('cpu')
         self.proposer_kind = proposer
         self.use_replay = use_replay
         self.replay_ratio = replay_ratio
@@ -293,6 +304,33 @@ class LM1System:
             self.proposer = S4ValueProposer(learned, k=self.n_prop)
         # 探索任务槽
         self._prop_keys = []
+        self._to_device()
+
+    # ── device 搬移 (GPU 训练支持) ─────────────────────────
+    def _to_device(self):
+        """把模型 / learner 内部模块 / head 状态 / 任务数据搬到 self.device."""
+        dev = self.device
+        if dev.type == 'cpu':
+            return
+        self.rln.to(dev)
+        self.pln.to(dev)
+        # learner 内部 nn.Module 成员 (intent_net / m_norm / head 等)
+        for name, mod in vars(self.learner).items():
+            if isinstance(mod, nn.Module):
+                mod.to(dev)
+            elif hasattr(mod, 'to') and name == 'head':
+                # SwiftTDHead 是普通类, 自定义 .to()
+                mod.to(dev)
+        # 任务数据 (support/query 张量)
+        for t in list(self.tasks.values()) + list(self.s5_tasks.values()):
+            t['support'] = [(c.to(dev), tg.to(dev)) for c, tg in t['support']]
+            t['query'] = [(c.to(dev), tg.to(dev)) for c, tg in t['query']]
+        # replay buffer 张量
+        self.replay_buffer.buffer = [
+            (c.to(dev), t.to(dev), n)
+            for c, t, n in self.replay_buffer.buffer]
+        if hasattr(self, 'learner') and hasattr(self.learner, 'head'):
+            pass  # head 已在上面处理
 
     # ── 探索: 价值函数提议 → 世界生成 (自主数据生成) ──
     def explore(self):
@@ -302,6 +340,11 @@ class LM1System:
             key = '__p%d' % i
             t = make_proposed_task(p, 50000 + self.round * 100 + i)
             if t is not None:
+                if self.device.type != 'cpu':
+                    t['support'] = [(c.to(self.device), tg.to(self.device))
+                                    for c, tg in t['support']]
+                    t['query'] = [(c.to(self.device), tg.to(self.device))
+                                  for c, tg in t['query']]
                 self.tasks[key] = t
                 self._prop_keys.append(key)
         return len(self._prop_keys)
@@ -369,7 +412,8 @@ class LM1System:
         if with_migrate:
             mu, msm = migrate_eval(self.learner, self.d_model,
                                    self.d_state, self.n_layers,
-                                   self.s5_tasks, self.s5_unseen)
+                                   self.s5_tasks, self.s5_unseen,
+                                   device=self.device)
             rec['migrate_s5'] = mu
             rec['migrate_s5_struct'] = msm
         return rec
@@ -378,13 +422,18 @@ class LM1System:
     def save(self, tag='latest'):
         CKPT_DIR.mkdir(exist_ok=True)
         path = CKPT_DIR / ('lm1_%s.pt' % tag)
+        # head 状态 (θ/h) 存 CPU 版 (跨 device 加载安全)
+        head_st = self.learner.head.state()
+        if self.device.type != 'cpu':
+            head_st = ([t.cpu() for t in head_st[0]],
+                       [t.cpu() for t in head_st[1]])
         torch.save({
             'round': self.round,
             'd_model': self.d_model, 'd_state': self.d_state,
             'n_layers': self.n_layers,
-            'rln': self.rln.state_dict(),
-            'pln': self.pln.state_dict(),
-            'head': self.learner.head.state(),
+            'rln': {k: v.cpu() for k, v in self.rln.state_dict().items()},
+            'pln': {k: v.cpu() for k, v in self.pln.state_dict().items()},
+            'head': head_st,
             'proposer_freq': getattr(self.proposer, 'freq', {}),
             'history': self.history,
             'proposer_kind': self.proposer_kind,
@@ -414,6 +463,8 @@ class LM1System:
         self.learner.head.load_state(ck['head'])
         self.proposer.freq = ck['proposer_freq']
         for ctx, tgt, name in ck.get('replay_buffer', []):
+            if self.device.type != 'cpu':
+                ctx = ctx.to(self.device); tgt = tgt.to(self.device)
             self.replay_buffer.add(ctx, tgt, name)
         return self.round
 
@@ -547,6 +598,8 @@ def main():
     ap.add_argument('--n-layers', type=int, default=2)
     ap.add_argument('--threads', type=int, default=8,
                     help='CPU 线程数 (torch 小算子任务: 4-8 最优, 48 会慢 750x)')
+    ap.add_argument('--device', type=str, default='cpu',
+                    help='训练设备: cpu / cuda / cuda:1 (GPU 需 cu128 torch)')
     ap.add_argument('--scale', type=str, default=None,
                     choices=['0.9M', '8M', '24M', '82M', '244M', '532M', '1.2B', '2B'],
                     help='预置规模档位 (覆盖 --d-model/--d-state/--n-layers): '
@@ -594,7 +647,7 @@ def main():
                     n_layers=nl, iters_per_round=args.iters_per_round,
                     n_prop=args.n_prop, proposer=args.proposer,
                     use_replay=args.replay, replay_ratio=args.replay_ratio,
-                    causal_rl_lr=args.causal_rl_lr)
+                    causal_rl_lr=args.causal_rl_lr, device=args.device)
     if args.resume:
         r0 = sys.resume(args.resume)
         print("恢复自 %s (round %d)" % (args.resume, r0))

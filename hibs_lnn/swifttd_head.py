@@ -103,6 +103,15 @@ class SwiftTDHead:
         self.n_decays = 0
         self.n_steps = 0
 
+    def to(self, device):
+        """搬移 SwiftTD 状态 (θ/h 迹) 到 device (head 是普通类, 非 nn.Module)."""
+        self.theta = [t.to(device) for t in self.theta]
+        self.h = [t.to(device) for t in self.h]
+        return self
+
+    def cpu(self):
+        return self.to('cpu')
+
     def beta(self):
         return [t.exp().clamp(self.beta_min, self.beta_max) for t in self.theta]
 
