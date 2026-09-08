@@ -222,6 +222,13 @@ def migrate_eval(learner, d_model, d_state, n_layers, s5_tasks, s5_unseen,
     l2.rln.load_state_dict(learner.rln.state_dict())
     l2.pln.load_state_dict(learner.pln.state_dict())
     extend_head_n(pln2, l2, N_RESP, 5)
+    # extend_head_n 创建的新模块 (predictor[2]/step_beta/SwiftTDHead) 默认 CPU → 搬回 dev
+    if dev.type != 'cpu':
+        pln2.to(dev)
+        l2.head.to(dev)
+        for name, mod in vars(l2).items():
+            if isinstance(mod, nn.Module):
+                mod.to(dev)
     accs = s4_eval(l2, s5_tasks, s5_unseen)   # 协议同构 (n_resp=5)
     by = {'c3': [], 'c4': [], 'c5': [], 'dbl': []}
     for n, a in accs.items():
