@@ -263,11 +263,11 @@ class LM1System:
         self.outer_lr = outer_lr
         self.round = 0
         self.history = []
-        # 数据: S4 seen/unseen + S5 迁移集
-        self.tasks = build_v32_tasks(V, n_support=40, n_query=20, seed=42,
+        # 数据: S4 seen/unseen + S5 迁移集 (seed 参数化: 数据+模型同源)
+        self.tasks = build_v32_tasks(V, n_support=40, n_query=20, seed=self.seed,
                                      window=3, stop_at_halt=True)
-        self.u_struct = build_u_struct(42)
-        self.t_struct = build_t_struct(42)
+        self.u_struct = build_u_struct(self.seed)
+        self.t_struct = build_t_struct(self.seed)
         self.tasks = make_regs_tasks(self.tasks)
         self.train_names = [n for n in self.tasks if self.tasks[n]['seen']][:8]
         self.unseen_names = [n for n in self.tasks
@@ -633,6 +633,8 @@ def main():
                     help='CausalRLAgent 学习率 (仅 proposer=causal_rl 时生效)')
     ap.add_argument('--outer-lr', type=float, default=1e-3,
                     help='外循环 Adam 学习率 (大模型需调低: 8M→3e-4, 24M→1e-4)')
+    ap.add_argument('--seed', type=int, default=42,
+                    help='随机种子 (数据+模型同源; 多 seed 验证用 42/2026/7 等)')
     args = ap.parse_args()
 
     # 规模前缀 (隔离 checkpoint/报告文件)
@@ -665,7 +667,7 @@ def main():
                     n_prop=args.n_prop, proposer=args.proposer,
                     use_replay=args.replay, replay_ratio=args.replay_ratio,
                     causal_rl_lr=args.causal_rl_lr, device=args.device,
-                    outer_lr=args.outer_lr)
+                    outer_lr=args.outer_lr, seed=args.seed)
     if args.resume:
         r0 = sys.resume(args.resume)
         print("恢复自 %s (round %d)" % (args.resume, r0))
