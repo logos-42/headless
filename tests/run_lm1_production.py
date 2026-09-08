@@ -248,7 +248,7 @@ class LM1System:
     def __init__(self, d_model=192, d_state=12, n_layers=2,
                  iters_per_round=40, n_prop=2, seed=42, proposer='value',
                  use_replay=True, replay_ratio=0.3, replay_capacity=2000,
-                 causal_rl_lr=0.3, device='cpu'):
+                 causal_rl_lr=0.3, device='cpu', outer_lr=1e-3):
         self.d_model = d_model
         self.d_state = d_state
         self.n_layers = n_layers
@@ -260,6 +260,7 @@ class LM1System:
         self.use_replay = use_replay
         self.replay_ratio = replay_ratio
         self.causal_rl_lr = causal_rl_lr
+        self.outer_lr = outer_lr
         self.round = 0
         self.history = []
         # 数据: S4 seen/unseen + S5 迁移集
@@ -298,7 +299,7 @@ class LM1System:
         self.learner = V35_Learner_A(
             self.rln, self.pln, V, K=20, seed=self.seed, sleep_iters=2,
             n_resp=N_RESP, use_intent=True, use_compose=False,
-            use_atoms=False)
+            use_atoms=False, outer_lr=self.outer_lr)
         learned = [self.tasks[n]['perm'] for n in self.train_names]
         if self.proposer_kind == 'causal':
             from hibs_lnn.causal import CausalProposer
@@ -630,6 +631,8 @@ def main():
                     help='每轮 replay 任务占比 (0~1)')
     ap.add_argument('--causal-rl-lr', type=float, default=0.3,
                     help='CausalRLAgent 学习率 (仅 proposer=causal_rl 时生效)')
+    ap.add_argument('--outer-lr', type=float, default=1e-3,
+                    help='外循环 Adam 学习率 (大模型需调低: 8M→3e-4, 24M→1e-4)')
     args = ap.parse_args()
 
     # 规模前缀 (隔离 checkpoint/报告文件)
@@ -661,7 +664,8 @@ def main():
                     n_layers=nl, iters_per_round=args.iters_per_round,
                     n_prop=args.n_prop, proposer=args.proposer,
                     use_replay=args.replay, replay_ratio=args.replay_ratio,
-                    causal_rl_lr=args.causal_rl_lr, device=args.device)
+                    causal_rl_lr=args.causal_rl_lr, device=args.device,
+                    outer_lr=args.outer_lr)
     if args.resume:
         r0 = sys.resume(args.resume)
         print("恢复自 %s (round %d)" % (args.resume, r0))
