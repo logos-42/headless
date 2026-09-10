@@ -18,6 +18,9 @@ env/
 checkpoints/
 results/
 
+# Downloaded datasets (LM4 wave data, >100MB)
+data/
+
 # Logs and temporary data
 *.log
 *.tmp
