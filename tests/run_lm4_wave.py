@@ -105,11 +105,18 @@ def load_wave_data(wave_dir):
     return t_all, dens, mt, mf
 
 
-def build_windows(times, dens, mag_times, mag_feats, window=WINDOW, stride=4,
+def build_windows(times, dens, mag_times, mag_feats, window=WINDOW, stride=None,
                   tol=3.0):
     """构造 (特征窗口, 密度域标签)。
+
+    stride 默认 = window (**不重叠**)。重叠窗口 + 随机切分会让测试窗口的
+    近邻副本留在训练集(实测 100% 的测试窗口与最近训练窗口相距 <=8 索引,
+    即时间上重叠 >=24/32 步) → 严重泄漏, 会同时抬高 acc 并虚增 replay 效果。
+
     特征 = [log10 Magnitude, log10 rms, lambda, delta] (MAG 近邻对齐, tol 秒内)。
     时间用 numpy datetime64 向量化解析 (快 100x)。"""
+    if stride is None:
+        stride = window
     if len(mag_times) == 0:
         return np.zeros((0, window, N_FEAT), dtype=np.float32), np.zeros((0,))
     try:
@@ -205,7 +212,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     acc_matrix = []          # acc_matrix[step][domain]
-    replay_buf = []          # (x, y) 元组列表
+    replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
 
     for step, dd in enumerate(domains):
         dl = loader_for(train_by_dom[dd], shuffle=True)
@@ -217,12 +224,18 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                     break
                 xb, yb = xb.to(device), yb.to(device)
                 loss = F.cross_entropy(model(xb), yb)
-                # Replay: 混入旧域样本
-                if replay and replay_buf:
+                # Replay: 按域均衡混入旧域样本
+                if replay and replay_by_dom:
                     k = max(1, int(batch * replay_ratio))
-                    ridx = random.sample(range(len(replay_buf)), min(k, len(replay_buf)))
-                    rx = torch.stack([replay_buf[j][0] for j in ridx]).to(device)
-                    ry = torch.stack([replay_buf[j][1] for j in ridx]).to(device)
+                    seen_doms = list(replay_by_dom)
+                    per = max(1, k // len(seen_doms))
+                    rxs, rys = [], []
+                    for sd in seen_doms:
+                        bx, by = replay_by_dom[sd]
+                        m = min(per, len(bx))
+                        sel = torch.randint(0, len(bx), (m,), device=device)
+                        rxs.append(bx[sel]); rys.append(by[sel])
+                    rx, ry = torch.cat(rxs), torch.cat(rys)
                     loss = loss + F.cross_entropy(model(rx), ry)
                 opt.zero_grad(); loss.backward(); opt.step()
                 it += 1
@@ -232,13 +245,13 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         acc_matrix.append(row)
         seen = [f"D{d}:{row[i]:.3f}" for i, d in enumerate(domains) if i <= step]
         print(f"  [{'replay' if replay else 'naive '}] step{step+1} (域{dd}) → {' '.join(seen)}", flush=True)
-        # 存回放样本
+        # 存回放样本 (每域固定 2000, 预置 device 避免逐步搬运)
         if replay:
             idx = train_by_dom[dd]
             sel = np.random.RandomState(seed + step).choice(
                 idx, size=min(2000, len(idx)), replace=False)
-            for i in sel:
-                replay_buf.append((torch.from_numpy(X[i]), torch.from_numpy(np.array(y_dom[i]))))
+            replay_by_dom[dd] = (torch.from_numpy(X[sel]).to(device),
+                                 torch.from_numpy(y_dom[sel]).to(device))
     return acc_matrix, domains
 
 
@@ -302,6 +315,8 @@ def run_joint(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=str(ROOT / "data" / "wave"))
+    ap.add_argument("--stride", type=int, default=None,
+                    help="窗口步长 (默认=window 即不重叠, 防 train/test 泄漏)")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--d-state", type=int, default=8)
     ap.add_argument("--n-layers", type=int, default=2)
@@ -310,6 +325,8 @@ def main():
                     help="联合训练诊断步数 (非持续学习上限)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--replay-ratio", type=float, default=1.0,
+                    help="回放样本数 / 当前 batch 数 (1.0 = 等量混入)")
     ap.add_argument("--domains", type=int, default=6)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cpu")
@@ -319,8 +336,9 @@ def main():
     device = torch.device(args.device)
     t0 = time.time()
     times, dens, mag_times, mag_feats = load_wave_data(args.data)
-    X, y_log = build_windows(times, dens, mag_times, mag_feats)
-    print(f"[data] 样本 {len(X)} 窗口 x {WINDOW} x {N_FEAT} 维, {time.time()-t0:.0f}s", flush=True)
+    X, y_log = build_windows(times, dens, mag_times, mag_feats, stride=args.stride)
+    eff_stride = args.stride if args.stride else WINDOW
+    print(f"[data] 样本 {len(X)} 窗口 x {WINDOW} x {N_FEAT} 维 (stride={eff_stride}), {time.time()-t0:.0f}s", flush=True)
     if len(X) == 0:
         print("ERROR: 无样本 (检查 MAG 数据是否下载)"); return
     y_dom, qs = assign_domains(y_log, args.domains)
@@ -331,15 +349,16 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     results = {}
 
-    # 诊断: 联合训练上限 (判断任务本身是否可解)
-    print("\n=== Joint (联合训练上限诊断) ===", flush=True)
-    joint_accs, joint_mean = run_joint(
-        X, y_dom, device, d_model=args.d_model, d_state=args.d_state,
-        n_layers=args.n_layers, steps=args.joint_steps, batch=args.batch,
-        lr=args.lr, seed=args.seed, n_domains=args.domains)
-    print("  → 联合训练平均 acc %.4f | 各域 %s" % (
-        joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
-    results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
+    # 诊断: 联合训练上限 (判断任务本身是否可解; --joint-steps 0 跳过)
+    if args.joint_steps > 0:
+        print("\n=== Joint (联合训练上限诊断) ===", flush=True)
+        joint_accs, joint_mean = run_joint(
+            X, y_dom, device, d_model=args.d_model, d_state=args.d_state,
+            n_layers=args.n_layers, steps=args.joint_steps, batch=args.batch,
+            lr=args.lr, seed=args.seed, n_domains=args.domains)
+        print("  → 联合训练平均 acc %.4f | 各域 %s" % (
+            joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
+        results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
 
     for replay in (False, True):
         print(f"\n=== {'Replay' if replay else 'Naive sequential'} ===", flush=True)
@@ -347,6 +366,7 @@ def main():
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
+                                 replay_ratio=args.replay_ratio,
                                  seed=args.seed, n_domains=args.domains)
         s = summarize(M, doms)
         key = "replay" if replay else "naive"

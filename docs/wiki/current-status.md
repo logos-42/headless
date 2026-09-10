@@ -11,13 +11,14 @@ status: current
 
 ## 最近更新
 
-- 2026-09-10：**LM4 电磁波持续学习启动**（NASA CDAWeb 真实空间物理数据）
+- 2026-09-10：**LM4 电磁波持续学习**（NASA CDAWeb 真实空间物理数据）
   - 目标：把 headless 持续学习框架扩展到电磁波观测 → 持续推断等离子体物理状态
-  - 数据：Van Allen Probes RBSP-A EMFISIS（DENSITY L4 6s + MAG L3），2015 全年 DENSITY（408 万点）+ Q1 MAG（130 万点）→ 对齐后 197,708 窗口
-  - **关键设计**：排除 `fpe`/`fuh`/`wpe_over_wce`（与 density 有解析关系 = 标签泄漏）；物理状态 = log10(density) 分 6 个分位数域（跨 6.3 数量级）；时间对齐用近邻匹配
-  - **可解性诊断**：联合训练上限 6 类 0.523 / 3 类 0.720（随机 0.167/0.333）→ 任务可解，持续学习对比有意义
-  - 脚本 `tests/{dl_local,dl_mag,run_lm4_wave}.py`，文档 `docs/lm4_wave.md`
-  - 阻塞：服务器 GPU 权限再次丢失（EPERM）→ 待重开；数据与脚本已就位，CPU 验证中
+  - 数据：Van Allen Probes RBSP-A EMFISIS（DENSITY L4 6s + MAG L3），2015 全年 DENSITY（408 万点）+ 全年 MAG（537 万点）→ 不重叠窗口 127,134 个
+  - **关键设计**：排除 `fpe`/`fuh`/`wpe_over_wce`（与 density 有解析关系 = 标签泄漏）；物理状态 = log10(density) 分 6 个分位数域；时间对齐用近邻匹配；窗口不重叠（stride=window）
+  - **首版结果（已作废）**：joint 0.4295 / naive 0.1667 / replay 0.3613±0.0803 —— 因 `stride=4` 窗口重叠 87.5% + 随机切分导致 train/test 泄漏（每个测试窗口都有时间上重叠 ≥24/32 步的兄弟在训练集）
+  - **修正**：stride 默认改为 window（不重叠），样本 101.7 万 → 12.7 万；夜间队列 `tests/run_lm4_overnight.sh` 重跑（14 seed + 3 档 ratio 消融）
+  - 脚本 `tests/{dl_local,dl_mag,run_lm4_wave}.py` + `run_lm4_overnight.sh`，文档 `docs/lm4_wave.md`
+  - 服务器 GPU 已恢复（EPERM 已由管理员解决）
 - 2026-09-08：LM1 GPU 训练支持 + 8M 档首次跑测（服务器 2×A100-40GB）
   - 完成 lm1 的 GPU 化改造（6 个 commit，见 git log）：`--scale` 规模档位（0.9M~2B）、`--device cuda`、SwiftTDHead `.to()`、swifttd f_b1/f_b2 硬编码 CPU 修复、`--tag` 隔离、migrate_eval GPU 搬移、`--outer-lr`
   - **关键发现 1（线程）**：torch 2.13 CPU 小算子任务 48 线程慢 750x（4-8 线程最优）
