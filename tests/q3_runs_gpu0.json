@@ -1,0 +1,5 @@
+[
+ {"tag":"q3_agg_rr2","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q3_agg_rr5","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","5.0","--seed","42"]},
+ {"tag":"q3_agg_rr10","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","10.0","--seed","42"]}
+]
