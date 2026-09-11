@@ -50,7 +50,9 @@ def main():
 
     runs = json.load(open(ROOT / args.runs_json)) if not os.path.isabs(args.runs_json) \
         else json.load(open(args.runs_json))
-    log = RESULTS / f"queue_gpu{args.gpu}.log"
+    # 日志按 runs 文件名区分, 避免同一 GPU 上多个队列互相混写
+    stem = Path(args.runs_json).stem
+    log = RESULTS / f"queue_{stem}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
 
     def say(msg):
