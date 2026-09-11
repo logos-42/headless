@@ -6,6 +6,9 @@ import statistics as st
 rows = []
 for jf in sorted(glob.glob("results/lm4c_*/lm4_wave_results.json")):
     tag = os.path.basename(os.path.dirname(jf))
+    # 排除非标准 run: lm4c_joint20k 用 --epochs-per-domain 1, 其 naive/replay 无意义
+    if "joint" in tag:
+        continue
     try:
         d = json.load(open(jf))
     except Exception as e:
@@ -47,4 +50,11 @@ print(f"  n={len(nv)}  唯一值: {sorted(set(round(v,4) for v in nv))}")
 
 jn = [x["joint"] for x in rows if x["joint"] == x["joint"]]
 if jn:
-    print(f"\n=== joint 上限 (不重叠窗口, 修正后) ===\n  {jn}")
+    print(f"\n=== joint 上限 (各 run 内联的 5000 步诊断) ===\n  {jn}")
+# 真上限: lm4c_joint20k (20000 步)
+try:
+    _j = json.load(open("results/lm4c_joint20k/lm4_wave_results.json"))["joint"]
+    print(f"\n=== joint 真上限 (20000 步) ===\n  {_j['final_mean_acc']:.4f}  "
+          f"per_domain={ {k: round(v,3) for k,v in _j['per_domain'].items()} }")
+except Exception as e:
+    print(f"\n(joint20k 未找到: {e})")
