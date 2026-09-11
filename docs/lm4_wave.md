@@ -161,7 +161,7 @@ joint 上限(0.36 vs 0.43)。**所以上表的 replay 对比不可信,不能归�
 而泄漏版每步混入大量近邻副本, 反而**降低**了训练效率。
 所以"泄漏一定抬高精度"不成立 —— 但它一定**使结论不可信**(replay 效果被邻域记忆污染)。
 
-## 特征升级 v2:WFR 波功率谱(进行中)
+## 特征升级 v2:WFR 波功率谱(数据已就绪)
 
 **动机**: 见上"天花板位置" —— 当前 4 维特征(`Magnitude`/`rms`/`lambda`/`delta`)
 分辨不了中段密度域(D2/D3 联合训练都只到随机)。需要真正含信息量的波特征。
@@ -193,10 +193,24 @@ EuEu / EvEv / EwEw  电功率谱密度 [(V/m)²/Hz]
 
 实测谱形合理(低频强、高频弱): `BuBu` 频段均值 log10 从 **-4.0(低频)递减到 -9.8(高频)**。
 
-### 下载与存储
+### 下载与存储(已完成)
 
 `tests/dl_wfr.py` —— 并行逐日下载 CSV(395 列), **边下边抽**(原始 ~50 MB/天不落盘),
 存 `log10(PSD)` float16 + 增益, 月度 npz `data/wave/wfr_YYYYMM.npz`(`time[]`, `psd[N,6,65]`)。
+
+**已下载 2015 全年 12 个月**(5.2 小时, 4 线程), 校验结果:
+
+| 检查 | 结果 |
+|---|---|
+| 记录总数 | **5,226,553 条** |
+| shape | 全部 `(N, 6, 65)` |
+| NaN 比例 | **0.00%**(12 个月全部) |
+| log10 范围 | -21.9 ~ 2.5 |
+| **与 DENSITY 对齐** | 最近邻时差中位数 **1.73 s**, **≤3 s 占 100%** ✅ |
+| 体积 | 2.87 GB(月度 221~247 MB) |
+
+**数据已传到服务器** `/work/liuyuanjie/headless/data/wave/`(现共 36 个 npz = 12 DENSITY + 12 MAG + 12 WFR);
+本机副本已删除(磁盘紧张), 需要时用 `dl_wfr.py` 重下。
 
 ### 计划中的特征向量(下一轮)
 
@@ -214,10 +228,12 @@ EuEu / EvEv / EwEw  电功率谱密度 [(V/m)²/Hz]
 |---|---|
 | `tests/dl_local.py` | 下载 DENSITY(本机并行, 比服务器快 17×) |
 | `tests/dl_mag.py` | 下载 MAG + 提取独立特征 |
+| `tests/dl_wfr.py` | 下载 WFR 波功率谱(边下边抽, 6×65 谱) |
 | `tests/run_lm4_wave.py` | lm4 实验(数据管线 + 持续学习 + 诊断) |
 | `tests/run_lm4_overnight.sh` | 夜间批量队列(多 seed + ratio 消融) |
+| `tests/run_lm4_overnight2.sh` | ratio 2.0 补 seed 队列 |
 | `tests/aggregate_lm4.py` | 汇总 `results/lm4c_*/` 全部结果为表格 + 统计 |
-| `data/wave/*.npz` | 数据(115 MB, gitignore) |
+| `data/wave/*.npz` | 数据(服务器 3.0 GB: DENSITY+MAG 100MB, WFR 2.9GB; 本机仅留 DENSITY/MAG) |
 | `results/lm4c_*/` | 修正版结果(25 run) |
 
 ## 坑
