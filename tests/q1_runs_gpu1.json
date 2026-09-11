@@ -1,0 +1,5 @@
+[
+ {"tag":"q1_pool_mean","args":["--wfr-bands","13","--joint-only","--joint-steps","20000","--device","cuda","--pool","mean"]},
+ {"tag":"q1_pool_cat_ls","args":["--wfr-bands","13","--joint-only","--joint-steps","20000","--device","cuda","--pool","cat","--lshell"]},
+ {"tag":"q1_pool_cat_agg_ls","args":["--wfr-bands","13","--joint-only","--joint-steps","20000","--device","cuda","--pool","cat","--agg-path","--lshell"]}
+]

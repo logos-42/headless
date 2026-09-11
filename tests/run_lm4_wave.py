@@ -37,26 +37,57 @@ MAG_SENTINEL_LO = -1e4      # MAG L3 用 -100000 标记无效采样 (实测占 0
 # ============================================================
 # 模型: 连续输入 SSM + 域分类头
 # ============================================================
+def window_agg(x):
+    """(B,L,F) → (B,5F) 窗口聚合: mean/std/last/first/斜率。
+
+    非序列基线 (MLP on 150 维聚合) 实测 joint 0.8045, 而旧 WaveSSM (只用末时刻
+    隐状态) 只有 0.7213 —— 差距来自 SSM 必须从零学时间池化。"""
+    return torch.cat([x.mean(1), x.std(1), x[:, -1, :], x[:, 0, :],
+                      x[:, -1, :] - x[:, 0, :]], dim=-1)
+
+
 class WaveSSM(nn.Module):
-    """连续特征序列 → SSM → 物理状态(密度域)分类。"""
+    """连续特征序列 → SSM → 物理状态(密度域)分类。
+
+    pool: 时序池化
+      'last' — 只用末时刻隐状态 (旧行为, 实测打不过聚合基线)
+      'cat'  — [末时刻, 均值, 最大] 拼接 (默认)
+    agg_path: 把原始窗口统计量直接拼进分类头 —— 给模型一条"聚合直通车",
+      不必从零学池化 (与 MLP 基线对齐, 同时保留 SSM 的时序建模)
+    """
 
     def __init__(self, n_feat=N_FEAT, d_model=128, d_state=8, n_layers=2,
-                 n_classes=6):
+                 n_classes=6, pool="cat", agg_path=False):
         super().__init__()
+        self.pool = pool
+        self.agg_path = agg_path
         self.in_proj = nn.Linear(n_feat, d_model)
         self.layers = nn.ModuleList([
             SSM_Layer_V30_3(d_model, d_state, layer_idx=i, ent_mode='none')
             for i in range(n_layers)])
         self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, n_classes)
+        d_head = d_model * (3 if pool == "cat" else 1)
+        if agg_path:
+            d_head += 5 * n_feat
+        self.head = nn.Linear(d_head, n_classes)
 
-    def forward(self, x):
-        """x: (B, L, n_feat) → logits (B, n_classes)  (取末时刻)"""
+    def forward(self, x, agg=None):
+        """x: (B, L, n_feat) → logits (B, n_classes)"""
         h = self.in_proj(x)
         for layer in self.layers:
             h, _ = layer(h)
         h = self.norm(h)
-        return self.head(h[:, -1])
+        if self.pool == "last":
+            s = h[:, -1]
+        elif self.pool == "mean":
+            s = h.mean(1)
+        elif self.pool == "max":
+            s = h.max(1).values
+        else:
+            s = torch.cat([h[:, -1], h.mean(1), h.max(1).values], dim=-1)
+        if self.agg_path:
+            s = torch.cat([s, window_agg(x) if agg is None else agg], dim=-1)
+        return self.head(s)
 
 
 # ============================================================
@@ -148,12 +179,53 @@ def load_wfr_data(wave_dir, bands=13):
     return T, np.concatenate(F, axis=0).astype(np.float32)
 
 
-def build_feature_matrix(wave_dir, bands=13, use_wfr=True, tol=3.0):
-    """统一特征管线: 以密度时间轴为准, 对齐 MAG + WFR。
+def load_lshell_data(wave_dir, tol=3.0):
+    """MAG 4SEC 的 coordinates(GEI, km) → [log10(偶极 L), sin(磁纬)], 2 维。
+
+    注意: 用 GEI 的 z 轴当磁轴是近似(真实磁轴倾角约 11°)。
+    valid = (magFill==0) & (magInvalid==0), 官方有效性标志。
+    """
+    files = sorted(Path(wave_dir).glob("magpos_*.npz"))
+    T, F, V = [], [], []
+    for f in files:
+        z = np.load(f, allow_pickle=True)
+        c = z["coords"].astype(np.float64)
+        fl = z["flags"]
+        r = np.linalg.norm(c, axis=1)
+        r_re = r / 6371.0
+        sinlat = np.clip(c[:, 2] / np.maximum(r, 1e-9), -0.999, 0.999)
+        L = r_re / np.maximum(1.0 - sinlat ** 2, 1e-3)
+        F.append(np.stack([np.log10(np.maximum(L, 1e-3)), sinlat],
+                          axis=1).astype(np.float32))
+        V.append((fl[:, 0] == 0) & (fl[:, 1] == 0))
+        T.extend(z["time"].tolist())
+    if not F:
+        return [], np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool)
+    tot = sum(len(x) for x in F)
+    print(f"[lshell] {len(files)} 月, {tot} 条, 2 维特征")
+    return T, np.concatenate(F, axis=0).astype(np.float32), np.concatenate(V)
+
+
+def _feat_cache_path(wave_dir, bands, use_wfr, use_lshell):
+    return (Path(wave_dir) / "_cache"
+            / f"feat_b{bands}_wfr{int(use_wfr)}_ls{int(use_lshell)}.npz")
+
+
+def build_feature_matrix(wave_dir, bands=13, use_wfr=True, use_lshell=False,
+                         tol=3.0, use_cache=True):
+    """统一特征管线: 以密度时间轴为准, 对齐 MAG + WFR + L-shell。
 
     返回 (times, dens, feats (N,D), ok (N,))
-      D = 4 (log10 Mag, log10 rms, lambda, delta) [+ 2*bands (WFR 磁/电总功率谱)]
+      D = 4 (log10 Mag, log10 rms, lambda, delta)
+          [+ 2*bands (WFR 磁/电总功率谱)] [+ 2 (log10 偶极 L, sin 磁纬)]
+    结果缓存到 data/wave/_cache/, 重跑省去 ~160s 重建。
     """
+    cache = _feat_cache_path(wave_dir, bands, use_wfr, use_lshell)
+    if use_cache and cache.exists():
+        z = np.load(cache, allow_pickle=True)
+        print(f"[cache] 特征矩阵命中 {cache.name}")
+        return z["times"].tolist(), z["dens"], z["F"], z["ok"]
+
     d_dir = Path(wave_dir)
     dens_files = sorted(d_dir.glob("rbsp_a_*.npz"))
     if not dens_files:
@@ -196,13 +268,33 @@ def build_feature_matrix(wave_dir, bands=13, use_wfr=True, tol=3.0):
         wt, wf = load_wfr_data(wave_dir, bands)
         if len(wt):
             w_f, w_idx, w_ok = _align(t_all, wt, wf, tol)
+            n0 = X.shape[1]
             X = np.concatenate([X, w_f[w_idx]], axis=1).astype(np.float32)
-            X[~w_ok, 4:] = 0.0          # 缺失填 0 (这些窗口会被 ok 掩码丢弃)
+            X[~w_ok, n0:] = 0.0          # 缺失填 0 (这些窗口会被 ok 掩码丢弃)
             ok &= w_ok
+
+    if use_lshell:
+        lt, lf, lv = load_lshell_data(wave_dir)
+        if len(lt):
+            # 有效性标志必须跟着特征一起排序 → 拼成额外一列再拆开
+            lf2 = np.concatenate([lf, lv.astype(np.float32)[:, None]], axis=1)
+            l_f, l_idx, l_ok = _align(t_all, lt, lf2, tol)
+            got = l_f[l_idx]
+            l_feats, l_valid = got[:, :-1], got[:, -1] > 0.5
+            l_ok = l_ok & l_valid
+            n0 = X.shape[1]
+            X = np.concatenate([X, l_feats], axis=1).astype(np.float32)
+            X[~l_ok, n0:] = 0.0
+            ok &= l_ok
 
     ok &= np.isfinite(X).all(axis=1)
     X[~ok] = 0.0
     print(f"[data] 特征 {X.shape[1]} 维, 有效点 {int(ok.sum())}/{n}")
+    if use_cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache, times=np.array(t_all, dtype=object),
+                            dens=dens, F=X, ok=ok)
+        print(f"[cache] 已写入 {cache.name} ({cache.stat().st_size/1024/1024:.0f} MB)")
     return t_all, dens, X, ok
 
 
@@ -260,7 +352,8 @@ def evaluate(model, loader, device):
 
 def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    epochs_per_domain=300, batch=32, lr=1e-3, replay=False,
-                   replay_ratio=0.3, seed=42, n_domains=6, n_feat=None):
+                   replay_ratio=0.3, seed=42, n_domains=6, n_feat=None,
+                   pool="cat", agg_path=False):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
     # 每域划分 train/test
@@ -286,7 +379,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     n_classes = n_domains
     model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
                     d_state=d_state, n_layers=n_layers,
-                    n_classes=n_classes).to(device)
+                    n_classes=n_classes, pool=pool, agg_path=agg_path).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     acc_matrix = []          # acc_matrix[step][domain]
@@ -352,7 +445,8 @@ def summarize(acc_matrix, domains):
 
 
 def run_joint(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
-              steps=1500, batch=32, lr=1e-3, seed=42, n_domains=6, n_feat=None):
+              steps=1500, batch=32, lr=1e-3, seed=42, n_domains=6, n_feat=None,
+              pool="cat", agg_path=False):
     """诊断: 所有域混合训练 (非持续学习上限)。若这个也学不好 → 特征/任务定义有问题。"""
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     tr_idx, te_by_dom = [], {}
@@ -371,7 +465,7 @@ def run_joint(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     dl = torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=True)
     model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
                     d_state=d_state, n_layers=n_layers,
-                    n_classes=n_domains).to(device)
+                    n_classes=n_domains, pool=pool, agg_path=agg_path).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     it = 0
@@ -398,14 +492,24 @@ def main():
                     help="窗口步长 (默认=window 即不重叠, 防 train/test 泄漏)")
     ap.add_argument("--no-wfr", action="store_true",
                     help="只用 MAG 4 维特征, 不接 WFR 波谱")
+    ap.add_argument("--lshell", action="store_true",
+                    help="追加 L-shell 特征 (log10 偶极 L, sin 磁纬), 需 magpos_*.npz")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="不使用/不写入特征矩阵缓存")
     ap.add_argument("--wfr-bands", type=int, default=13,
                     help="WFR 65 频段聚合成的段数 (每段磁/电各 1 维 → 2*N 维)")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--d-state", type=int, default=8)
     ap.add_argument("--n-layers", type=int, default=2)
+    ap.add_argument("--pool", default="cat", choices=["last", "mean", "max", "cat"],
+                    help="SSM 时序池化 (last = 旧行为, 实测弱于聚合基线)")
+    ap.add_argument("--agg-path", action="store_true",
+                    help="窗口聚合统计量直接拼进分类头 (聚合直通车)")
     ap.add_argument("--epochs-per-domain", type=int, default=300)
     ap.add_argument("--joint-steps", type=int, default=1500,
                     help="联合训练诊断步数 (非持续学习上限)")
+    ap.add_argument("--joint-only", action="store_true",
+                    help="只跑 joint 天花板, 跳过 naive/replay (容量扫描用)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--replay-ratio", type=float, default=1.0,
@@ -419,7 +523,8 @@ def main():
     device = torch.device(args.device)
     t0 = time.time()
     times, dens, F_mat, ok = build_feature_matrix(
-        args.data, bands=args.wfr_bands, use_wfr=not args.no_wfr)
+        args.data, bands=args.wfr_bands, use_wfr=not args.no_wfr,
+        use_lshell=args.lshell, use_cache=not args.no_cache)
     X, y_log = build_windows(times, dens, F_mat, ok, stride=args.stride)
     eff_stride = args.stride if args.stride else WINDOW
     d_feat = X.shape[-1] if len(X) else 0
@@ -441,12 +546,13 @@ def main():
         joint_accs, joint_mean = run_joint(
             X, y_dom, device, d_model=args.d_model, d_state=args.d_state,
             n_layers=args.n_layers, steps=args.joint_steps, batch=args.batch,
-            lr=args.lr, seed=args.seed, n_domains=args.domains, n_feat=d_feat)
+            lr=args.lr, seed=args.seed, n_domains=args.domains, n_feat=d_feat,
+            pool=args.pool, agg_path=args.agg_path)
         print("  → 联合训练平均 acc %.4f | 各域 %s" % (
             joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
         results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
 
-    for replay in (False, True):
+    for replay in (() if args.joint_only else (False, True)):
         print(f"\n=== {'Replay' if replay else 'Naive sequential'} ===", flush=True)
         M, doms = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
@@ -454,7 +560,8 @@ def main():
                                  batch=args.batch, lr=args.lr, replay=replay,
                                  replay_ratio=args.replay_ratio,
                                  seed=args.seed, n_domains=args.domains,
-                                 n_feat=d_feat)
+                                 n_feat=d_feat, pool=args.pool,
+                                 agg_path=args.agg_path)
         s = summarize(M, doms)
         key = "replay" if replay else "naive"
         results[key] = s
@@ -489,6 +596,19 @@ def main():
             cells = " | ".join("nan" if (isinstance(v, float) and np.isnan(v)) else f"{v:.3f}" for v in row)
             lines.append(f"| {i+1} | {cells} |")
         lines.append("")
+    # config 指纹: 汇总时按它过滤, 防止诊断 run(--epochs-per-domain 1 之类) 混入统计
+    results["_config"] = {
+        "use_wfr": not args.no_wfr, "wfr_bands": args.wfr_bands,
+        "use_lshell": args.lshell, "stride": eff_stride,
+        "d_model": args.d_model, "d_state": args.d_state,
+        "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
+        "pool": args.pool, "agg_path": args.agg_path,
+        "joint_steps": args.joint_steps, "batch": args.batch, "lr": args.lr,
+        "replay_ratio": args.replay_ratio, "domains": args.domains,
+        "seed": args.seed, "n_windows": int(X.shape[0]), "n_feat": d_feat,
+        # 规范化 argv 指纹: 队列据此判断"这个 tag 是否已用完全相同参数跑过"
+        "argv_sig": " ".join(sorted(sys.argv[1:])),
+    }
     out_md = os.path.join(args.out, "lm4_wave_report.md")
     Path(out_md).write_text("\n".join(lines), encoding="utf-8")
     json.dump(results, open(os.path.join(args.out, "lm4_wave_results.json"), "w"),
