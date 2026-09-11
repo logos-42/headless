@@ -353,7 +353,7 @@ def evaluate(model, loader, device):
 def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    epochs_per_domain=300, batch=32, lr=1e-3, replay=False,
                    replay_ratio=0.3, seed=42, n_domains=6, n_feat=None,
-                   pool="cat", agg_path=False):
+                   pool="cat", agg_path=False, shuffle_domains=False):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
     # 每域划分 train/test
@@ -369,6 +369,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         test_by_dom[dd] = idx[:n_te]
         train_by_dom[dd] = idx[n_te:]
     domains = sorted(train_by_dom)
+    if shuffle_domains:
+        # 随机化训练顺序: 检验"按密度递增"的课程是否重要
+        random.Random(seed * 7919 + 13).shuffle(domains)
 
     def loader_for(idxs, shuffle=False):
         ds = torch.utils.data.TensorDataset(
@@ -501,8 +504,8 @@ def main():
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--d-state", type=int, default=8)
     ap.add_argument("--n-layers", type=int, default=2)
-    ap.add_argument("--pool", default="cat", choices=["last", "mean", "max", "cat"],
-                    help="SSM 时序池化 (last = 旧行为, 实测弱于聚合基线)")
+    ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
+                    help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
     ap.add_argument("--agg-path", action="store_true",
                     help="窗口聚合统计量直接拼进分类头 (聚合直通车)")
     ap.add_argument("--epochs-per-domain", type=int, default=300)
@@ -515,6 +518,8 @@ def main():
     ap.add_argument("--replay-ratio", type=float, default=1.0,
                     help="回放样本数 / 当前 batch 数 (1.0 = 等量混入)")
     ap.add_argument("--domains", type=int, default=6)
+    ap.add_argument("--shuffle-domains", action="store_true",
+                    help="随机化域训练顺序 (检验按密度递增的课程是否重要)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default=str(ROOT / "results" / "lm4_wave"))
@@ -561,7 +566,8 @@ def main():
                                  replay_ratio=args.replay_ratio,
                                  seed=args.seed, n_domains=args.domains,
                                  n_feat=d_feat, pool=args.pool,
-                                 agg_path=args.agg_path)
+                                 agg_path=args.agg_path,
+                                 shuffle_domains=args.shuffle_domains)
         s = summarize(M, doms)
         key = "replay" if replay else "naive"
         results[key] = s
@@ -603,6 +609,7 @@ def main():
         "d_model": args.d_model, "d_state": args.d_state,
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
         "pool": args.pool, "agg_path": args.agg_path,
+        "shuffle_domains": args.shuffle_domains,
         "joint_steps": args.joint_steps, "batch": args.batch, "lr": args.lr,
         "replay_ratio": args.replay_ratio, "domains": args.domains,
         "seed": args.seed, "n_windows": int(X.shape[0]), "n_feat": d_feat,

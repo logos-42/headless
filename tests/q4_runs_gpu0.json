@@ -1,0 +1,5 @@
+[
+ {"tag":"q4_d3","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--domains","3","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q4_d8","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--domains","8","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q4_d12","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--domains","12","--replay-ratio","2.0","--seed","42"]}
+]
