@@ -1,0 +1,5 @@
+[
+ {"tag":"q5_agg_s7","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","7"]},
+ {"tag":"q5_agg_s2026","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","2026"]},
+ {"tag":"q5_agg_s123","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","123"]}
+]

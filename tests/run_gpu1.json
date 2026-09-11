@@ -1,0 +1,10 @@
+[
+ {"tag":"q3_agg_ls_rr2","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--lshell","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q3_agg_ls_rr5","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--lshell","--replay-ratio","5.0","--seed","42"]},
+ {"tag":"q5_agg_s1","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","1"]},
+ {"tag":"q5_agg_s2","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","2"]},
+ {"tag":"q5_agg_s3","args":["--wfr-bands","13","--joint-steps","0","--epochs-per-domain","1000","--device","cuda","--pool","cat","--agg-path","--replay-ratio","2.0","--seed","3"]},
+ {"tag":"q4_d6_shuf","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--shuffle-domains","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q4_d6_ls","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--lshell","--replay-ratio","2.0","--seed","42"]},
+ {"tag":"q4_d6_agg","args":["--wfr-bands","13","--joint-steps","20000","--epochs-per-domain","1000","--device","cuda","--pool","last","--agg-path","--replay-ratio","2.0","--seed","42"]}
+]

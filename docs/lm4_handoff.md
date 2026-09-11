@@ -4,27 +4,30 @@
 
 ## 一、现在正在跑什么
 
-服务器上 **6 条队列**(全部 `setsid` 脱离 SSH,PPID=1,我退出/你关终端都不影响):
+服务器上 **2 条合并队列**(每卡一条, 串行;`setsid` 脱离 SSH, PPID=1):
 
-| 队列 | GPU | 内容 | 状态 |
-|:--|:--|:--|:--|
-| `q1_runs_gpu0/1` | 0/1 | 池化对照(last/mean/cat/cat+agg/±lshell) | 收尾 |
-| `q3_runs_gpu0/1` | 0/1 | **持续学习方法扫描**(agg-path × replay{1,2,5,10} × ±lshell) | 进行中 |
-| `q4_runs_gpu0/1` | 0/1 | **任务定义变体**(域数 3/8/12、随机域序、±lshell、±agg) | 刚挂上 |
+| 队列 | GPU | 项数 | 内容 |
+|:--|:--|--:|:--|
+| `run_gpu0.json` | 0 | 8 | replay{5,10} + agg-path 多 seed(7/2026/123)+ 域数 3/8/12 |
+| `run_gpu1.json` | 1 | 8 | agg-path+lshell replay{2,5} + agg-path 多 seed(1/2/3)+ 随机域序/±lshell/±agg |
+
+每卡约 3–4 小时跑完。**注意: 之前曾同时挂 6 条队列导致同一 GPU 上 4 个并发训练进程
+(互相抢 GPU 且会触发超时误杀), 已合并为每卡一条串行队列 —— 后续加任务请追加到
+`tests/run_gpu{0,1}.json` 而不是新开队列。**
 
 **监控命令**:
 ```bash
 ssh -p 6100 root@100.100.30.185
 cd /work/liuyuanjie/headless
-tail -f results/queue_q3_runs_gpu0.log      # 队列进度
+tail -f results/queue_run_gpu0.log          # 队列进度
 nvidia-smi                                   # GPU 利用率
-ls results/q[134]_*/lm4_wave_results.json    # 完成的结果
+ls results/q[1345]_*/lm4_wave_results.json   # 完成的结果
 ```
 
 **聚合结果**:
 ```bash
 /work/liuyuanjie/envs/vllm-cu128/bin/python tests/compare_lm4.py \
-  q1_pool_last q1_pool_mean q1_pool_cat q3_agg_rr2 q4_d3 q4_d8 q4_d12
+  q1_pool_last q1_pool_cat_agg q3_agg_rr2 q5_agg_s7 q4_d3 q4_d8 q4_d12
 ```
 
 ## 二、已完成的关键结论
