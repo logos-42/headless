@@ -161,6 +161,53 @@ joint 上限(0.36 vs 0.43)。**所以上表的 replay 对比不可信,不能归�
 而泄漏版每步混入大量近邻副本, 反而**降低**了训练效率。
 所以"泄漏一定抬高精度"不成立 —— 但它一定**使结论不可信**(replay 效果被邻域记忆污染)。
 
+## 特征升级 v2:WFR 波功率谱(进行中)
+
+**动机**: 见上"天花板位置" —— 当前 4 维特征(`Magnitude`/`rms`/`lambda`/`delta`)
+分辨不了中段密度域(D2/D3 联合训练都只到随机)。需要真正含信息量的波特征。
+
+### 数据集选择的实测结论
+
+把 28 个 RBSP-A EMFISIS 数据集逐个探测后:
+
+| 数据集 | 结论 |
+|---|---|
+| `HFR-SPECTRA_EMFISIS-L2` | ❌ **稀疏/突发**, 实测 2015 年多数时段 `no data for time range` |
+| `WNA-SURVEY_EMFISIS-L4` | ❌ 同样稀疏(波法角 L4 产品但非连续) |
+| **`WFR-SPECTRAL-MATRIX-DIAGONAL-MERGED_EMFISIS-L2`** | ✅ **survey+burst 合并版, 全年连续**; 12 个采样日期全部 599 点/小时 |
+
+**顺带纠正一个此前的误标**: `lambda`/`delta` 不是卫星位置, 而是**磁场矢量的纬/经角**;
+真位置在 MAG L3 的 `coordinates`[km] 字段(当前未取)。L-shell 特征需要重新下载 MAG。
+
+### WFR 内容
+
+6 个对角功率谱, 各 65 个频段(~2 Hz ~ 10 kHz), **6 s 采样(与 DENSITY L4 同频, 可直接对齐)**:
+
+```
+BuBu / BvBv / BwBw  磁功率谱密度 [nT²/Hz]
+EuEu / EvEv / EwEw  电功率谱密度 [(V/m)²/Hz]
+```
+
+物理意义: 哨声/合声/嘶声/磁声波等活动随等离子体状态变化, 且**与 density 无解析关系**
+——不像 `fpe`/`fuh` 那样是标签泄漏。
+
+实测谱形合理(低频强、高频弱): `BuBu` 频段均值 log10 从 **-4.0(低频)递减到 -9.8(高频)**。
+
+### 下载与存储
+
+`tests/dl_wfr.py` —— 并行逐日下载 CSV(395 列), **边下边抽**(原始 ~50 MB/天不落盘),
+存 `log10(PSD)` float16 + 增益, 月度 npz `data/wave/wfr_YYYYMM.npz`(`time[]`, `psd[N,6,65]`)。
+
+### 计划中的特征向量(下一轮)
+
+```
+每时刻 = 4 (MAG: log10 Mag, log10 rms, lambda, delta)
+       + WFR 频段聚合: log10(BuBu+BvBv+BwBw) 分 10 段
+                     + log10(EuEu+EvEv+EwEw) 分 10 段
+                     + 各向异性 log10(BuBu/BwBw) 等 4 维
+       ≈ 28 维  →  替换现有 4 维
+```
+
 ## 文件
 
 | 文件 | 作用 |
