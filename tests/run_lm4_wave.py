@@ -581,18 +581,14 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             prof = (prof / prof.sum()) if prof.sum() > 0 else None
         else:
             prof = None
-        schedule = []
-        for _r in range(n_rounds):
-            if proposer in ("value", "value-nofb"):
-                schedule.append(prop.propose())
-            elif prof is not None:
-                idx = rng_sched.choice(prop.n, size=min(proposer_k, prop.n),
-                                       replace=False, p=prof)
-                for i in idx:
-                    prop.freq[i] += 1
-                schedule.append(list(map(int, idx)))
-            else:
-                schedule.append(prop.pick_random())
+        # ★ 关键: 提案必须**在线**逐轮生成, 不能在训练前一次性预生成。
+        #   预生成会导致 observe() 从未被调用 ->
+        #     acc 全 NaN -> fb(p) ≡ 1.0 (反馈项死)
+        #     learned 为空 -> sim(p) ≡ 1.0 (简约性项死)
+        #   剩 V(i) = 常数 + λ_cov/(1+freq), 退化成一个"均匀化采样器",
+        #   与价值函数无关 (实测 value 与 random-matched 逐位几乎相同,
+        #   就是这个 bug 的签名)。schedule 保持 None, 由主循环在线取。
+        schedule = None
 
     test_loaders = {d: loader_for(test_by_dom[d]) for d in domains}
     n_classes = n_domains
@@ -645,8 +641,20 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     any_time = []          # 每轮的"已见域平均准确率" (在线性能)
     for step in range(n_rounds):
         dd = domains[step] if step < len(domains) else domains[-1]
-        if schedule is not None:
-            pick = schedule[step]
+        if prop is not None:
+            # 在线提案: 此时 prop 已吃过前面所有轮的 observe 反馈
+            if proposer in ("value", "value-nofb"):
+                pick = prop.propose()
+            elif prof is not None:
+                pick = list(rng_sched.choice(prop.n, size=min(proposer_k, prop.n),
+                                             replace=False, p=prof))
+                for i in pick:
+                    prop.freq[i] += 1
+            else:
+                pick = prop.pick_random()
+        if schedule is not None or prop is not None:
+            if prop is None:
+                pick = schedule[step]
             idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
             np.random.RandomState(seed * 131 + step).shuffle(idx_tr)
             dl = loader_for(idx_tr, shuffle=True)
