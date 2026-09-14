@@ -288,7 +288,23 @@ def build_causal_data(n=20000, L=8, seed=0, n_bins=5):
         # ★ 观测/干预必须用**同一个**噪声水平, 否则两边标签难度不同,
         #   "干预比观测准"会是纯假象 (do_intervene 内部写死 noise=0)。
         a = scm.acc(perm, atoms)
-        a_do = scm.do_intervene(perm, atoms)
+        # ★ 干预只点亮**部分**生成元。旧写法把该 perm 的全部生成元并进已学集合,
+        #   known/total ≡ 1 -> acc 恒 ~0.95 -> y_do 有 78.9% 挤在同一类,
+        #   多数类基线 0.789, 模型原始准确率 0.734 竟低于常数预测器 ->
+        #   "干预 vs 观测"的对照完全失去区分度 (实测见 docs/lm5_*).
+        #   干预强度**均匀覆盖**: acc = 0.35 + 0.6*(已学数/总生成元数), 若只允许
+        #   "点亮"则 acc 只会往上走, y_do 仍偏斜 (实测多数类 0.663)。改成先均匀
+        #   抽一个"目标已学数"再补齐, 让 y_do 覆盖整个 [0.35, 0.95] 值域,
+        #   同时也包含"无效干预"(_need=0, 干预后与原观测一致)。
+        _sig = scm.sig_bits(perm)
+        _tot = max(1, int(sum(_sig)))
+        _cur = sum(1 for i in range(6) if _sig[i] and i in atoms)
+        _cand = [i for i in range(6) if _sig[i] and i not in atoms]
+        _target = int(rng.integers(_cur, _tot + 1))
+        _need = min(max(0, _target - _cur), len(_cand))
+        _do_atoms = (list(rng.choice(_cand, size=_need, replace=False))
+                     if _cand and _need else [])
+        a_do = scm.do_intervene(perm, atoms, atoms=_do_atoms)
         # 给干预版补上同样的观测噪声
         a_do_n = float(np.clip(a_do + rng.normal(0, 0.08), 0.02, 0.98))
         y[i] = min(n_bins - 1, max(0, int(a * n_bins)))

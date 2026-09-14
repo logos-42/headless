@@ -158,10 +158,22 @@ class S4WorldSCM:
             base *= 0.88
         return float(np.clip(base + rng.normal(0, noise), 0.02, 0.98))
 
-    def do_intervene(self, perm, learned_atoms):
-        """do()：干预——假设该 perm 的生成元已被覆盖，测量其对 acc 的因果效应。"""
+    def do_intervene(self, perm, learned_atoms, atoms=None):
+        """do()：干预——假设该 perm 的生成元已被覆盖，测量其对 acc 的因果效应。
+
+        atoms=None  (旧语义, 保持向后兼容):
+            把该 perm 的**全部**生成元位并入已学集合。此时 known/total ≡ 1,
+            acc 恒为 ~0.95 —— 输出退化成常数, 不适合做"干预 vs 观测"的对照。
+        atoms=[i,...]  (有区分度的干预):
+            只点亮指定的生成元, acc 随样本变化。
+            实测: 旧语义下 y_do 有 78.9% 挤在同一类, 多数类基线 0.789,
+            模型原始准确率 0.734 竟**低于常数预测器** —— 对照完全失去意义。
+        """
         new_atoms = set(learned_atoms)
-        new_atoms |= {i for i in range(6) if self.sig_bits(perm)[i]}
+        if atoms is None:
+            new_atoms |= {i for i in range(6) if self.sig_bits(perm)[i]}
+        else:
+            new_atoms |= {int(a) for a in atoms}
         return self.acc(perm, new_atoms, noise=0.0)
 
     def counterfactual(self, observed_perm, observed_acc, learned_atoms,
