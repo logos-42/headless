@@ -11,6 +11,21 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**OaK 结构件三件套：Option manager + 反事实 rollout + coverage/uncertainty 门控**
+  - 按用户指点**停止堆 RL 算法**（会变成"算法动物园"），转而补 OaK 的结构性组件：
+    `Prediction → Abstraction → Options → World Model → Planning`
+  - 新建 `hibs_lnn/uncertainty_gate.py`：`TransitionEnsemble`（bootstrap 集成分歧估 `U_T`）+
+    `UncertaintyGate`（`allow = [C(s,a)>τ_C] ∧ [U_T<τ_U]`）+ `rollout`（**一遇不可信即中止**，不硬外推）
+  - 新建 `hibs_lnn/option_manager.py`：`Option=(I_o, π_o, β_o)`，**option 从转移结构发现**
+    （聚类→建图→筛可靠边→找多步路径），`β_o` 是**学习式终止**而非硬阈值
+  - **`tests/test_oak_structure.py` 四测项全过**：① 发现 6 个长度≥2 的 option 且**自动避开高噪声动作**；
+    ①b 远离质心 4/4 预测正确（回归守卫）；② 零覆盖被挡 + U_T 区分高低噪声；③ rollout 遇零覆盖即中止；
+    ④ P(终止) 随接近目标单调上升（β 在 `g−s` 上权重 = −2.10，符号正确）
+  - **修掉 4 个真 bug**：特征冗余常数列（条件数 1.24e16、预测全错）、onehot 与截距共线
+    （远离质心 Δ=[92.7,96.4,25.8,23.7]，真值 0.3/0/0/0）、fit/predict 的「Δ vs 绝对状态」约定不一致
+    （质心处巧合相等而掩盖）、夹具三次尺度错配
+  - 详见 `docs/oak_structure.md`
+
 - 2026-09-14：**分离 δ^pred 与 δ^RL 两条学习信号 + 覆盖度门控（Q15/Q8）**
   - Q15 要求「两个不要混成一个东西」—— 此前 `RLProposer` 只有 reward=Δ(any-time)，没有独立预测通路
   - 新建 `hibs_lnn/dual_proposer.py` `DualSignalProposer`：
