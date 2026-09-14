@@ -464,7 +464,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
                    consolidate_every=10, stat_input=False, backbone="ssm",
                    head_type="linear", norm="batchnorm",
-                   trace_every=0, external_test=None):
+                   trace_every=0, external_test=None,
+                   fine=None, fine_desc=None, proposer="fixed",
+                   lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.5):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -497,6 +499,26 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X[idxs]), torch.from_numpy(y_dom[idxs]))
         return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=shuffle)
+
+    # ── 训练调度 (价值函数 / 随机 / 固定) ──
+    # 评估域仍是原来的 n_domains 个粗域 (保证与历史结果可比);
+    # 调度只改"每轮喂哪批样本"。
+    prop, schedule, fine_test = None, None, {}
+    if proposer != "fixed" and fine is not None:
+        from hibs_lnn.value_proposer import RegimeProposer
+        n_fine = int(fine.max()) + 1
+        prop = RegimeProposer(fine_desc, groups=None, lam=lam,
+                              sigma=proposer_sigma, k=proposer_k,
+                              seed=(seed * 7919 + 29))
+        schedule = []
+        for _r in range(len(domains)):
+            schedule.append(prop.propose() if proposer == "value"
+                            else prop.pick_random())
+        # 每个细区间的测试子集 (取该区间样本的 10%)
+        for f in range(n_fine):
+            idx_f = np.where(fine == f)[0]
+            if len(idx_f) >= 20:
+                fine_test[f] = idx_f[:max(20, len(idx_f) // 10)]
 
     test_loaders = {d: loader_for(test_by_dom[d]) for d in domains}
     n_classes = n_domains
@@ -544,14 +566,33 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
 
     curves = {}        # dd -> [(step, acc)]  学习效率曲线
+    prop_rows = []     # 价值函数调度轨迹
+    n_fine_all = int(fine.max()) + 1 if fine is not None else 0
     for step, dd in enumerate(domains):
-        dl = loader_for(train_by_dom[dd], shuffle=True)
+        if schedule is not None:
+            pick = schedule[step]
+            idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
+            np.random.RandomState(seed * 131 + step).shuffle(idx_tr)
+            dl = loader_for(idx_tr, shuffle=True)
+            # ★ 公平性: proposer 每轮只覆盖 len(pick)/n_fine 的样本。
+            #   步数按比例放大, 保证**每轮消耗的数据量**与固定臂相同,
+            #   否则是拿 1/6 的数据打全程 (实测会低估 proposer 臂)。
+            #   归一化到"每轮数据量 = 一个粗域": 每个细区间占 1/n_fine,
+            #   一个粗域占 n_fine/n_domains 个细区间。k=3/n_fine=18/n_dom=6 时
+            #   系数恰为 1 (3 个细区间 ≈ 21K 样本 ≈ 一个粗域), 不变训。
+            steps_this = max(1, int(round(
+                epochs_per_domain * n_fine_all
+                / max(1, len(domains)) / max(1, len(pick)))))
+        else:
+            pick = [dd]
+            dl = loader_for(train_by_dom[dd], shuffle=True)
+            steps_this = epochs_per_domain
         model.train()
         it = 0
         cur = []
-        while it < epochs_per_domain:
+        while it < steps_this:
             for xb, yb in dl:
-                if it >= epochs_per_domain:
+                if it >= steps_this:
                     break
                 xb, yb = xb.to(device), yb.to(device)
 
@@ -654,10 +695,19 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                         a = evaluate(model, test_loaders[dd], device)
                     model.train(was_training)
                     cur.append((it, a))
+        # ── 价值函数的真实反馈: 测每个刚学过的细区间, 回填 prop ──
+        if prop is not None:
+            for f in pick:
+                if f in fine_test:
+                    prop.observe(f, evaluate(model, loader_for(fine_test[f]), device))
         # 记录: 已见域整体准确率
         row = [evaluate(model, test_loaders[d], device) if d in test_loaders else float('nan')
                for d in domains]
         acc_matrix.append(row)
+        if prop is not None:
+            prop_rows.append({"step": step + 1, "picks": pick,
+                              "value": [round(prop.value(f), 4) for f in pick],
+                              "freq": [int(prop.freq[f]) for f in pick]})
         # 跨年/外部分布: 每步评**所有**外部域, 形成外部矩阵。
         # 只报"刚训完 dd 时在外部 dd 上的准确率"是没有意义的 —— naive 在那个瞬间
         # 恰好专精于 dd, 会得到 1.0。有意义的量是**全流程训完后**的末行。
@@ -681,7 +731,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 idx, size=min(2000, len(idx)), replace=False)
             replay_by_dom[dd] = (torch.from_numpy(X[sel]).to(device),
                                  torch.from_numpy(y_dom[sel]).to(device))
-    return acc_matrix, domains, curves, cross
+    return acc_matrix, domains, curves, cross, prop_rows
 
 
 def efficiency_report(curves, domains, thresholds=(0.5, 0.9)):
@@ -796,6 +846,16 @@ def main():
                     help="StatMLP 归一化: batchnorm (随域漂移) / fixed (冻结全局 mu/sd) / none")
     ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
                     help="分类头: linear (原) / pln (Meta-SGD 逐参数步长) / swifttd (lm1 局部规则)")
+    ap.add_argument("--proposer", choices=["fixed", "random", "value"],
+                    default="fixed",
+                    help="训练调度: fixed=固定域序(默认) random=随机区间 value=价值函数驱动")
+    ap.add_argument("--fine-bins", type=int, default=18,
+                    help="候选区间池大小 (必须 >> 轮数, 否则价值函数被抹平)")
+    ap.add_argument("--proposer-k", type=int, default=3, help="每轮提议几个区间")
+    ap.add_argument("--lam-sim", type=float, default=1.0, help="简约性权重")
+    ap.add_argument("--lam-con", type=float, default=1.0, help="自洽性权重")
+    ap.add_argument("--lam-cov", type=float, default=1.0, help="覆盖增量权重")
+    ap.add_argument("--lam-fb", type=float, default=1.0, help="真实反馈权重")
     ap.add_argument("--backbone", default="mlp", choices=["mlp", "ssm"],
                     help="骨干: mlp = 窗口统计+MLP (探针实测更强更快); ssm = 原复值 SSM")
     ap.add_argument("--stat-input", action="store_true",
@@ -903,9 +963,34 @@ def main():
     else:
         runs = [("naive", False), ("replay", True)]
 
+    # ── 候选区间池 (价值函数的"可选结构") ──
+    # 用物理描述子 [log_dens, logL, |maglat|] 定义, 划分到 --fine-bins 个细区间。
+    # 池必须远大于轮数, 否则价值函数被抹平 (V35.19 v1 的教训)。
+    FINE_IDX, FINE_DESC = None, None
+    if args.proposer != "fixed":
+        nf = args.fine_bins
+        _fine, _ = assign_domains(y_log, nf)
+        FINE_IDX = _fine.astype(np.int64)
+        # 描述子 = [log10 密度] (+ --lshell 时窗口平均的 [log10 偶极 L, sin 磁纬])
+        # 这三者共同定义"物理区间", 相似度 = 描述子空间里的距离。
+        _cols = [y_log]
+        if args.lshell and X.ndim == 3 and X.shape[2] >= 2:
+            _cols.append(X[:, :, -2].mean(1))     # log10 偶极 L
+            _cols.append(X[:, :, -1].mean(1))     # sin 磁纬
+        _D = np.stack(_cols, axis=1)
+        _desc = np.zeros((nf, _D.shape[1]))
+        for f in range(nf):
+            m = (FINE_IDX == f)
+            _desc[f] = _D[m].mean(0) if m.sum() else np.nan
+        ok = np.isfinite(_desc).all(1)
+        _desc[~ok] = np.nanmean(_desc[ok], axis=0) if ok.any() else 0.0
+        FINE_DESC = _desc
+        print("[proposer] 候选池 %d 个区间, 描述子 %d 维, 调度=%s, 每轮提议 %d"
+              % (nf, _D.shape[1], args.proposer, args.proposer_k), flush=True)
+
     for key, replay in runs:
         print(f"\n=== {key} ===", flush=True)
-        M, doms, curves, cross = run_experiment(X, y_dom, device, d_model=args.d_model,
+        M, doms, curves, cross, prop_rows = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
@@ -924,7 +1009,12 @@ def main():
                                  backbone=args.backbone, head_type=args.head,
                                  norm=args.norm,
                                  trace_every=args.trace_every,
-                                 external_test=ext_test)
+                                 external_test=ext_test,
+                                 fine=FINE_IDX, fine_desc=FINE_DESC,
+                                 proposer=args.proposer,
+                                 lam=(args.lam_sim, args.lam_con,
+                                      args.lam_cov, args.lam_fb),
+                                 proposer_k=args.proposer_k)
         s = summarize(M, doms)
         s["curves"] = {str(k): v for k, v in (curves or {}).items()}
         s["cross_external"] = cross                 # 外部矩阵 (每步一行)
@@ -932,6 +1022,9 @@ def main():
             [None if (c != c) else float(c) for c in cross[-1]]
             if cross and cross[-1] is not None else None)
         s["efficiency"] = efficiency_report(curves, doms)
+        # 价值函数调度轨迹 (提议了哪些区间 / 当时的价值 / 累计次数)
+        if prop_rows:
+            s["proposer_trace"] = prop_rows
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
         if ext_test and cross and cross[-1] is not None:
