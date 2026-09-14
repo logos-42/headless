@@ -195,6 +195,15 @@ def build_causal_data(n=20000, L=8, seed=0, n_bins=5):
 # ============================================================
 # 持续学习主循环
 # ============================================================
+def batched_pred(fwd, X, bs=512):
+    """分批前向再 argmax —— 一次性喂整个测试集会 OOM
+    (SSM 的 Ab 张量是 (B,L,d,s) 复数, B=1.2万 时 ~5GB)。"""
+    outs = []
+    for i in range(0, X.shape[0], bs):
+        outs.append(fwd(X[i:i + bs]).argmax(-1))
+    return torch.cat(outs)
+
+
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
            causal=None, n_causal_classes=5,
            d_model=192, d_state=12, n_layers=2, vocab=1000,
@@ -243,7 +252,7 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                 if d == "wave":
                     if d in wave_test:
                         Xte, yte = wave_test[d]
-                        pred = model.forward_wave(Xte).argmax(-1)
+                        pred = batched_pred(model.forward_wave, Xte)
                         out[d] = float((pred == yte).float().mean())
                     else:
                         out[d] = float('nan')
@@ -257,9 +266,9 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                         Xo, yo = causal["test_obs"]
                         Xd, yd = causal["test_do"]
                         out["causal"] = float(
-                            (model.forward_causal(Xo).argmax(-1) == yo).float().mean())
+                            (batched_pred(model.forward_causal, Xo) == yo).float().mean())
                         out["causal_do"] = float(
-                            (model.forward_causal(Xd).argmax(-1) == yd).float().mean())
+                            (batched_pred(model.forward_causal, Xd) == yd).float().mean())
                 else:
                     ids = torch.tensor(text_domains[d][:60000], dtype=torch.long)
                     if len(ids) < CHUNK + 2:
@@ -307,6 +316,9 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                         sidx = torch.randint(0, len(_y), (k,), device=device)
                         parts_x.append(_h[sidx]); parts_y.append(_y[sidx])
                     XB, YB = torch.cat(parts_x), torch.cat(parts_y)
+                    # ★ 同 run_lm4_wave: 必须随机切, 否则 support=新域 / query=旧域
+                    _perm = torch.randperm(XB.shape[0], device=device)
+                    XB, YB = XB[_perm], YB[_perm]
                     half = max(2, XB.shape[0] // 2)
                     with torch.no_grad():
                         h_sup = enc_fn(XB[:half])

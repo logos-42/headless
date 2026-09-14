@@ -59,12 +59,18 @@ class WaveSSM(nn.Module):
 
     def __init__(self, n_feat=N_FEAT, d_model=128, d_state=8, n_layers=2,
                  n_classes=6, pool="cat", agg_path=False, head_type="linear",
-                 pln_d=64, inner_lr=0.1):
+                 pln_d=64, inner_lr=0.1, stat_input=False):
         super().__init__()
         self.pool = pool
         self.agg_path = agg_path
         self.head_type = head_type
-        self.in_proj = nn.Linear(n_feat, d_model)
+        self.stat_input = stat_input
+        # stat_input: 把窗口统计(5*n_feat)拼到**每个时刻的输入**上。
+        #   动机: 探针显示 SSM 的序列编码低于简单统计基线 0.065-0.296
+        #   (docs/lm4_ssm_bottleneck_verdict.md), 而 --agg-path (只拼到头上)
+        #   实测更差 (0.6525 vs 0.7213) —— 说明统计量必须进**递归**才能被用上。
+        n_in = n_feat + 5 * n_feat if stat_input else n_feat
+        self.in_proj = nn.Linear(n_in, d_model)
         self.layers = nn.ModuleList([
             SSM_Layer_V30_3(d_model, d_state, layer_idx=i, ent_mode='none')
             for i in range(n_layers)])
@@ -81,6 +87,9 @@ class WaveSSM(nn.Module):
 
     def encode(self, x, agg=None):
         """x: (B, L, n_feat) → 表示 s (B, d_head)。双循环里内/外循环都复用这个 s。"""
+        if self.stat_input:
+            st = window_agg(x)                       # (B, 5*n_feat)
+            x = torch.cat([x, st.unsqueeze(1).expand(-1, x.shape[1], -1)], dim=-1)
         h = self.in_proj(x)
         for layer in self.layers:
             h, _ = layer(h)
@@ -99,6 +108,55 @@ class WaveSSM(nn.Module):
 
     def forward(self, x, agg=None):
         """x: (B, L, n_feat) → logits (B, n_classes)"""
+        return self.head(self.encode(x, agg))
+
+
+class StatMLP(nn.Module):
+    """窗口统计 + MLP backbone (替代 SSM)。
+
+    依据: GPU 探针 (docs/lm4_ssm_bottleneck_verdict.md) 显示
+      域数   MLP聚合基线   SSM joint   架构损失
+       3     0.9159       0.8510      +0.065
+       6     0.8065       0.7213      +0.085
+      12     0.6638       0.3674      +0.296
+    SSM 在**每个**粒度上都低于这个"不做序列建模"的基线, 且差距随粒度扩大。
+    所以换掉它: 更快 (无递归)、更强、且同样的 CL 机制 (PLN/SwiftTD 头) 照常可用。
+
+    接口与 WaveSSM 对齐 (encode / forward), 这样 run_experiment 不用改分支。
+    """
+
+    def __init__(self, n_feat=N_FEAT, n_classes=6, hidden=512, n_layers=3,
+                 head_type="linear", pln_d=64, inner_lr=0.1, dropout=0.0,
+                 stat_input=True, **kw):
+        super().__init__()
+        self.n_feat = n_feat
+        self.head_type = head_type
+        # 聚合特征: mean/std/last/first/斜率 = 5*n_feat
+        d_in = 5 * n_feat
+        mods = [nn.Linear(d_in, hidden), nn.GELU()]
+        if dropout > 0:
+            mods.append(nn.Dropout(dropout))
+        for _ in range(n_layers - 1):
+            mods += [nn.Linear(hidden, hidden), nn.GELU()]
+            if dropout > 0:
+                mods.append(nn.Dropout(dropout))
+        self.body = nn.Sequential(*mods)
+        self.d_head = hidden
+        self.d_wave = hidden
+        if head_type == "swifttd":
+            from hibs_lnn.pln_head import SwiftTDAdapter
+            self.head = SwiftTDAdapter(hidden, n_classes)
+        elif head_type == "pln":
+            from hibs_lnn.pln_head import PLNHead
+            self.head = PLNHead(hidden, pln_d, n_classes, inner_lr=inner_lr)
+        else:
+            self.head = nn.Linear(hidden, n_classes)
+
+    def encode(self, x, agg=None):
+        """x: (B, L, F) -> (B, hidden)。agg 参数仅为接口兼容。"""
+        return self.body(window_agg(x))
+
+    def forward(self, x, agg=None):
         return self.head(self.encode(x, agg))
 
 
@@ -368,7 +426,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    pool="cat", agg_path=False, shuffle_domains=False,
                    cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
-                   consolidate_every=10):
+                   consolidate_every=10, stat_input=False, backbone="ssm"):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -402,11 +460,17 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
 
     test_loaders = {d: loader_for(test_by_dom[d]) for d in domains}
     n_classes = n_domains
-    model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
-                    d_state=d_state, n_layers=n_layers,
-                    n_classes=n_classes, pool=pool, agg_path=agg_path,
-                    head_type=("pln" if use_pln else "linear"),
-                    pln_d=pln_d, inner_lr=inner_lr).to(device)
+    ht = ("pln" if use_pln else "linear")
+    if backbone == "mlp":
+        model = StatMLP(n_feat=n_feat or X.shape[-1], n_classes=n_classes,
+                        hidden=d_model, head_type=ht, pln_d=pln_d,
+                        inner_lr=inner_lr).to(device)
+    else:
+        model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
+                        d_state=d_state, n_layers=n_layers,
+                        n_classes=n_classes, pool=pool, agg_path=agg_path,
+                        head_type=ht, pln_d=pln_d, inner_lr=inner_lr,
+                        stat_input=stat_input).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     # 双循环: 外循环 (慢, 表示+meta 参数) 与 内循环 (快, 仅头)
     opt_outer = opt
@@ -458,6 +522,11 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                             sel = torch.randint(0, len(bx), (m,), device=device)
                             parts_x.append(bx[sel]); parts_y.append(by[sel])
                     XB, YB = torch.cat(parts_x), torch.cat(parts_y)
+                    # ★ 必须**随机**切 support/query。批次是 [当前域..., 回放(旧域)...]
+                    #   拼的, 按位置切会让 support=纯新域 / query=纯旧域 ->
+                    #   元目标退化成"适应新域、再在旧域上预测" -> 教模型摧毁旧域可分性。
+                    _perm = torch.randperm(XB.shape[0], device=device)
+                    XB, YB = XB[_perm], YB[_perm]
                     half = max(2, XB.shape[0] // 2)
                     xq, yq = XB[half:], YB[half:]
                     if xq.shape[0] < 2:
@@ -563,7 +632,7 @@ def summarize(acc_matrix, domains):
 
 def run_joint(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
               steps=1500, batch=32, lr=1e-3, seed=42, n_domains=6, n_feat=None,
-              pool="cat", agg_path=False):
+              pool="cat", agg_path=False, stat_input=False, backbone="ssm"):
     """诊断: 所有域混合训练 (非持续学习上限)。若这个也学不好 → 特征/任务定义有问题。"""
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     tr_idx, te_by_dom = [], {}
@@ -580,9 +649,14 @@ def run_joint(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     ds = torch.utils.data.TensorDataset(
         torch.from_numpy(X[tr_idx]), torch.from_numpy(y_dom[tr_idx]))
     dl = torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=True)
-    model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
-                    d_state=d_state, n_layers=n_layers,
-                    n_classes=n_domains, pool=pool, agg_path=agg_path).to(device)
+    if backbone == "mlp":
+        model = StatMLP(n_feat=n_feat or X.shape[-1], n_classes=n_domains,
+                        hidden=d_model).to(device)
+    else:
+        model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
+                        d_state=d_state, n_layers=n_layers,
+                        n_classes=n_domains, pool=pool, agg_path=agg_path,
+                        stat_input=stat_input).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()
     it = 0
@@ -620,6 +694,10 @@ def main():
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
                     help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
+    ap.add_argument("--backbone", default="mlp", choices=["mlp", "ssm"],
+                    help="骨干: mlp = 窗口统计+MLP (探针实测更强更快); ssm = 原复值 SSM")
+    ap.add_argument("--stat-input", action="store_true",
+                    help="把窗口统计拼到每个时刻的输入上 (修 SSM 丢全局信息的候选方案)")
     ap.add_argument("--agg-path", action="store_true",
                     help="窗口聚合统计量直接拼进分类头 (聚合直通车)")
     ap.add_argument("--epochs-per-domain", type=int, default=300)
@@ -679,7 +757,8 @@ def main():
             X, y_dom, device, d_model=args.d_model, d_state=args.d_state,
             n_layers=args.n_layers, steps=args.joint_steps, batch=args.batch,
             lr=args.lr, seed=args.seed, n_domains=args.domains, n_feat=d_feat,
-            pool=args.pool, agg_path=args.agg_path)
+            pool=args.pool, agg_path=args.agg_path,
+            stat_input=args.stat_input, backbone=args.backbone)
         print("  → 联合训练平均 acc %.4f | 各域 %s" % (
             joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
         results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
@@ -708,7 +787,9 @@ def main():
                                  inner_lr=args.inner_lr, outer_lr=args.outer_lr,
                                  meta_every=args.meta_every,
                                  reptile_lr=args.reptile_lr,
-                                 consolidate_every=args.consolidate_every)
+                                 consolidate_every=args.consolidate_every,
+                                 stat_input=args.stat_input,
+                                 backbone=args.backbone)
         s = summarize(M, doms)
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
@@ -748,7 +829,8 @@ def main():
         "use_lshell": args.lshell, "stride": eff_stride,
         "d_model": args.d_model, "d_state": args.d_state,
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
-        "pool": args.pool, "agg_path": args.agg_path,
+        "pool": args.pool, "agg_path": args.agg_path, "stat_input": args.stat_input,
+        "backbone": args.backbone,
         "shuffle_domains": args.shuffle_domains,
         "cl_method": args.cl_method, "pln_d": args.pln_d,
         "inner_k": args.inner_k, "inner_lr": args.inner_lr,
