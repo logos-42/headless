@@ -83,7 +83,9 @@ def build_variables(data_dir, bands=13, use_lshell=True, sample=20000, seed=0):
 def discover(X, names, alpha=0.3, max_order=2, seed=0, tag=""):
     rng = np.random.default_rng(seed)
     t0 = time.time()
+    t_c = time.time()
     adj = pc_skeleton(X, names, alpha=alpha, max_order=max_order, rng=rng)
+    print(f"  [pc] 骨架完成 {time.time()-t_c:.0f}s", flush=True)
     edges = [(names[i], names[j]) for (i, j), v in adj.items() if v]
     print(f"\n=== PC 骨架 {tag} (alpha={alpha}, order<={max_order}, {time.time()-t0:.0f}s) ===")
     print(f"  变量 {len(names)} 个, 边 {len(edges)} 条 (完全图 {len(names)*(len(names)-1)//2} 条)")
