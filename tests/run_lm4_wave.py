@@ -133,7 +133,9 @@ class StatMLP(nn.Module):
         self.head_type = head_type
         # 聚合特征: mean/std/last/first/斜率 = 5*n_feat
         d_in = 5 * n_feat
-        mods = [nn.Linear(d_in, hidden), nn.GELU()]
+        # ★ 必须标准化。探针 (probe_ceiling.py) 对聚合特征做了 (x-mu)/sd, 实测
+        #   6 域 0.8065; 不做标准化的 StatMLP 只有 0.6558 —— 差 0.15 全在这一点。
+        mods = [nn.BatchNorm1d(d_in), nn.Linear(d_in, hidden), nn.GELU()]
         if dropout > 0:
             mods.append(nn.Dropout(dropout))
         for _ in range(n_layers - 1):
@@ -426,7 +428,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    pool="cat", agg_path=False, shuffle_domains=False,
                    cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
-                   consolidate_every=10, stat_input=False, backbone="ssm"):
+                   consolidate_every=10, stat_input=False, backbone="ssm",
+                   head_type="linear"):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -434,7 +437,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                      (per-feature 步长), query loss 反传全模型, 再合并
     """
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    use_pln = cl_method in ("oml", "oml2")
+    # head_type 与 cl_method 解耦: 否则 "OML 失败" 分不清是 OML 的问题
+    # 还是它默认带的 PLN 头(2 层 tanh MLP)的问题 —— 这是同时变两个变量的混淆。
+    use_pln = head_type in ("pln", "swifttd")
 
     # 每域划分 train/test
     train_by_dom, test_by_dom = {}, {}
@@ -460,7 +465,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
 
     test_loaders = {d: loader_for(test_by_dom[d]) for d in domains}
     n_classes = n_domains
-    ht = ("pln" if use_pln else "linear")
+    ht = head_type
     if backbone == "mlp":
         model = StatMLP(n_feat=n_feat or X.shape[-1], n_classes=n_classes,
                         hidden=d_model, head_type=ht, pln_d=pln_d,
@@ -694,6 +699,8 @@ def main():
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
                     help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
+    ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
+                    help="分类头: linear (原) / pln (Meta-SGD 逐参数步长) / swifttd (lm1 局部规则)")
     ap.add_argument("--backbone", default="mlp", choices=["mlp", "ssm"],
                     help="骨干: mlp = 窗口统计+MLP (探针实测更强更快); ssm = 原复值 SSM")
     ap.add_argument("--stat-input", action="store_true",
@@ -789,7 +796,7 @@ def main():
                                  reptile_lr=args.reptile_lr,
                                  consolidate_every=args.consolidate_every,
                                  stat_input=args.stat_input,
-                                 backbone=args.backbone)
+                                 backbone=args.backbone, head_type=args.head)
         s = summarize(M, doms)
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
@@ -830,7 +837,7 @@ def main():
         "d_model": args.d_model, "d_state": args.d_state,
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
         "pool": args.pool, "agg_path": args.agg_path, "stat_input": args.stat_input,
-        "backbone": args.backbone,
+        "backbone": args.backbone, "head": args.head,
         "shuffle_domains": args.shuffle_domains,
         "cl_method": args.cl_method, "pln_d": args.pln_d,
         "inner_k": args.inner_k, "inner_lr": args.inner_lr,
