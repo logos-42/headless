@@ -1,0 +1,248 @@
+"""oak_proposer.py — OaK 提议器: 把 InternalKnowledge + Options 接进主回路。
+
+## 状态/动作的定义 (在这个问题里)
+
+    state  = 各细区间的**能力画像** (维度 = n_fine)   "我现在会什么"
+    action = 选哪个细区间训练 (0..n_fine-1)
+    next   = 训练后的新能力画像
+    reward = Δ(any-time 准确率)
+
+这就是真实的持续学习闭环: **动作是"去练哪块", 环境是"练完能力怎么变"。**
+`T(s,a) -> s'` 因此是一个**真正可学、数据里天然存在**的转移 —— 不是硬凑的。
+
+## 结构
+
+    OAKProposer
+      ├── base    : RLProposer        (Level 3 价值/策略知识, 复用已验证机制)
+      └── know    : InternalKnowledge (Level 1/2/4 + 三类元知识)
+            ├── predictions  GVFBank
+            ├── dynamics     TransitionEnsemble
+            ├── options      OptionManager
+            ├── uncertainty  UncertaintyGate
+            ├── coverage     Coverage
+            └── plasticity   Plasticity
+
+## act() 的决策顺序
+
+    ① 有 option 在跑且未终止  -> 沿 option 的动作序列走
+    ② 否则取 base 的候选      -> 过**门控**; 被拒则退回已覆盖动作
+    ③ 记录 (state, action)    -> 供 dynamics/option 发现用
+
+## E9 vs E10 就是一个 flag
+
+    use_options=False  -> E9  (+coverage/uncertainty 门控)
+    use_options=True   -> E10 (+Options)
+    两者共用同一 base 与同一门控, 差异**只**在于是否使用时间抽象。
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from hibs_lnn.knowledge import InternalKnowledge
+
+
+class OAKProposer:
+    def __init__(self, fine_desc, n_fine, k=3, seed=0, tau=0.5,
+                 mu=0.05, alpha0=0.2, explore_w=0.5, algo="autostep",
+                 n_know=0, use_options=True, use_gate=True,
+                 n_models=5, refresh_every=4, min_transitions=40,
+                 n_regions=4, max_opt_len=3):
+        from hibs_lnn.rl_proposer import RLProposer
+        self.n_fine = int(n_fine)
+        self.n = self.n_fine
+        self.k = int(k)
+        self.seed = seed
+        self.use_options = bool(use_options)
+        self.use_gate = bool(use_gate)
+        self.refresh_every = int(refresh_every)
+        self.min_transitions = int(min_transitions)
+        self.n_regions = int(n_regions)
+        self.max_opt_len = int(max_opt_len)
+
+        # Level 3: 复用已验证的 RL 提议器
+        self.base = RLProposer(fine_desc, tau=tau, k=k, mu=mu, alpha0=alpha0,
+                               explore_w=explore_w, algo=algo, n_know=n_know,
+                               seed=seed)
+        # ★ 内部知识**惰性创建**: 状态维度在构造时未知。
+        #   主回路的状态是 `row` = 每**粗域**准确率 (长度 = --domains),
+        #   而动作数是细区间数 n_fine —— 两个维度**不同**。
+        #   (实测: 按 n_fine 建 GVF 会在 observe 时撞
+        #    `size 3 is different from 6`)。
+        self._know_cfg = dict(n_models=n_models, seed=seed, alpha0=alpha0, mu=mu)
+        self.know = None
+        self.dim_state = None
+
+        # 转移日志: (state_t, action, state_{t+1})
+        self.trans = []
+        self._prev_state = None
+        self._prev_pick = None
+        self._last_acc = {}
+        self._opt_queue = []          # 正在执行的 option 剩余动作
+        self._opt_active = None
+        self.refresh_count = 0
+        self.untrusted_picks = 0      # 提议落在不可信区的次数 (仅诊断)
+        self.fallback_count = 0       # 保留字段 (旧: 门控重定向次数, 已废弃)
+        self.option_steps = 0         # 由 option 决定的步数
+        self.option_starts = 0        # option 被启动的次数
+
+    # ── 惰性初始化 ──────────────────────────────────────────────────
+    def _ensure_know(self, dim_state):
+        if self.know is not None:
+            return self.know
+        self.dim_state = int(dim_state)
+        self.know = InternalKnowledge(self.n_fine, self.dim_state, **self._know_cfg)
+        self.know.register_value_fn(
+            lambda s, a: float(self._last_acc.get(int(a), np.nan)),
+            policy="rl-base")
+        return self.know
+
+    # ── 记录环境反馈 ────────────────────────────────────────────────
+    def set_state(self, state):
+        """每轮训练后由主回路喂入**新**能力画像。"""
+        st = np.asarray(state, dtype=float)
+        self._ensure_know(st.shape[0])
+        if self._prev_state is not None and self._prev_pick is not None:
+            for a in (self._prev_pick if isinstance(self._prev_pick, (list, tuple))
+                      else [self._prev_pick]):
+                self.trans.append((self._prev_state.copy(), int(a), st.copy()))
+                self.know.observe_action(int(a))
+        self._prev_state = st
+        self._last_acc = {i: float(v) for i, v in enumerate(st)
+                          if np.isfinite(v)}
+
+    def set_pick(self, pick):
+        """记录本轮真正执行的动作。"""
+        self._prev_pick = list(pick) if isinstance(pick, (list, tuple)) else [pick]
+
+    # ── 动作选择 ───────────────────────────────────────────────────
+    def act(self):
+        # ① option 在执行中
+        if self.use_options and self._opt_queue:
+            a = int(self._opt_queue.pop(0))
+            self.option_steps += 1
+            if not self._opt_queue:
+                self._opt_active = None
+            return [a]
+
+        pick = list(self.base.act())
+
+        # ② ★ 门控**不用于 action selection**。
+        #   早先版本在这里把零覆盖动作重定向到 `argmin(visits)` 的已覆盖动作,
+        #   结果是灾难性的: 一旦某个动作被覆盖, 门控就把**所有**提议都指向它
+        #   (实测 `per_action = [0,9,0,0,0,0]`, 9 轮只练了 1 个区间, 探索崩塌)。
+        #
+        #   语义纠正 (Q8 原文): "目标策略必须在现有经验中得到足够的信息支持" ——
+        #   这约束的是**模型驱动的规划决策** (凭预测去选), **不是**阻止 base
+        #   policy 去探索。往零覆盖区探索恰恰是想要的: 覆盖度只能这样长起来。
+        #   所以门控只作用在**模型被咨询**的地方 (option 选择 / rollout),
+        #   那两处已由 OptionManager.select(exclude_unc=True) 与
+        #   ens.rollout(gate=...) 各自保证。
+        if self.use_gate and self.know is not None:
+            # 只**记录**当前提议是否落在不可信区 (诊断用, 不做干预)
+            for a in pick:
+                if int(a) < self.n_fine:
+                    _, unc = self.know.predict(self._prev_state
+                                               if self._prev_state is not None
+                                               else np.zeros(self.dim_state or 1), int(a))
+                    tau = self.know.uncertainty.tau_U
+                    if (not np.isfinite(unc)) or (tau and unc >= tau):
+                        self.untrusted_picks += 1
+
+        # ③ 起一个新 option
+        if self.use_options and self.know is not None and self.know.options is not None \
+                and self._prev_state is not None:
+            o = self.know.options.select(self._prev_state, exclude_unc=True)
+            if o is not None and len(getattr(o, "actions", [])) > 1:
+                self._opt_active = o
+                # ★ 返回 option 的**第一个**动作。早先实现假设"起点的那个动作
+                #   已经执行过了", 于是只排队 actions[1:] —— 结果 option 的语义
+                #   只被用了一半, option_steps 实测只有 1~2 步。
+                self._opt_queue = [int(x) for x in o.actions[1:]]
+                self.option_starts += 1
+                return [int(o.actions[0])]
+        return pick
+
+    # ── 奖励 → 参数更新 (+ 知识维护) ────────────────────────────────
+    def observe(self, pick, acc, any_time):
+        self.base.observe(pick, acc=acc, any_time=any_time)
+
+    def update(self, pick):
+        self.base.update(pick)
+        # 预测知识: cumulant = 各区间能力本身 (GVF 学"能力会怎么走")
+        if self.know is not None and self._prev_state is not None:
+            phi = self._prev_state
+            cums = [float(np.mean(phi)),
+                    float(np.max(phi) - np.min(phi)),
+                    float(np.std(phi)),
+                    float(np.mean(np.diff(np.sort(phi)[::-1][:3])) if self.n_fine >= 3 else 0.0)]
+            self.know.observe_gvf(phi, cums, phi)
+        # 周期性重建 world model + 重新发现 option
+        if (self.know is not None and len(self.trans) >= self.min_transitions
+                and self.refresh_count < len(self.trans) // max(1, self.refresh_every)):
+            self.refresh()
+            self.refresh_count += 1
+
+    def refresh(self):
+        """把转移日志灌进 dynamics ensemble -> 标定门控 -> 重新发现 options。"""
+        if self.know is None:
+            return
+        try:
+            X = np.array([np.append(s, a) for s, a, _ in self.trans])
+            Y = np.array([sp for _, _, sp in self.trans])
+            self.know.fit_dynamics(X, Y)
+            from hibs_lnn.option_manager import OptionManager
+            om = OptionManager(self.know.dynamics_model, self.know.uncertainty,
+                               max_len=self.max_opt_len, seed=self.seed)
+            states = np.array([s for s, _, _ in self.trans])
+            acts = np.array([a for _, a, _ in self.trans])
+            om.discover(states, acts, n_regions=min(self.n_regions,
+                                                    max(2, len(states) // 10)))
+            self.know.register_options(om)
+        except Exception as e:      # 知识重建失败不该拖垮主实验
+            print("!! knowledge refresh 失败:", e, flush=True)
+
+    # ── 诊断 ───────────────────────────────────────────────────────
+    def stats(self):
+        s = self.base.proposer_stats() if hasattr(self.base, "proposer_stats") else {}
+        if self.know is None:
+            s.update({"n_trans": len(self.trans), "refreshes": 0, "n_options": 0,
+                      "option_steps": self.option_steps,
+            "option_starts": self.option_starts, "untrusted_picks": self.untrusted_picks,
+                      "coverage_total": 0, "tau_U": None, "gvf_steps": [], "alpha_std": 0.0})
+            return s
+        s.update({
+            "n_trans": len(self.trans),
+            "refreshes": self.refresh_count,
+            "n_options": len(self.know.skills()),
+            "option_steps": self.option_steps,
+            "option_starts": self.option_starts,
+            "untrusted_picks": self.untrusted_picks,
+            "coverage_total": int(self.know.coverage.n_total),
+            "tau_U": self.know.uncertainty.tau_U,
+            "gvf_steps": [g.steps for g in self.know.predictions.gvfs],
+            "alpha_std": float(self.know.plasticity.alpha.std()),
+        })
+        return s
+
+    def stats_extra(self):
+        """主实验落盘用。"""
+        if self.know is None:
+            return {"knowledge": {"n_options": 0, "coverage": {}, "plasticity": {},
+                                  "tau_U": None, "options": []},
+                    "oak": {"use_options": self.use_options, "use_gate": self.use_gate,
+                            "n_trans": len(self.trans), "refreshes": 0,
+                            "option_steps": self.option_steps,
+            "option_starts": self.option_starts,
+                            "untrusted_picks": self.untrusted_picks}}
+        d = self.know.describe()
+        return {"knowledge": {
+            "n_options": d["Level4_abstraction"]["n_options"],
+            "coverage": d["meta_coverage"],
+            "plasticity": d["meta_plasticity"],
+            "tau_U": d["meta_uncertainty"]["tau_U"],
+            "options": d["Level4_abstraction"]["options"],
+        }, "oak": {"use_options": self.use_options, "use_gate": self.use_gate,
+                   "n_trans": len(self.trans), "refreshes": self.refresh_count,
+                   "option_steps": self.option_steps,
+            "option_starts": self.option_starts,
+                   "untrusted_picks": self.untrusted_picks}}

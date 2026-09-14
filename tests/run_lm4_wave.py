@@ -544,7 +544,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    y_log=None, bands=13, use_lshell=False,
                    rl_mu=0.05, rl_alpha0=0.2, rl_explore_w=0.5, rl_algo="autostep",
                    rl_know=0, schedule_str="",
-                   lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0):
+                   lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0,
+                   oak_options=1, oak_gate=1, oak_refresh=4):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -641,6 +642,20 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
               % (rlprop.n, rlprop.fdim, rl_algo, rl_mu, rl_alpha0, rl_explore_w),
               flush=True)
 
+    oakprop = None
+    if proposer == "oak":
+        # ★ OaK 提议器: 包住 RLProposer(Level 3) + InternalKnowledge(Level 1/2/4 + 元知识)。
+        #   E9 vs E10 只差 use_options: 同一 base、同一门控, 唯一变量是时间抽象。
+        from hibs_lnn.oak_proposer import OAKProposer
+        oakprop = OAKProposer(fine_desc, n_fine=int(fine.max()) + 1,
+                              k=proposer_k, seed=(seed * 7919 + 29),
+                              mu=rl_mu, alpha0=rl_alpha0, explore_w=rl_explore_w,
+                              algo=rl_algo, n_know=int(rl_know),
+                              use_options=bool(oak_options), use_gate=bool(oak_gate),
+                              refresh_every=oak_refresh)
+        print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s refresh=%d"
+              % (oakprop.n_fine, oak_options, oak_gate, rl_algo, oak_refresh), flush=True)
+
     if proposer == "bins":
         # ★ 显式 schedule 优先: 用于执行规划器给出的序列 (真实环境验证)
         # ★ 不能用 args: run_experiment 是独立函数, args 只存在于 main。
@@ -682,7 +697,10 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         dom_seq = [int(x) for x in dom_seq[:n_rounds]]
         schedule = [bins_of.get(d, []) for d in dom_seq]
         print("[stream] %s -> 粗域序列 %s" % (stream, dom_seq), flush=True)
-    elif proposer != "fixed":
+    elif proposer != "fixed" and proposer != "oak":
+        # ★ oak 自己包了 RLProposer, 不需要 RegimeProposer。
+        #   早先漏了这个排除, oak 臂会白白多建一个 value proposer
+        #   (表现为多打印 `[con] 自洽性注入 ... 0=该项死亡` 且白跑 observe)。
         from hibs_lnn.value_proposer import RegimeProposer
         if proposer == "value-nofb":
             lam = (lam[0], lam[1], lam[2], 0.0)      # 关掉真实反馈项
@@ -771,7 +789,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     any_time = []          # 每轮的"已见域平均准确率" (在线性能)
     for step in range(n_rounds):
         dd = domains[step] if step < len(domains) else domains[-1]
-        if rlprop is not None:
+        if oakprop is not None:
+            pick = oakprop.act()                    # ← 动作 (含 option / 门控)
+        elif rlprop is not None:
             pick = rlprop.act()                     # ← 动作
         elif prop is not None:
             # 在线提案: 此时 prop 已吃过前面所有轮的 observe 反馈
@@ -784,8 +804,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                     prop.freq[i] += 1
             else:
                 pick = prop.pick_random()
-        if schedule is not None or prop is not None or rlprop is not None:
-            if prop is None and rlprop is None:
+        if schedule is not None or prop is not None or rlprop is not None or oakprop is not None:
+            if prop is None and rlprop is None and oakprop is None:
                 pick = schedule[step]
             idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
             np.random.RandomState(seed * 131 + step).shuffle(idx_tr)
@@ -939,6 +959,18 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             _kv = np.concatenate([_row, _vis, [_at, _forg]])
             if _kv.size >= rlprop.n_know:
                 rlprop.set_knowledge(_kv[:rlprop.n_know])
+        if oakprop is not None:
+            _accs = [evaluate(model, loader_for(fine_test[f]), device)
+                     for f in pick if f in fine_test]
+            _at = float(np.mean([v for v in row if not math.isnan(v)]))
+            oakprop.observe(pick, acc=(float(np.mean(_accs)) if _accs else 0.5),
+                            any_time=_at)
+            # ★ 记录 (状态, 动作, 新状态) 与反馈; 顺序要紧:
+            #   set_pick 必须先于 set_state —— set_state 内部用**上一次**的
+            #   prev_state/prev_pick 组装转移, 再覆盖成新状态。
+            oakprop.set_pick(pick)
+            oakprop.set_state(row)
+            oakprop.update(pick)                     # 奖励 → 参数更新 + 知识维护
         if rlprop is not None:
             _accs = [evaluate(model, loader_for(fine_test[f]), device)
                      for f in pick if f in fine_test]
@@ -995,6 +1027,15 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         extra["proposer_stats"] = rlprop.stats()
         extra["rl_trace"] = rlprop.trace
         extra["rl_n_know"] = int(getattr(rlprop, "n_know", 0))
+    if oakprop is not None:
+        extra["proposer_freq"] = [int(x) for x in oakprop.know.coverage.n]
+        extra["proposer_stats"] = oakprop.stats()
+        # ★ 知识诊断块: 主回路里**真实**发现了多少 option、门控拦了几次、
+        #   转移日志有多长 —— 没有这些就无法判断 OaK 组件是否真的在起作用。
+        _kex = oakprop.stats_extra()
+        extra["oak"] = _kex["oak"]
+        extra["knowledge"] = _kex["knowledge"]
+        extra["oak_transitions"] = int(len(oakprop.trans))
     return acc_matrix, domains, curves, cross, prop_rows, extra
 
 
@@ -1134,9 +1175,16 @@ def main():
                     help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
                          "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
                          "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
+    ap.add_argument("--oak-options", type=int, default=1,
+                    help="OaK: 1=启用 Options/时间抽象 (E10), 0=关闭 (E9). "
+                         "★ 这是 E9 vs E10 的**唯一**变量 —— 同一 base、同一门控")
+    ap.add_argument("--oak-gate", type=int, default=1,
+                    help="OaK: 1=启用 coverage+uncertainty 门控 (安全层), 0=关闭")
+    ap.add_argument("--oak-refresh", type=int, default=4,
+                    help="每积累多少条转移重建一次 world model + 重新发现 option")
     ap.add_argument("--proposer",
                     choices=["fixed", "bins", "random", "random-matched",
-                             "value", "value-nofb", "rl"],
+                             "value", "value-nofb", "rl", "oak"],
                     default="fixed",
                     help="训练调度: fixed=固定域序(默认) random=随机区间 value=价值函数驱动")
     ap.add_argument("--fine-bins", type=int, default=18,
@@ -1332,10 +1380,29 @@ def main():
                                  rl_algo=args.rl_algo, rl_know=args.rl_know,
                                  schedule_str=args.schedule,
                                  rl_explore_w=args.rl_explore_w,
+                                 oak_options=args.oak_options,
+                                 oak_gate=args.oak_gate,
+                                 oak_refresh=args.oak_refresh,
                                  stream=args.stream, rounds=args.rounds,
                                  freq_profile=freq_prof,
                                  y_log=y_log, bands=args.wfr_bands,
                                  use_lshell=args.lshell)
+        # ★ 回读断言: 证明 oak 的三个 flag **真的传到了 run_experiment**。
+        #   上次 `--rl-algo/--rl-mu/--rl-alpha0` 只加了签名和 CLI、调用点没接,
+        #   导致四个臂跑同一配置且给出**逐位相同**结果, 整个对照作废。
+        if args.proposer == "oak":
+            _oak_st = (extra or {}).get("oak")
+            assert _oak_st is not None, (
+                "--proposer oak 但结果里没有 oak 诊断块 -> 配置没生效")
+            assert bool(_oak_st.get("use_options")) == bool(args.oak_options), (
+                "oak_options 未传到 run_experiment: 期望 %s 实得 %s"
+                % (args.oak_options, _oak_st.get("use_options")))
+            assert bool(_oak_st.get("use_gate")) == bool(args.oak_gate), (
+                "oak_gate 未传到 run_experiment")
+            print("[verify] oak 配置回读 OK: options=%s gate=%s n_trans=%s options_found=%s"
+                  % (_oak_st.get("use_options"), _oak_st.get("use_gate"),
+                     _oak_st.get("n_trans"),
+                     ((extra or {}).get("knowledge") or {}).get("n_options")), flush=True)
         s = summarize(M, doms)
         s["curves"] = {str(k): v for k, v in (curves or {}).items()}
         s["cross_external"] = cross                 # 外部矩阵 (每步一行)

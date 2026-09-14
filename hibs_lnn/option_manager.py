@@ -81,7 +81,11 @@ class Option:
 
     def stats(self):
         rate = (self.success / self.visits) if self.visits else 0.0
+        # ★ 必须暴露 actions: 多步**动作序列**正是 option 的全部意义
+        #   (时间抽象 = s -> a1..ak)。早先只返回 `len`, 日志里全是 actions=None,
+        #   等于把 option 最有信息量的部分丢了。
         return {"oid": self.oid, "len": len(self.actions),
+                "actions": [int(x) for x in self.actions],
                 "start": np.round(self.start_center, 3).tolist(),
                 "goal": np.round(self.goal_center, 3).tolist(),
                 "visits": self.visits, "success_rate": round(rate, 3),
