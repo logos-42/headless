@@ -11,6 +11,20 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**Benchmark 结算 —— 价值函数未能优于频率对齐对照（负面结论）**
+  - lm4 + lm5 新 benchmark 全臂（8 + 7 臂 × 3 seed）结算，报告 `docs/bm_benchmark_results.md`，脚本 `tests/analyze_bm_full.py`
+  - **唯一干净对照 `value` vs `random-matched`**：lm4 replay Δ=−0.0045（t=−0.32）/ any-time Δ=+0.0125（t=+0.47）
+    —— **不显著且数值略低**；lm4 **最差遗忘界 Δ=+0.1509（t=+2.22）显著更差**；
+    lm5 replay Δ=+0.0030（t=+0.07）不显著、any-time Δ=+0.0361（t=+2.06）边缘显著更好、最差遗忘界不显著
+    → **lm4 与 lm5 方向互相矛盾，只能判「测不出稳定效应」**
+  - **连混淆对照也赢不了**：`value` vs `random`（均匀随机）lm4 replay Δ=−0.0197 → 表现不佳**不是**频率分布差异造成的假象
+  - **`λ_fb` 是死代码（真 bug）**：`value-nofb` 与 `value` 逐位相同（三指标 Δ=+0.0000 / t=+0.00，提议频率向量完全一致）
+    → 「真实反馈 = 1−acc」对调度**零影响**，此前把 value 臂读作「含反馈的有效性」不成立，必须修
+  - **「方差稳定器」说法推翻**：干净配置下 lm4 value replay CV 2.0% 并未小于 random（1.7%）；
+    lm5 value CV 25.6% 反而全场最大（random-matched 5.3%）
+  - 唯一站得住的是 **「在线调度 > 预先定死的任务流」**（`value` vs `perm`：replay t=+3.44 / any-time t=+4.31 显著），
+    但 `random` / `random-matched` 同样具备该优势 → **是「调度」的功劳，不是「价值函数」的功劳**
+  - 顺带修 lm4 `random-matched` 首次 3/3 `rc=1` 的 profile 加载 bug（driver 把嵌套结果文件整拷作 profile）
 - 2026-09-14：**LM4 骨干替换完成 + 价值函数接入**（本日为最大一次推进）
   - **骨干替换四轴全胜**：StatMLP（窗口统计 + MLP + **冻结归一化**）vs 复值 SSM
     - joint（6 域）0.8104 vs 0.7213（+0.089）
@@ -41,7 +55,11 @@ status: current
 
 - **lm4 价值函数 3 臂 × 6 seed**（`vp2_*`，18 run）：验证「提议器降低 naive 遗忘」的 +0.20 效应是否可复现
 - **lm4 因果发现可扩展到干预效应估计**：当前 `causal_intervene.py` 的 DAG 为物理先验手工定向，缺太阳风/地磁/MLT 混杂
-- 待办：lm5 价值函数正式 3 seed 对照（现仅冒烟）
+- **已完成（负面）**：lm5 价值函数正式 3 seed 对照 —— 见上，干净对照下测不出稳定增益
+- 待办：**查 `λ_fb` 为何对调度零影响**（`value` 与 `value-nofb` 逐位相同）—— 价值函数里的反馈闭环目前是死代码
+- 待办：提高 seed 数（现 `n=3`，`|t|≈2` 只能算边缘证据，ddof 口径一变结论就翻转）
+- 待办：**lm5 补 `random`（均匀随机）臂** —— 现缺该臂，无法在 lm5 上复现混淆对照
+- 待办：新 benchmark 全臂开启 `--trace-every`（学习效率/达标步数指标仍缺）
 - 待办：lm5 混合骨干 wave 退化归因（是否 SSM 文本通路梯度干扰 MLP 波通路）
 
 ## 已知的执行缺口（必须默认开启，不能只在单次 run 里用）

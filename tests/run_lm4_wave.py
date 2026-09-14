@@ -1097,7 +1097,18 @@ def main():
     if args.freq_profile:
         try:
             _fp = json.loads(Path(args.freq_profile).read_text())
-            freq_prof = _fp.get("proposer_freq") or _fp
+            # lm4 结果文件是嵌套结构 (naive/replay/_config), lm5 是扁平结构;
+            # 两种都支持, 否则 _fp.get 取不到 -> 退化成整个 dict -> np.asarray 报错。
+            _cand = _fp.get("proposer_freq")
+            if _cand is None and isinstance(_fp.get("replay"), dict):
+                _cand = _fp["replay"].get("proposer_freq")
+            if isinstance(_cand, dict):            # 稀疏 {idx: freq} -> 密集向量
+                _mx = max((int(k) for k in _cand), default=-1)
+                _vec = [0.0] * (_mx + 1)
+                for _k, _v in _cand.items():
+                    _vec[int(_k)] = float(_v)
+                _cand = _vec
+            freq_prof = _cand if _cand is not None else _fp
             print("[freq-matched] 载入频率分布: %d 项" % len(freq_prof), flush=True)
         except Exception as e:
             print("!! --freq-profile 读取失败:", e, flush=True)
