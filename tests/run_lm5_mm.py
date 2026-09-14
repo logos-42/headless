@@ -41,6 +41,7 @@ from hibs_lnn.pln_head import (PLNHead, SwiftTDAdapter, inner_adapt,
 from run_lm3_bpe import BPE
 from run_lm4_wave import (WINDOW, build_feature_matrix, build_windows,
                           assign_domains, window_agg)
+from hibs_lnn.causal import S4WorldSCM
 
 CHUNK = 32          # 文本块长度
 TEXT_DOMAINS = ("en", "zh", "code")
@@ -50,7 +51,7 @@ TEXT_DOMAINS = ("en", "zh", "code")
 # 模型: 共享 trunk + 模态 stem + 各自任务头
 # ============================================================
 class MultiModalSSM(nn.Module):
-    def __init__(self, vocab, n_feat, n_wave_classes,
+    def __init__(self, vocab, n_feat, n_wave_classes, n_causal_classes=5,
                  d_model=192, d_state=12, n_layers=2,
                  head_type="pln", pln_d=64, pool="cat", agg_path=False):
         super().__init__()
@@ -60,6 +61,7 @@ class MultiModalSSM(nn.Module):
         # ── 模态 stem (各自独立) ──
         self.text_stem = nn.Embedding(vocab, d_model)
         self.wave_stem = nn.Linear(n_feat, d_model)
+        self.causal_stem = nn.Linear(CAUSAL_FEAT, d_model)
         # ── 共享 trunk (meta 参数 θ) ──
         self.layers = nn.ModuleList([
             SSM_Layer_V30_3(d_model, d_state, layer_idx=i, ent_mode='none')
@@ -73,8 +75,10 @@ class MultiModalSSM(nn.Module):
         self.d_wave = d_wave
         if head_type == "swifttd":
             self.wave_head = SwiftTDAdapter(d_wave, n_wave_classes)
+            self.causal_head = SwiftTDAdapter(d_wave, n_causal_classes)
         else:
             self.wave_head = PLNHead(d_wave, pln_d, n_wave_classes)
+            self.causal_head = PLNHead(d_wave, pln_d, n_causal_classes)
 
     # ---- 共享 trunk ----
     def _trunk(self, h):
@@ -87,16 +91,17 @@ class MultiModalSSM(nn.Module):
         return self.text_head(self._trunk(self.text_stem(ids)))
 
     # ---- 电磁波: (B, L, n_feat) -> 表示 (B, d_wave) ----
-    def encode_wave(self, x, agg=None):
-        h = self._trunk(self.wave_stem(x))
+    def _pool(self, h):
         if self.pool == "last":
-            s = h[:, -1]
-        elif self.pool == "mean":
-            s = h.mean(1)
-        elif self.pool == "max":
-            s = h.max(1).values
-        else:
-            s = torch.cat([h[:, -1], h.mean(1), h.max(1).values], dim=-1)
+            return h[:, -1]
+        if self.pool == "mean":
+            return h.mean(1)
+        if self.pool == "max":
+            return h.max(1).values
+        return torch.cat([h[:, -1], h.mean(1), h.max(1).values], dim=-1)
+
+    def encode_wave(self, x, agg=None):
+        s = self._pool(self._trunk(self.wave_stem(x)))
         if self.agg_path:
             s = torch.cat([s, window_agg(x) if agg is None else agg], dim=-1)
         return s
@@ -104,9 +109,16 @@ class MultiModalSSM(nn.Module):
     def forward_wave(self, x):
         return self.wave_head(self.encode_wave(x))
 
+    # ---- 因果: (B, L, CAUSAL_FEAT) -> (B, d_wave) ----
+    def encode_causal(self, x):
+        return self._pool(self._trunk(self.causal_stem(x)))
+
+    def forward_causal(self, x):
+        return self.causal_head(self.encode_causal(x))
+
     def trunk_params(self):
         ps = [p for n, p in self.named_parameters()
-              if not n.startswith(("text_head.", "wave_head."))]
+              if not n.startswith(("text_head.", "wave_head.", "causal_head."))]
         return ps
 
     def wave_head_params(self):
@@ -139,9 +151,52 @@ def make_text_chunks(ids, rng, batch, chunk=CHUNK):
 
 
 # ============================================================
+# 因果域数据 (S4WorldSCM)
+# ============================================================
+CAUSAL_FEAT = 10       # [6 位生成元 sig] + [cyc] + [3 维 obs]
+
+
+def build_causal_data(n=20000, L=8, seed=0, n_bins=5):
+    """从 S4WorldSCM 生成因果域序列分类数据。
+
+    S4WorldSCM 的因果结构:  G -> cyc;  G -> obs;  cyc -> obs;  obs,cyc -> acc
+
+    每样本:
+      x (L, CAUSAL_FEAT)  每步 = [6 位生成元 sig, cyc, obs(3)]
+      y = acc 分桶         (n_bins 类)          <- **观测**结果
+      y_do = do() 干预后的 acc 分桶              <- **干预**结果
+
+    关键: y 与 y_do 的差就是"相关 vs 因果"的判别面。
+    只学到相关性的模型在 y_do 上会塌, 学到因果结构的模型能撑住。
+    """
+    scm = S4WorldSCM(seed=seed)
+    rng = np.random.default_rng(seed)
+    perms = list(scm.factor.keys())
+    X = np.zeros((n, L, CAUSAL_FEAT), dtype=np.float32)
+    y = np.zeros(n, dtype=np.int64)
+    y_do = np.zeros(n, dtype=np.int64)
+    for i in range(n):
+        perm = perms[int(rng.integers(len(perms)))]
+        sig = np.array(scm.sig_bits(perm), dtype=np.float32)
+        cyc = float(scm.cyc(perm))
+        # 随机"已学生成元"子集 -> 让 acc 有丰富分布
+        k = int(rng.integers(0, 7))
+        atoms = set(rng.choice(6, size=k, replace=False).tolist())
+        for t in range(L):
+            obs = np.asarray(scm.observe(perm, rng), dtype=np.float32)
+            X[i, t] = np.concatenate([sig, [cyc], obs])
+        a = scm.acc(perm, atoms)
+        y[i] = min(n_bins - 1, max(0, int(a * n_bins)))
+        a_do = scm.do_intervene(perm, atoms)
+        y_do[i] = min(n_bins - 1, max(0, int(a_do * n_bins)))
+    return X, y, y_do
+
+
+# ============================================================
 # 持续学习主循环
 # ============================================================
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
+           causal=None, n_causal_classes=5,
            d_model=192, d_state=12, n_layers=2, vocab=1000,
            n_feat=30, n_wave_classes=6, head_type="pln",
            text_steps=300, wave_epochs=300, batch=32, lr=1e-3,
@@ -151,7 +206,8 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     rng = random.Random(seed)
 
-    model = MultiModalSSM(vocab, n_feat, n_wave_classes, d_model=d_model,
+    model = MultiModalSSM(vocab, n_feat, n_wave_classes,
+                          n_causal_classes=n_causal_classes, d_model=d_model,
                           d_state=d_state, n_layers=n_layers,
                           head_type=head_type, pool=pool,
                           agg_path=agg_path).to(device)
@@ -164,10 +220,15 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     # 域序列: 文本域(有数据且非空) + 电磁波域
     domains = [d for d in TEXT_DOMAINS if d in text_domains and len(text_domains[d]) > 2000]
     domains = domains + ["wave"]
+    if causal is not None:
+        domains = domains + ["causal"]
     n_dom = len(domains)
     # 随机基线
-    chance = {d: 1.0 / vocab for d in domains if d != "wave"}
+    chance = {d: 1.0 / vocab for d in domains if d not in ("wave", "causal")}
     chance["wave"] = 1.0 / n_wave_classes
+    if "causal" in domains:
+        chance["causal"] = 1.0 / n_causal_classes
+        chance["causal_do"] = 1.0 / n_causal_classes
 
     # 回放缓冲: 每域固定量
     replay_buf = {}
@@ -186,6 +247,19 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                         out[d] = float((pred == yte).float().mean())
                     else:
                         out[d] = float('nan')
+                elif d == "causal":
+                    # 关键: 同时报**观测**与**干预**两个准确率。
+                    # 只学到相关性的模型会在干预版上塌 —— 那个 gap 就是因果能力的度量。
+                    if causal is None:
+                        out["causal"] = float('nan')
+                        out["causal_do"] = float('nan')
+                    else:
+                        Xo, yo = causal["test_obs"]
+                        Xd, yd = causal["test_do"]
+                        out["causal"] = float(
+                            (model.forward_causal(Xo).argmax(-1) == yo).float().mean())
+                        out["causal_do"] = float(
+                            (model.forward_causal(Xd).argmax(-1) == yd).float().mean())
                 else:
                     ids = torch.tensor(text_domains[d][:60000], dtype=torch.long)
                     if len(ids) < CHUNK + 2:
@@ -208,49 +282,64 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         print(f"\n--- 域 {step+1}/{n_dom}: {dom} ---", flush=True)
         model.train()
 
-        if dom == "wave":
-            # ── 电磁波域: 密度分类 ──
-            tr_idx = np.arange(len(wave_X))
+        if dom in ("wave", "causal"):
+            # ── 分类域 (电磁波密度 / 因果 acc): 同一套逻辑, 只换 stem+head+数据 ──
+            if dom == "wave":
+                CX, CY = wave_X, wave_y
+                enc_fn, head_fn, fwd_fn = (model.encode_wave, model.wave_head,
+                                           model.forward_wave)
+            else:
+                CX, CY = causal["X"], causal["y"]
+                enc_fn, head_fn, fwd_fn = (model.encode_causal, model.causal_head,
+                                           model.forward_causal)
+            tr_idx = np.arange(len(CX))
             it = 0
             while it < wave_epochs:
                 sel = np.random.RandomState(seed + it).choice(
                     tr_idx, size=min(batch, len(tr_idx)), replace=False)
-                xb = torch.from_numpy(wave_X[sel]).to(device)
-                yb = torch.from_numpy(wave_y[sel]).to(device)
+                xb = torch.from_numpy(CX[sel]).to(device)
+                yb = torch.from_numpy(CY[sel]).to(device)
                 if cl_method == "oml2" and use_pln:
                     parts_x, parts_y = [xb], [yb]
-                    if replay_buf.get("wave") is not None:
-                        _h, _y = replay_buf["wave"]
+                    if replay_buf.get(dom) is not None:
+                        _h, _y = replay_buf[dom]
                         k = max(1, int(batch * replay_ratio))
                         sidx = torch.randint(0, len(_y), (k,), device=device)
                         parts_x.append(_h[sidx]); parts_y.append(_y[sidx])
                     XB, YB = torch.cat(parts_x), torch.cat(parts_y)
                     half = max(2, XB.shape[0] // 2)
                     with torch.no_grad():
-                        h_sup = model.encode_wave(XB[:half])
-                    h_qry = model.encode_wave(XB[half:])
+                        h_sup = enc_fn(XB[:half])
+                    h_qry = enc_fn(XB[half:])
                     fn = oml_step_swifttd if head_type == "swifttd" else oml_step
-                    kw = dict(K=inner_k, consolidate=(consolidate_every > 0 and it % consolidate_every == 0),
+                    kw = dict(K=inner_k,
+                              consolidate=(consolidate_every > 0 and it % consolidate_every == 0),
                               reptile_lr=reptile_lr)
                     if head_type != "swifttd":
                         kw["per_feature"] = True
-                    lq, _ = fn(model, model.wave_head, h_sup, YB[:half],
-                               h_qry, YB[half:], opt_outer, **kw)
+                    lq, _ = fn(model, head_fn, h_sup, YB[:half], h_qry, YB[half:],
+                               opt_outer, **kw)
+                    # lm3 oml2 的第二部分: 常规训练步 (含 replay)
+                    loss_n = F.cross_entropy(fwd_fn(XB), YB)
+                    opt.zero_grad(); loss_n.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
                 else:
-                    loss = F.cross_entropy(model.forward_wave(xb), yb)
-                    if cl_method == "replay" and replay_buf.get("wave") is not None:
-                        rh, ry = replay_buf["wave"]
+                    loss = F.cross_entropy(fwd_fn(xb), yb)
+                    if cl_method == "replay" and replay_buf.get(dom) is not None:
+                        rh, ry = replay_buf[dom]
                         k = max(1, int(batch * replay_ratio))
                         sidx = torch.randint(0, len(ry), (k,), device=device)
-                        loss = loss + F.cross_entropy(model.forward_wave(rh[sidx]), ry[sidx])
-                    opt.zero_grad(); loss.backward(); opt.step()
+                        loss = loss + F.cross_entropy(fwd_fn(rh[sidx]), ry[sidx])
+                    opt.zero_grad(); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
                 it += 1
-            # 存回放
-            n_rb = min(2000, len(wave_X))
-            sel = np.random.RandomState(seed).choice(len(wave_X), n_rb, replace=False)
-            with torch.no_grad():
-                rb_x = torch.from_numpy(wave_X[sel]).to(device)
-            replay_buf["wave"] = (rb_x, torch.from_numpy(wave_y[sel]).to(device))
+            # 存回放 (按域)
+            n_rb = min(2000, len(CX))
+            sel = np.random.RandomState(seed).choice(len(CX), n_rb, replace=False)
+            replay_buf[dom] = (torch.from_numpy(CX[sel]).to(device),
+                               torch.from_numpy(CY[sel]).to(device))
         else:
             # ── 文本域: 下一个 token 预测 ──
             ids = text_domains[dom]
@@ -287,7 +376,10 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         seen = [f"{d}:{row[d]:.3f}" for d in domains if d in row and not math.isnan(row[d])]
         print(f"  [{cl_method}] 已见域 → {' '.join(seen)}  ({time.time()-t0:.0f}s)", flush=True)
 
-    return acc_hist, domains, chance
+    report_doms = list(domains)
+    if "causal" in domains:
+        report_doms.append("causal_do")     # 干预版单列, 与观测版对比
+    return acc_hist, report_doms, chance
 
 
 def main():
@@ -309,6 +401,9 @@ def main():
     ap.add_argument("--pool", default="cat", choices=["last", "mean", "max", "cat"])
     ap.add_argument("--agg-path", action="store_true")
     ap.add_argument("--domains", type=int, default=6)
+    ap.add_argument("--no-causal", action="store_true",
+                    help="不加因果域 (默认加: en/zh/code -> wave -> causal)")
+    ap.add_argument("--causal-n", type=int, default=20000, help="因果域样本数")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=str(ROOT / "results" / "lm5_mm"))
@@ -321,12 +416,34 @@ def main():
     if not td:
         print("!! 没有文本数据, 请在 --text-data 下放 en.txt / zh.txt / code.txt")
         sys.exit(1)
-    # BPE
+    # BPE —— 必须缓存: 纯 Python 训练在 120 万字符上要十几分钟, 而多配置跑会重复 N 次
     bpe = BPE()
-    bpe.train([v[:400000] for v in td.values()], num_merges=800)
+    bpe_cache = str(Path(args.text_data) / f"bpe_lm5_{args.seed}.json")
+    if os.path.exists(bpe_cache):
+        ck = json.load(open(bpe_cache))
+        bpe.base = ck["base"]
+        bpe.merges = {tuple(int(x) for x in k.split("_")): v
+                      for k, v in ck["merges"].items()}
+        bpe.vocab = ck["vocab"]
+        print(f"[bpe] 命中缓存 vocab={bpe.vocab}", flush=True)
+    else:
+        t_b = time.time()
+        bpe.train([v[:400000] for v in td.values()], num_merges=800)
+        json.dump({"base": bpe.base,
+                   "merges": {f"{a}_{b}": v for (a, b), v in bpe.merges.items()},
+                   "vocab": bpe.vocab}, open(bpe_cache, "w"))
+        print(f"[bpe] 训练完成 vocab={bpe.vocab}, {time.time()-t_b:.0f}s (已缓存)", flush=True)
     vocab = bpe.vocab + 2
-    print(f"[bpe] vocab={vocab}", flush=True)
-    enc = {k: bpe.encode(v) for k, v in td.items()}
+    enc_cache = str(Path(args.text_data) / f"enc_lm5_{args.seed}.json")
+    if os.path.exists(enc_cache):
+        enc = json.load(open(enc_cache))
+        enc = {k: v for k, v in enc.items()}
+        print(f"[bpe] 编码命中缓存", flush=True)
+    else:
+        t_e = time.time()
+        enc = {k: bpe.encode(v) for k, v in td.items()}
+        json.dump(enc, open(enc_cache, "w"))
+        print(f"[bpe] 编码完成 {time.time()-t_e:.0f}s (已缓存)", flush=True)
     print(f"[bpe] 编码后长度: { {k: len(v) for k, v in enc.items()} }", flush=True)
 
     # ── 电磁波数据 ──
@@ -346,8 +463,25 @@ def main():
     # NaN 防护
     wave_X = np.nan_to_num(wave_X, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # ── 因果域 (S4WorldSCM) ──
+    causal_data = None
+    if not args.no_causal:
+        cX, cy, cydo = build_causal_data(n=args.causal_n, seed=args.seed)
+        n_cte = max(100, len(cX) // 10)
+        c_idx = np.random.RandomState(args.seed).permutation(len(cX))
+        c_te, c_tr = c_idx[:n_cte], c_idx[n_cte:]
+        causal_data = {
+            "X": cX[c_tr], "y": cy[c_tr],
+            "test_obs": (torch.from_numpy(cX[c_te]).to(device),
+                         torch.from_numpy(cy[c_te]).to(device)),
+            "test_do": (torch.from_numpy(cX[c_te]).to(device),
+                        torch.from_numpy(cydo[c_te]).to(device)),
+        }
+        print(f"[causal] 训练 {causal_data['X'].shape}, 测试 {cX[c_te].shape}, "
+              f"类数 5, 观测/干预双标签", flush=True)
+
     hist, doms, chance = run_mm(
-        enc, wave_X, wave_y, wave_test, device,
+        enc, wave_X, wave_y, wave_test, device, causal=causal_data,
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         vocab=vocab, n_feat=n_feat, n_wave_classes=args.domains,
         head_type=args.head, text_steps=args.text_steps,
