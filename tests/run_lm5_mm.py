@@ -225,6 +225,112 @@ class MultiModalMLP(nn.Module):
 # ============================================================
 # 数据
 # ============================================================
+class MultiModalHybrid(nn.Module):
+    """**按模态分派骨干** —— 依据 docs/lm5_backbone_verdict.md。
+
+    3 seed x 2000 步实测 (同一批数据, 同一任务):
+        域        MLP             SSM            差
+        en      0.1250±0.1021   0.2500±0.1021  -0.125   <- SSM 赢
+        code    0.0833±0.0589   0.2083±0.0589  -0.125   <- SSM 赢
+        wave    0.5256±0.0353   0.4611±0.0329  +0.065   <- MLP 赢
+        causal  0.3598±0.0127   0.3600±0.0114  -0.0002  <- 无差别
+    结论: "哪个骨干更好"没有全局答案, 分派规则 =
+        离散有序序列 (文本)   -> SSM       (下一 token 预测需要词序, 池化会丢掉它)
+        连续窗口 (电磁波)     -> 统计 MLP  (全局矩已足够, 且更快更稳)
+        结构/因果任务         -> 两者皆可  (任务瓶颈, 选便宜的)
+    """
+
+    def __init__(self, vocab, n_feat, n_wave_classes, n_causal_classes=5,
+                 d_model=192, d_state=12, n_layers=2, head_type="linear",
+                 pln_d=64, pool="cat", agg_path=False, norm="fixed",
+                 text_bb="ssm", wave_bb="mlp"):
+        super().__init__()
+        self.text_bb, self.wave_bb = text_bb, wave_bb
+        self.pool, self.agg_path = pool, agg_path
+        self.norm_mode = norm
+        self.n_feat = n_feat
+        # ── 文本路径: 序列主干 ──
+        self.text_stem = nn.Embedding(vocab, d_model)
+        self.text_layers = nn.ModuleList([
+            SSM_Layer_V30_3(d_model, d_state, layer_idx=i, ent_mode='none')
+            for i in range(n_layers)])
+        self.text_norm = nn.LayerNorm(d_model)
+        self.text_head = nn.Linear(d_model, vocab)
+        # ── 电磁波/因果路径: 统计特征 MLP ──
+        self.wave_proj = nn.Linear(5 * n_feat, d_model)
+        self.causal_proj = nn.Linear(5 * CAUSAL_FEAT, d_model)
+        nml = (nn.BatchNorm1d(d_model) if norm in ("batchnorm", "fixed")
+               else nn.Identity())
+        self.norm_layer = nml
+        mods = [nml, nn.Linear(d_model, d_model), nn.GELU()]
+        self.body = nn.Sequential(*mods)
+        # 本骨干的波/因果通路是 body(wave_proj(window_agg(x))) -> 维度就是 d_model;
+        # 不做 pool=cat 的三路拼接 (那是 SSM 通路的事), 否则头维度对不上。
+        d_head = d_model
+        self.d_head = d_head
+        d_wave = d_model
+        self.d_wave = d_wave
+        if head_type == "swifttd":
+            self.wave_head = SwiftTDAdapter(d_wave, n_wave_classes)
+            self.causal_head = SwiftTDAdapter(d_wave, n_causal_classes)
+        elif head_type == "pln":
+            self.wave_head = PLNHead(d_wave, pln_d, n_wave_classes)
+            self.causal_head = PLNHead(d_wave, pln_d, n_causal_classes)
+        else:
+            self.wave_head = nn.Linear(d_wave, n_wave_classes)
+            self.causal_head = nn.Linear(d_wave, n_causal_classes)
+
+    # ---- 文本 (SSM) ----
+    def _text_trunk(self, h):
+        for layer in self.text_layers:
+            h, _ = layer(h)
+        return self.text_norm(h)
+
+    def forward_text(self, ids):
+        return self.text_head(self._text_trunk(self.text_stem(ids)))[:, -1]
+
+    # ---- 电磁波 / 因果 (统计 MLP) ----
+    def _pool(self, h):
+        if self.pool == "last":
+            return h[:, -1]
+        if self.pool == "mean":
+            return h.mean(1)
+        if self.pool == "max":
+            return h.max(1).values
+        return torch.cat([h[:, -1], h.mean(1), h.max(1).values], dim=-1)
+
+    def encode_wave(self, x):
+        return self.body(self.wave_proj(window_agg(x)))
+
+    def forward_wave(self, x):
+        return self.wave_head(self.encode_wave(x))
+
+    def encode_causal(self, x):
+        return self.body(self.causal_proj(window_agg(x)))
+
+    def forward_causal(self, x):
+        return self.causal_head(self.encode_causal(x))
+
+    def set_fixed_stats(self, feats):
+        if self.norm_mode != "fixed":
+            return
+        with torch.no_grad():
+            self.norm_layer.running_mean.copy_(feats.mean(0))
+            self.norm_layer.running_var.copy_(feats.std(0).clamp(min=1e-6) ** 2)
+            self.norm_layer.num_batches_tracked.fill_(1)
+        self.norm_layer.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "norm_mode", None) == "fixed":
+            self.norm_layer.eval()
+        return self
+
+    def trunk_params(self):
+        return [p for n, p in self.named_parameters()
+                if not n.startswith(("text_head.", "wave_head.", "causal_head."))]
+
+
 def load_text_domains(data_dir, limit=2_000_000):
     """en / zh / code 三个文本域。缺文件则跳过。"""
     dom = {}
@@ -361,7 +467,13 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     rng = random.Random(seed)
 
-    if backbone == "mlp":
+    if backbone == "hybrid":
+        model = MultiModalHybrid(vocab, n_feat, n_wave_classes,
+                                 n_causal_classes=n_causal_classes, d_model=d_model,
+                                 d_state=d_state, n_layers=n_layers,
+                                 head_type=head_type, pool=pool,
+                                 agg_path=agg_path, norm=norm).to(device)
+    elif backbone == "mlp":
         model = MultiModalMLP(vocab, n_feat, n_wave_classes,
                               n_causal_classes=n_causal_classes, d_model=d_model,
                               hidden=d_model, n_layers=n_layers,
@@ -375,18 +487,22 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                               agg_path=agg_path).to(device)
     # fixed 归一化: 从各模态的投影特征算一次全局 mu/sd 然后冻结。
     # (BatchNorm 的 running stats 随域漂移 = 持续学习的隐性杀手)
-    if backbone == "mlp" and norm == "fixed":
+    if backbone in ("mlp", "hybrid") and norm == "fixed":
         with torch.no_grad():
             rows = []
-            for d in list(text_domains)[:3]:
-                ids = torch.tensor(text_domains[d][:30000], dtype=torch.long)
-                if len(ids) < CHUNK + 2:
-                    continue
-                hi = len(ids) - CHUNK - 1
-                st = np.random.randint(0, hi, min(256, hi))
-                xx = torch.stack([ids[t:t + CHUNK - 1] for t in st]).to(device)
-                e = model.text_emb(xx)
-                rows.append(model.text_proj(torch.cat([e.mean(1), e[:, -1, :]], -1)))
+            # 只有纯 MLP 骨干的文本通路走池化投影 (需要 fixed 统计量);
+            # 混合骨干的文本走 SSM + LayerNorm, 与统计量无关。
+            if backbone == "mlp":
+                for d in list(text_domains)[:3]:
+                    ids = torch.tensor(text_domains[d][:30000], dtype=torch.long)
+                    if len(ids) < CHUNK + 2:
+                        continue
+                    hi = len(ids) - CHUNK - 1
+                    st = np.random.randint(0, hi, min(256, hi))
+                    xx = torch.stack([ids[t:t + CHUNK - 1] for t in st]).to(device)
+                    e = model.text_emb(xx)
+                    rows.append(model.text_proj(
+                        torch.cat([e.mean(1), e[:, -1, :]], -1)))
             if wave_X is not None and len(wave_X):
                 rows.append(model.wave_proj(window_agg(torch.as_tensor(
                     wave_X[:256]).float().to(device))))
@@ -609,7 +725,7 @@ def main():
     ap.add_argument("--causal-n", type=int, default=20000, help="因果域样本数")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--backbone", choices=["mlp", "ssm"], default="mlp",
+    ap.add_argument("--backbone", choices=["mlp", "ssm", "hybrid"], default="mlp",
                     help="统一骨干: mlp=统计特征MLP(新, 默认) ssm=复值SSM(旧)")
     ap.add_argument("--norm", choices=["fixed", "batchnorm", "none"], default="fixed",
                     help="MLP 归一化; fixed=冻结全局mu/sd (默认, 抗 BN 漂移)")
