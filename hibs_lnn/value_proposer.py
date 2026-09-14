@@ -56,17 +56,27 @@ class RegimeProposer:
     """
 
     def __init__(self, desc, groups=None, lam=(1.0, 1.0, 1.0, 1.0),
-                 sigma=0.5, tau=0.5, k=2, seed=0):
+                 sigma=None, tau=0.5, k=2, seed=0):
         desc = np.asarray(desc, dtype=np.float64)
         self.n = len(desc)
         mu = desc.mean(0)
         sd = desc.std(0)
         sd[sd < 1e-9] = 1.0
         self.z = (desc - mu) / sd
+        # ★ sigma 默认由数据决定, 不能用固定 0.5。
+        #   低维描述子 (1-3 维) 下候选间距离量级很小, 固定 sigma=0.5 会让
+        #   exp(-d/sigma) ≈ 0 对所有候选成立 -> sim(p) ≡ 1.0 -> 简约性项死亡
+        #   (实测 signature: value 与 value-nofb 提议序列逐位相同)。
+        #   取"最近邻距离的中位数"当尺度, 保证核在真实分布上有区分度。
+        if sigma is None:
+            d = np.linalg.norm(self.z[:, None, :] - self.z[None, :, :], axis=-1)
+            np.fill_diagonal(d, np.inf)
+            sigma = float(np.median(d.min(axis=1)))
+            sigma = max(sigma, 1e-3)
+        self.sigma = float(sigma)
         self.groups = (np.asarray(groups) if groups is not None
                        else np.zeros(self.n, dtype=int))
         self.lam = tuple(float(x) for x in lam)
-        self.sigma = float(sigma)
         self.tau = float(tau)
         self.k = int(k)
         self.rng = np.random.default_rng(seed)
@@ -90,9 +100,11 @@ class RegimeProposer:
         return 1.0 / (1.0 + self.freq[i])
 
     def con(self, i):
-        """自洽性 —— 由调用方通过 set_consistency() 注入。
+        """自洽性 (V35.19 三项之一) —— 由调用方 set_consistency() 注入。
 
-        默认 1.0 (不惩罚), 便于先跑通再接入真实因果检验。
+        **没注入时返回恒定 1.0, 该维对排序零贡献** —— 这是本轮踩过的坑:
+        忘了注入 -> 自洽性项死亡 -> 价值函数退化成覆盖均匀化采样器。
+        诊断: stats() 里的 con_std; 若为 0 说明这一项是死的。
         """
         return float(self._con[i]) if self._con is not None else 1.0
 
@@ -147,6 +159,11 @@ class RegimeProposer:
     # ---------------- 诊断 ----------------
     def stats(self):
         v = np.array([self.value(i) for i in range(self.n)])
+        # ★ 各项的**区分度**诊断: 标准差为 0 = 该项是死的 (对排序零贡献)
+        _sim = np.array([self.sim(i) for i in range(self.n)])
+        _con = np.array([self.con(i) for i in range(self.n)])
+        _cov = np.array([self.cov(i) for i in range(self.n)])
+        _fb = np.array([self.fb(i) for i in range(self.n)])
         return {
             "n_candidates": int(self.n),
             "n_learned": len(self.learned),
@@ -156,4 +173,8 @@ class RegimeProposer:
             "value_std": float(v.std()),
             "value_cv": float(v.std() / max(1e-9, abs(v.mean()))),
             "covered_frac": float((self.freq > 0).mean()),
+            "sigma": float(self.sigma),
+            # 各项区分度: 0 = 该项死了 (本轮踩过的坑)
+            "term_std": {"sim": float(_sim.std()), "con": float(_con.std()),
+                         "cov": float(_cov.std()), "fb": float(_fb.std())},
         }

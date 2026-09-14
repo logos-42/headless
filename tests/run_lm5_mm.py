@@ -456,6 +456,77 @@ def batched_pred(fwd, X, bs=512):
     return torch.cat(outs)
 
 
+def build_modality_consistency(domains, wave_X, causal, text_domains):
+    """每个模态域的**自洽性** con(p) —— V35.19 三项之一 (leo 理论: 自洽性=彼此不矛盾)。
+
+    为什么必须有: 不注入时 `con(p)` 恒为 1.0, 该维对排序零贡献 ->
+    价值函数退化成覆盖均匀化采样器 (lm4 实测 signature: value 与 value-nofb
+    提议序列逐位相同, term_std['con']=0.0)。这是本轮踩过的坑。
+
+    lm5 的候选是 (模态, 复习轮次), 所以自洽性按**模态**给:
+      wave   : 用 lm4 因果发现的稳定关系 (密度↔电场波、偶极场 B∝L^-3) 检验
+               域内相关符号是否与全局同向
+      causal : 用 SCM 的父结构 (obs,cyc -> acc) 检验
+      text   : **无结构可查 -> 1.0** (明确标注未实现, 不是"一致性好")
+
+    返回 {domain: con} 字典。
+    """
+    out = {d: 1.0 for d in domains}
+    # ── wave: 稳定关系的符号一致性 ──
+    try:
+        if wave_X is not None and len(wave_X) > 500:
+            Xw = np.asarray(wave_X, dtype=np.float64)
+            if Xw.ndim == 3:
+                Xw = Xw.mean(axis=1)               # 窗口内均值
+            nf = Xw.shape[1]
+            # 特征布局: 0=log10|B|, 1=log10 rms, 2=lambda, 3=delta,
+            #           4..  = WFR (磁前半/电后半), 末尾两列= L-shell
+            pairs = [(0, 1), (0, nf - 2), (1, nf - 2)]
+            # ★ 连续强度: 半数据 vs 另一半 的相关强度比 = 结构性有多稳。
+            #   二值版("关系是否成立")实测处处为真 -> con ≡ 1.0 -> 该项死亡。
+            half = len(Xw) // 2
+            num = den = 0.0
+            for i, j in pairs:
+                if not (0 <= i < nf and 0 <= j < nf):
+                    continue
+                a, b = Xw[:, i], Xw[:, j]
+                if a.std() < 1e-9 or b.std() < 1e-9:
+                    continue
+                cg = np.corrcoef(a, b)[0, 1]
+                ca = np.corrcoef(a[:half], b[:half])[0, 1]
+                cb = np.corrcoef(a[half:], b[half:])[0, 1]
+                if not (np.isfinite(cg) and np.isfinite(ca) and np.isfinite(cb)):
+                    continue
+                st = min(1.0, abs((ca + cb) / 2) / max(1e-6, abs(cg)))
+                if np.sign(ca + cb) != np.sign(cg):
+                    st = 0.0
+                num += st
+                den += 1.0
+            if den:
+                out["wave"] = num / den
+    except Exception as e:
+        print("!! wave 自洽性计算失败 (con=1.0):", e, flush=True)
+    # ── causal: SCM 父结构的一致性 (acc 应同时依赖 obs 与 cyc) ──
+    try:
+        if causal is not None and causal.get("X") is not None:
+            CX = np.asarray(causal["X"], dtype=np.float64)
+            if CX.ndim == 3 and CX.shape[2] >= 4:
+                Cm = CX.mean(axis=1)               # 每样本的步均值
+                y = np.asarray(causal["y"])
+                if len(y) == len(Cm):
+                    # 每维与 acc 的相关强度 -> 至少要有 ≥2 维显著依赖才算自洽
+                    cs = [abs(np.corrcoef(Cm[:, k], y)[0, 1])
+                          for k in range(Cm.shape[1])
+                          if Cm[:, k].std() > 1e-9]
+                    cs = [c for c in cs if np.isfinite(c)]
+                    if cs:
+                        strong = sum(1 for c in cs if c > 0.05)
+                        out["causal"] = min(1.0, strong / max(2, len(cs) * 0.3))
+    except Exception as e:
+        print("!! causal 自洽性计算失败 (con=1.0):", e, flush=True)
+    return out
+
+
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
            causal=None, n_causal_classes=5, backbone="mlp", norm="fixed",
            proposer="fixed", rounds_per_domain=3, lam=(1.0, 1.0, 1.0, 1.0),
@@ -636,6 +707,16 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         _lam = (lam[0], lam[1], lam[2], 0.0) if proposer == "value-nofb" else lam
         prop = RegimeProposer(_desc, k=1, lam=_lam, sigma=proposer_sigma,
                               tau=0.5, seed=seed * 7919 + 31)
+        # ★ 注入自洽性, 否则该项恒 1.0 = 死亡 (lm4 踩过的坑)
+        try:
+            _conds = build_modality_consistency(domains, wave_X, causal, text_domains)
+            _cv = np.array([_conds.get(d, 1.0) for d, _ in POOL], dtype=np.float64)
+            prop.set_consistency(_cv)
+            print("[con] 模态自洽性: %s (std=%.3f, 0=该项死亡)"
+                  % ({k: round(v, 3) for k, v in _conds.items()}, _cv.std()),
+                  flush=True)
+        except Exception as _e:
+            print("!! 自洽性注入失败, con 项将为常数:", _e, flush=True)
         if proposer == "random-matched" and freq_profile:
             _pr = np.asarray(freq_profile, dtype=np.float64)
             prof = (_pr / _pr.sum()) if _pr.sum() > 0 else None

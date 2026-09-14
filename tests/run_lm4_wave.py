@@ -456,6 +456,80 @@ def evaluate(model, loader, device):
     return correct / max(total, 1)
 
 
+def build_consistency(fine, y_log, X, bands, use_lshell, min_n=30):
+    """自洽性 con(p) —— leo 理论「简约点 = 不可归约的原理; 自洽性 = 彼此不矛盾」。
+
+    做法: 先用全局数据确定若干**已发现结构关系**的符号, 再看每个候选区间内
+    这些关系是否保持同向。区间内保持同向的比例 = 该区间的自洽性。
+
+    这些关系不是凭空选的 —— 它们对应 lm4 因果发现的**稳定边**
+    (tests/lm4_causal_waves.py, 20 条稳定边 / 18 条漂移边):
+        log_dens — ele_*      密度 ↔ 电场波功率 (hiss 波)
+        log_dens — logL       等离子体层顶依赖 L
+        logB     — logL       偶极场定律 B ∝ L^-3
+        logB     — mag_*      磁强计频段本就源自 B
+    一个区间若破坏这些关系 = 与全局结构矛盾 = 自洽性低, 价值函数应降低其优先级。
+
+    返回 (n_fine,) 的自洽性分数, 取值 [0,1]; 样本太少的区间给 1.0 (不惩罚)。
+    """
+    n_fine = int(fine.max()) + 1
+    # 变量: 0=log10|B|, 1=log10 rms, 2=lambda, 3=delta, 4..4+bands-1=WFR 磁,
+    #       4+bands..4+2bands-1=WFR 电, 末尾两列(若 use_lshell)= log10 L, sin 磁纬
+    cols = {"logB": 0, "rms": 1,
+            "ele_lo": 4 + bands, "ele_mid": 4 + bands + bands // 2,
+            "ele_hi": 4 + 2 * bands - 1}
+    if use_lshell and X.shape[2] >= 2:
+        cols["logL"] = X.shape[2] - 2
+    Xm = X.mean(axis=1)                       # (N, F) 窗口内均值
+    dens = y_log
+    avail = {k: v for k, v in cols.items() if v < Xm.shape[1]}
+    pairs = [("log_dens", "ele_hi", "dens"), ("log_dens", "ele_mid", "dens"),
+             ("log_dens", "ele_lo", "dens"), ("logB", "ele_hi", "plain"),
+             ("logB", "logL", "plain"), ("log_dens", "logL", "dens"),
+             ("ele_lo", "ele_hi", "plain")]
+    # 全局符号
+    rels = []
+    for a, b, kind in pairs:
+        if a != "log_dens" and a not in avail:
+            continue
+        if b != "log_dens" and b not in avail:
+            continue
+        va = dens if a == "log_dens" else Xm[:, avail[a]]
+        vb = dens if b == "log_dens" else Xm[:, avail[b]]
+        if va.std() < 1e-9 or vb.std() < 1e-9:
+            continue
+        c = np.corrcoef(va, vb)[0, 1]
+        if np.isfinite(c) and abs(c) > 0.05:
+            # 存 (变量, 变量, 全局相关幅值) —— 用于算"该区间内关系有多强"
+            rels.append((va, vb, float(c)))
+    if not rels:
+        return np.ones(n_fine)
+    out = np.ones(n_fine)
+    for f in range(n_fine):
+        m = (fine == f)
+        if m.sum() < min_n:
+            continue
+        # ★ 自洽性必须是**连续强度**, 不能是"关系是否成立"的二值判断。
+        #   二值版实测处处为真 -> con ≡ 1.0 -> 该项死亡 (std=0)。
+        #   这里用: 区间内相关强度 / 全局相关强度, 且符号翻转直接清零。
+        num = den = 0.0
+        for va, vb, cg in rels:
+            aa, bb = va[m], vb[m]
+            if aa.std() < 1e-9 or bb.std() < 1e-9:
+                continue
+            c = np.corrcoef(aa, bb)[0, 1]
+            if not np.isfinite(c):
+                continue
+            strength = min(1.0, abs(c) / max(1e-6, abs(cg)))
+            if np.sign(c) != np.sign(cg):
+                strength = 0.0                       # 符号翻转 = 矛盾, 清零
+            num += strength
+            den += 1.0
+        if den:
+            out[f] = num / den
+    return out
+
+
 def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    epochs_per_domain=300, batch=32, lr=1e-3, replay=False,
                    replay_ratio=0.3, seed=42, n_domains=6, n_feat=None,
@@ -467,7 +541,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    trace_every=0, external_test=None,
                    fine=None, fine_desc=None, proposer="fixed",
                    stream="fixed", rounds=0, freq_profile=None,
-                   lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.5):
+                   y_log=None, bands=13, use_lshell=False,
+                   lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -570,8 +645,21 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         if proposer == "value-nofb":
             lam = (lam[0], lam[1], lam[2], 0.0)      # 关掉真实反馈项
         prop = RegimeProposer(fine_desc, groups=None, lam=lam,
-                              sigma=proposer_sigma, k=proposer_k,
+                              sigma=(proposer_sigma if proposer_sigma > 0
+                                     else None),
+                              k=proposer_k,
                               seed=(seed * 7919 + 29))
+        # ★ 注入自洽性 (V35.19 三项之一)。不注入 = 该项恒 1.0 = 死亡,
+        #   价值函数退化成覆盖均匀化采样器 (本轮踩过的坑)。
+        try:
+            _con = build_consistency(fine, y_log if y_log is not None
+                                     else np.zeros(len(y_dom)), X,
+                                     bands, use_lshell)
+            prop.set_consistency(_con)
+            print("[con] 自洽性注入: 均值 %.3f 标准差 %.3f (0=该项死亡)"
+                  % (_con.mean(), _con.std()), flush=True)
+        except Exception as _e:
+            print("!! 自洽性构建失败, con 项将为常数:", _e, flush=True)
         if proposer == "random-matched" and freq_profile:
             # ★ 频率对齐对照: 用 value 臂实测的提议频率分布驱动 random 臂。
             #   否则 value 有 cov(p)=1/(1+freq) 会主动均匀化覆盖, 和"均匀随机"
@@ -965,6 +1053,8 @@ def main():
     ap.add_argument("--fine-bins", type=int, default=18,
                     help="候选区间池大小 (必须 >> 轮数, 否则价值函数被抹平)")
     ap.add_argument("--proposer-k", type=int, default=3, help="每轮提议几个区间")
+    ap.add_argument("--proposer-sigma", type=float, default=0.0,
+                    help="sim 核宽度; 0=自适应(取最近邻距离中位数, 推荐)")
     ap.add_argument("--lam-sim", type=float, default=1.0, help="简约性权重")
     ap.add_argument("--lam-con", type=float, default=1.0, help="自洽性权重")
     ap.add_argument("--lam-cov", type=float, default=1.0, help="覆盖增量权重")
@@ -1148,8 +1238,11 @@ def main():
                                  lam=(args.lam_sim, args.lam_con,
                                       args.lam_cov, args.lam_fb),
                                  proposer_k=args.proposer_k,
+                                 proposer_sigma=args.proposer_sigma,
                                  stream=args.stream, rounds=args.rounds,
-                                 freq_profile=freq_prof)
+                                 freq_profile=freq_prof,
+                                 y_log=y_log, bands=args.wfr_bands,
+                                 use_lshell=args.lshell)
         s = summarize(M, doms)
         s["curves"] = {str(k): v for k, v in (curves or {}).items()}
         s["cross_external"] = cross                 # 外部矩阵 (每步一行)
