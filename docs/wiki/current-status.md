@@ -11,6 +11,24 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**真 RL 提议器 + IDBD/Autostep 步长自适应 —— 分化成立但无收益（诚实负面结论）**
+  - 用户要求「动作→环境→奖励→参数更新」的真闭环 + 「步长为主导的 policy 积累」+「redefine 也要探索 policy 的积累」
+  - **新建** `hibs_lnn/rl_proposer.py`（θ 可学；reward = **Δ any-time 准确率**；`h` 信用迹累积；
+    **α 本身是累积参数**；`redefine()` 按物理描述子最近邻**继承** explore/α/θ）
+    + `hibs_lnn/transition_model.py`（OaK 第③条：`T(a_t,u_t)→Δa` + beam-search planning）
+    + `docs/oak_alignment.md`
+  - **论文原始基准（weight-flipping）**：IDBD 分化 4/8 且 **3/8 档发散（MSE 1.6e9）**；
+    Autostep **6/8 且 0/8 发散** —— 与 Degris 2024 / Mahmood 2012 所述一致
+  - **真实回路（lm4，n=3）**：any-time — value **0.7702** > idbd 0.7659 > auto 0.7596 > auto2 0.7575，
+    **全部两两 t 检验不显著**（idbd−value p=0.82）→ **步长不是本任务主瓶颈**
+  - **反直觉**：真实回路里 IDBD 分化强（α_std 0.2357 / ratio 3.92），**Autostep 几乎不分化**
+    （0.0004 / 1.04）← 与 weight-flipping 相反；推测 Autostep 的 `α/=M` 均匀压缩在 fdim=9 下压平了 ratio
+  - **唯一有信号的项**：最差遗忘界 — idbd 0.2899±0.0179 vs value 0.3808±0.0606（−24%，t=−2.49，p=0.112），
+    签名同 V35.22「稳定器」；**seed 2–6 扩展已在跑**
+  - **修 4 个 bug**：① `--rl-algo/mu/alpha0` 调用点未接（四臂逐位相同，对照作废）；② JSON 非原子写 +
+    无 numpy 兜底 → **损坏半截文件**；③ IDBD 式误删 `x`；④ `random-matched` 对照臂因此首次全废
+  - 文档 `docs/stepsize_adaptation_results.md`、`docs/oak_alignment.md`
+
 - 2026-09-14：**修正版 benchmark 结算 —— 价值函数四项全活后依然不敌频率对齐对照（诚实负面结论）**
   - **先作废一批**：`docs/bm_benchmark_results.md` 原记录的 `bm_*` 结果**全部作废** —— 那批的价值函数是半成品
     （`con` 未实现 / `sim≡1` / `fb≡1`，实跑退化成「均匀化采样器」）

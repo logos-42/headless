@@ -542,6 +542,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    fine=None, fine_desc=None, proposer="fixed",
                    stream="fixed", rounds=0, freq_profile=None,
                    y_log=None, bands=13, use_lshell=False,
+                   rl_mu=0.05, rl_alpha0=0.2, rl_explore_w=0.5, rl_algo="autostep",
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
@@ -614,9 +615,40 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             if len(idx_f) >= 20:
                 fine_test[f] = idx_f[:max(20, len(idx_f) // 10)]
 
+    rlprop = None
+    if proposer == "rl":
+        # ★ 真 RL: 动作→环境→奖励→参数更新; 步长 (IDBD) 是主导累积参数。
+        #   与 RegimeProposer 的区别: V_θ 是可学参数且**按 reward 更新并累积**,
+        #   而不是固定公式 + 状态更新。
+        from hibs_lnn.rl_proposer import RLProposer
+        # 候选池 (与 value 臂同构, 便于公平对照)
+        _nf = int(fine.max()) + 1
+        rlprop = RLProposer(fine_desc, tau=0.5, k=proposer_k,
+                            mu=rl_mu, alpha0=rl_alpha0,
+                            explore_w=rl_explore_w, algo=rl_algo,
+                            seed=(seed * 7919 + 29))
+        for _f in range(_nf):
+            _idx = np.where(fine == _f)[0]
+            if len(_idx) >= 20:
+                fine_test[_f] = _idx[:max(20, len(_idx) // 10)]
+        print("[rl] RLProposer: 池 %d, fdim %d, algo=%s, mu=%.3f alpha0=%.2f explore_w=%.2f"
+              % (rlprop.n, rlprop.fdim, rl_algo, rl_mu, rl_alpha0, rl_explore_w),
+              flush=True)
+
     if proposer == "bins":
+        # ★ 显式 schedule 优先: 用于执行规划器给出的序列 (真实环境验证)
+        _explicit = [int(x) for x in args.schedule.split(",") if x.strip() != ""] \
+            if getattr(args, "schedule", "") else []
+        if _explicit:
+            dom_seq = _explicit
+            print("[schedule] 显式序列 -> %s" % dom_seq, flush=True)
+            if len(dom_seq) < n_rounds:
+                _r = int(np.ceil(n_rounds / max(1, len(dom_seq))))
+                dom_seq = (dom_seq * _r)[:n_rounds]
+            dom_seq = [int(x) for x in dom_seq[:n_rounds]]
+            schedule = [bins_of.get(d, []) for d in dom_seq]
         # 由 stream 决定粗域序列, 每轮用该域的全部细区间
-        if stream == "fixed":
+        elif stream == "fixed":
             dom_seq = list(range(n_domains))
         elif stream == "perm":
             dom_seq = list(rng_sched.permutation(n_domains))
@@ -729,7 +761,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     any_time = []          # 每轮的"已见域平均准确率" (在线性能)
     for step in range(n_rounds):
         dd = domains[step] if step < len(domains) else domains[-1]
-        if prop is not None:
+        if rlprop is not None:
+            pick = rlprop.act()                     # ← 动作
+        elif prop is not None:
             # 在线提案: 此时 prop 已吃过前面所有轮的 observe 反馈
             if proposer in ("value", "value-nofb"):
                 pick = prop.propose()
@@ -740,8 +774,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                     prop.freq[i] += 1
             else:
                 pick = prop.pick_random()
-        if schedule is not None or prop is not None:
-            if prop is None:
+        if schedule is not None or prop is not None or rlprop is not None:
+            if prop is None and rlprop is None:
                 pick = schedule[step]
             idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
             np.random.RandomState(seed * 131 + step).shuffle(idx_tr)
@@ -879,6 +913,17 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         _seen = [row[j] for j, d in enumerate(domains)
                  if not math.isnan(row[j]) and row[j] > 0]
         any_time.append(float(np.mean(_seen)) if _seen else float('nan'))
+        # ── ★ RL 闭环: 动作 → 环境 → 奖励 → 参数更新 ──
+        # 必须放在 row 算完之后: reward = Δ(any-time 准确率), 而 any-time 是
+        # **刚训练过的那个区间**通过改变模型能力而影响到的量 —— reward 因此
+        # 真正依赖动作, 而不是外生给定的。
+        if rlprop is not None:
+            _accs = [evaluate(model, loader_for(fine_test[f]), device)
+                     for f in pick if f in fine_test]
+            _at = float(np.mean([v for v in row if not math.isnan(v)]))
+            rlprop.observe(pick, acc=(float(np.mean(_accs)) if _accs else 0.5),
+                           any_time=_at)
+            rlprop.update(pick)                      # 奖励 → 参数更新 (含 IDBD 步长)
         if prop is not None:
             prop_rows.append({"step": step + 1, "picks": pick,
                               "value": [round(prop.value(f), 4) for f in pick],
@@ -923,6 +968,10 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     if prop is not None:
         extra["proposer_freq"] = [int(x) for x in prop.freq]
         extra["proposer_stats"] = prop.stats()
+    if rlprop is not None:
+        extra["proposer_freq"] = [int(x) for x in rlprop.visits]
+        extra["proposer_stats"] = rlprop.stats()
+        extra["rl_trace"] = rlprop.trace
     return acc_matrix, domains, curves, cross, prop_rows, extra
 
 
@@ -1045,9 +1094,20 @@ def main():
                     help="总轮数 (0 = 等于域数)")
     ap.add_argument("--freq-profile", default="",
                     help="random-matched 臂: 从该 JSON 读取 value 臂的提议频率分布")
+    ap.add_argument("--schedule", type=str, default="",
+                    help="显式粗域序列, 逗号分隔 (如 2,2,2,2,2). 用于**执行**"
+                         "规划器给出的序列, 检验它是真策略还是模型外推幻觉")
+    ap.add_argument("--rl-mu", type=float, default=0.05,
+                    help="IDBD 元步长 (实测稳定窗口 0.05~0.2)")
+    ap.add_argument("--rl-alpha0", type=float, default=0.2,
+                    help="每权重初始步长; 实测 <0.2 时 IDBD 不分化 (步长死亡)")
+    ap.add_argument("--rl-explore-w", type=float, default=0.5)
+    ap.add_argument("--rl-algo", choices=["idbd", "autostep"], default="autostep",
+                    help="步长自适应算法。idbd=Sutton1992(对 mu 敏感, 实测 3/8 档发散);"
+                         " autostep=Mahmood2012(归一化, 实测 0 档发散, 免调参)")
     ap.add_argument("--proposer",
                     choices=["fixed", "bins", "random", "random-matched",
-                             "value", "value-nofb"],
+                             "value", "value-nofb", "rl"],
                     default="fixed",
                     help="训练调度: fixed=固定域序(默认) random=随机区间 value=价值函数驱动")
     ap.add_argument("--fine-bins", type=int, default=18,
@@ -1239,6 +1299,9 @@ def main():
                                       args.lam_cov, args.lam_fb),
                                  proposer_k=args.proposer_k,
                                  proposer_sigma=args.proposer_sigma,
+                                 rl_mu=args.rl_mu, rl_alpha0=args.rl_alpha0,
+                                 rl_algo=args.rl_algo,
+                                 rl_explore_w=args.rl_explore_w,
                                  stream=args.stream, rounds=args.rounds,
                                  freq_profile=freq_prof,
                                  y_log=y_log, bands=args.wfr_bands,
@@ -1319,8 +1382,27 @@ def main():
     }
     out_md = os.path.join(args.out, "lm4_wave_report.md")
     Path(out_md).write_text("\n".join(lines), encoding="utf-8")
-    json.dump(results, open(os.path.join(args.out, "lm4_wave_results.json"), "w"),
-              ensure_ascii=False, indent=1)
+    # ★ 原子写 + numpy 兜底序列化。
+    #   旧写法 (直接 open(...,"w") + 裸 json.dump) 有两个坑:
+    #   ① 任何 numpy 标量漏进 results 就抛 TypeError, 且**已写的半截文件留在盘上**
+    #      (实测 bm2_random-matched 三个 seed 的结果全是损坏 JSON);
+    #   ② --freq-profile 路径会把 numpy 值带进结果, 触发 ①。
+    #   改成: 兜底序列化器 + 先写临时文件再 os.replace (原子)。
+    def _json_default(o):
+        # tolist 必须排在 item 前面: numpy 数组也有 .item(), 但对多元素数组
+        # 会抛 ValueError("can only convert an array of size 1 ...")。
+        # tolist 对数组返回 list、对标量返回 python 标量, 两种情况都正确。
+        if hasattr(o, "tolist"):
+            return o.tolist()
+        if hasattr(o, "item"):
+            return o.item()
+        return str(o)
+
+    _out_json = os.path.join(args.out, "lm4_wave_results.json")
+    _tmp_json = _out_json + ".tmp"
+    with open(_tmp_json, "w", encoding="utf-8") as _f:
+        json.dump(results, _f, ensure_ascii=False, indent=1, default=_json_default)
+    os.replace(_tmp_json, _out_json)
     print(f"\n报告: {out_md}", flush=True)
     print(f"总耗时: {time.time()-t0:.0f}s", flush=True)
 
