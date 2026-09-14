@@ -26,6 +26,8 @@ ap.add_argument("--paths", default="wfr,lshell", help="逗号分隔: wfr / lshel
 ap.add_argument("--domains", type=int, default=6)
 ap.add_argument("--steps", type=int, default=4000)
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--ssm-ref", type=float, default=None,
+                help="同域数下 WaveSSM 的 joint 参考值; 不给则只报聚合基线")
 args = ap.parse_args()
 
 use_wfr = "wfr" in args.paths
@@ -78,7 +80,16 @@ best = 0.0
 for hidden, layers in [(128, 2), (512, 3), (2048, 3)]:
     best = max(best, run_mlp(hidden, layers, args.steps, f"MLP h{hidden} x{layers}"))
 
-print(f"\n=== 对照 (SSM, 序列输入) ===")
-print(f"  WaveSSM d128 l2 (joint)       acc 0.7213  [已知]")
-print(f"\n判定: 聚合基线 {best:.4f} vs SSM 0.7213")
-print(f"  → {'数据/标签是瓶颈 (扫 SSM 容量意义有限)' if best >= 0.70 else 'SSM 容量可能是瓶颈 (值得扫容量)'}")
+print(f"\n=== 对照 (SSM, 序列输入, {args.domains} 域) ===")
+if args.ssm_ref is not None:
+    gap = best - args.ssm_ref
+    print(f"  WaveSSM joint            acc {args.ssm_ref:.4f}  [同域数实测]")
+    print(f"\n判定 ({args.domains} 域): 聚合基线 {best:.4f} vs SSM {args.ssm_ref:.4f}  (差 {gap:+.4f})")
+    if gap >= 0.05:
+        print(f"  → SSM 是瓶颈: 非序列基线高出 {gap:.3f}, 说明序列建模本身在丢信息")
+    elif gap >= 0.01:
+        print(f"  → 轻微: 差距 {gap:.3f} 不足以解释全部问题")
+    else:
+        print(f"  → 天花板由数据/标签决定 ({args.domains} 域), SSM 已到顶, 扫容量无意义")
+else:
+    print(f"  (未提供 --ssm-ref, 跳过判定)")

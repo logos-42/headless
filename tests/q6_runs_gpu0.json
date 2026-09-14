@@ -1,0 +1,48 @@
+[
+ {
+  "tag": "q6_oml2",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--joint-steps",
+   "0",
+   "--epochs-per-domain",
+   "1000",
+   "--device",
+   "cuda",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--replay-ratio",
+   "2.0",
+   "--seed",
+   "42",
+   "--cl-method",
+   "oml2"
+  ]
+ },
+ {
+  "tag": "q6_oml2_rep",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--joint-steps",
+   "0",
+   "--epochs-per-domain",
+   "1000",
+   "--device",
+   "cuda",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--replay-ratio",
+   "2.0",
+   "--seed",
+   "42",
+   "--cl-method",
+   "oml2",
+   "--reptile-lr",
+   "0.1"
+  ]
+ }
+]

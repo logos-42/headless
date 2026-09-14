@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 from hibs_lnn.ssm_v30_3 import SSM_Layer_V30_3
+from hibs_lnn.pln_head import PLNHead, inner_adapt, oml_step
 
 WINDOW = 32
 N_FEAT = 4
@@ -57,10 +58,12 @@ class WaveSSM(nn.Module):
     """
 
     def __init__(self, n_feat=N_FEAT, d_model=128, d_state=8, n_layers=2,
-                 n_classes=6, pool="cat", agg_path=False):
+                 n_classes=6, pool="cat", agg_path=False, head_type="linear",
+                 pln_d=64, inner_lr=0.1):
         super().__init__()
         self.pool = pool
         self.agg_path = agg_path
+        self.head_type = head_type
         self.in_proj = nn.Linear(n_feat, d_model)
         self.layers = nn.ModuleList([
             SSM_Layer_V30_3(d_model, d_state, layer_idx=i, ent_mode='none')
@@ -69,10 +72,15 @@ class WaveSSM(nn.Module):
         d_head = d_model * (3 if pool == "cat" else 1)
         if agg_path:
             d_head += 5 * n_feat
-        self.head = nn.Linear(d_head, n_classes)
+        self.d_head = d_head
+        if head_type == "pln":
+            # lm1 架构: 用 PLN (小 MLP + per-feature 步长) 取代线性头
+            self.head = PLNHead(d_head, pln_d, n_classes, inner_lr=inner_lr)
+        else:
+            self.head = nn.Linear(d_head, n_classes)
 
-    def forward(self, x, agg=None):
-        """x: (B, L, n_feat) → logits (B, n_classes)"""
+    def encode(self, x, agg=None):
+        """x: (B, L, n_feat) → 表示 s (B, d_head)。双循环里内/外循环都复用这个 s。"""
         h = self.in_proj(x)
         for layer in self.layers:
             h, _ = layer(h)
@@ -87,7 +95,11 @@ class WaveSSM(nn.Module):
             s = torch.cat([h[:, -1], h.mean(1), h.max(1).values], dim=-1)
         if self.agg_path:
             s = torch.cat([s, window_agg(x) if agg is None else agg], dim=-1)
-        return self.head(s)
+        return s
+
+    def forward(self, x, agg=None):
+        """x: (B, L, n_feat) → logits (B, n_classes)"""
+        return self.head(self.encode(x, agg))
 
 
 # ============================================================
@@ -353,8 +365,18 @@ def evaluate(model, loader, device):
 def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    epochs_per_domain=300, batch=32, lr=1e-3, replay=False,
                    replay_ratio=0.3, seed=42, n_domains=6, n_feat=None,
-                   pool="cat", agg_path=False, shuffle_domains=False):
+                   pool="cat", agg_path=False, shuffle_domains=False,
+                   cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
+                   outer_lr=None, meta_every=1, reptile_lr=0.0,
+                   consolidate_every=10):
+    """cl_method:
+      naive/replay — 单循环 (线性头), 原行为
+      oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
+      oml2         — 真 OML 双循环 (lm3 `oml2` + lm1 PLN): support 上适应克隆头
+                     (per-feature 步长), query loss 反传全模型, 再合并
+    """
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    use_pln = cl_method in ("oml", "oml2")
 
     # 每域划分 train/test
     train_by_dom, test_by_dom = {}, {}
@@ -382,8 +404,27 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     n_classes = n_domains
     model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
                     d_state=d_state, n_layers=n_layers,
-                    n_classes=n_classes, pool=pool, agg_path=agg_path).to(device)
+                    n_classes=n_classes, pool=pool, agg_path=agg_path,
+                    head_type=("pln" if use_pln else "linear"),
+                    pln_d=pln_d, inner_lr=inner_lr).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    # 双循环: 外循环 (慢, 表示+meta 参数) 与 内循环 (快, 仅头)
+    opt_outer = opt
+    if use_pln:
+        enc_params = [p for n_, p in model.named_parameters()
+                      if not n_.startswith("head.")]
+        head_params = [p for n_, p in model.named_parameters()
+                       if n_.startswith("head.")]
+        if cl_method == "oml2":
+            # 真 OML: 外循环更新全部 meta 参数 (表示 + 头初始化 + per-feature 步长)
+            opt_outer = torch.optim.Adam(model.parameters(), lr=(outer_lr or lr))
+            opt_inner = None
+        else:
+            # 快慢双循环: 外循环只动表示, 内循环只动头
+            opt_outer = torch.optim.Adam(enc_params, lr=(outer_lr or lr))
+            opt_inner = torch.optim.Adam(head_params, lr=inner_lr)
+    else:
+        opt_inner = None
 
     acc_matrix = []          # acc_matrix[step][domain]
     replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
@@ -397,6 +438,69 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 if it >= epochs_per_domain:
                     break
                 xb, yb = xb.to(device), yb.to(device)
+
+                if cl_method == "oml2":
+                    # ===== 真 OML 双循环 (lm3 oml2 + lm1 PLN) =====
+                    # 内循环: 克隆头在 support 上适应 K 步 (per-feature 步长)
+                    # 外循环: fast head 在 query 上的 loss 反传全部 meta 参数
+                    # support/query 都混入回放样本 (lm4 聚合所有有利于 CL 的机制)
+                    parts_x, parts_y = [xb], [yb]
+                    if replay and replay_by_dom:
+                        k = max(1, int(batch * replay_ratio))
+                        seen_doms = list(replay_by_dom)
+                        per = max(1, k // len(seen_doms))
+                        for sd in seen_doms:
+                            bx, by = replay_by_dom[sd]
+                            m = min(per, len(bx))
+                            sel = torch.randint(0, len(bx), (m,), device=device)
+                            parts_x.append(bx[sel]); parts_y.append(by[sel])
+                    XB, YB = torch.cat(parts_x), torch.cat(parts_y)
+                    half = max(2, XB.shape[0] // 2)
+                    xq, yq = XB[half:], YB[half:]
+                    if xq.shape[0] < 2:
+                        it += 1; continue
+                    with torch.no_grad():
+                        h_sup = model.encode(XB[:half])
+                    h_qry = model.encode(xq)              # 保留计算图
+                    # 关键: 合并必须**周期性**做 (lm3 是每 10 步), 每步合并会让头
+                    # 被"只在当前批次上适应过 K 步"的版本覆盖 → 永远积累不了知识
+                    lq, _ = oml_step(model, model.head, model.encode,
+                                     h_sup, YB[:half], h_qry, yq, opt_outer,
+                                     K=inner_k, per_feature=True,
+                                     consolidate=(consolidate_every > 0
+                                                  and it % consolidate_every == 0),
+                                     reptile_lr=reptile_lr)
+                    loss = torch.tensor(lq, device=device)
+                    it += 1
+                    continue
+
+                if cl_method == "oml":
+                    # ===== 快慢双循环 (lm3 oml) =====
+                    # 内循环(快): 表示视为固定特征, 只更新头 (+回放)
+                    parts_x, parts_y = [xb], [yb]
+                    if replay and replay_by_dom:
+                        k = max(1, int(batch * replay_ratio))
+                        seen_doms = list(replay_by_dom)
+                        per = max(1, k // len(seen_doms))
+                        for sd in seen_doms:
+                            bx, by = replay_by_dom[sd]
+                            m = min(per, len(bx))
+                            sel = torch.randint(0, len(bx), (m,), device=device)
+                            parts_x.append(bx[sel]); parts_y.append(by[sel])
+                    XB, YB = torch.cat(parts_x), torch.cat(parts_y)
+                    with torch.no_grad():
+                        hb = model.encode(XB)
+                    loss = F.cross_entropy(model.head(hb), YB)
+                    opt_inner.zero_grad(); loss.backward(); opt_inner.step()
+                    # 外循环(慢): 低频更新表示
+                    if meta_every > 0 and it % meta_every == 0:
+                        opt_outer.zero_grad()
+                        l2 = F.cross_entropy(model(XB), YB)
+                        l2.backward(); opt_outer.step()
+                    it += 1
+                    continue
+
+                # ===== 单循环 (naive / replay): 原行为, 不变 =====
                 loss = F.cross_entropy(model(xb), yb)
                 # Replay: 按域均衡混入旧域样本
                 if replay and replay_by_dom:
@@ -521,6 +625,19 @@ def main():
     ap.add_argument("--shuffle-domains", action="store_true",
                     help="随机化域训练顺序 (检验按密度递增的课程是否重要)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cl-method", default="naive", choices=["naive", "replay", "oml", "oml2"],
+                    help="持续学习方法: naive/replay = 单循环 (线性头); "
+                         "oml = 快慢双循环 (lm3 oml); oml2 = 真 OML 双循环 (lm3 oml2 + lm1 PLN)")
+    ap.add_argument("--pln-d", type=int, default=64, help="PLN 头隐层维度 (lm1 V31_PLN)")
+    ap.add_argument("--inner-k", type=int, default=2, help="OML 内循环适应步数 K")
+    ap.add_argument("--inner-lr", type=float, default=0.1, help="内循环基础步长 (per-feature β 初值)")
+    ap.add_argument("--outer-lr", type=float, default=None, help="外循环学习率 (默认同 --lr)")
+    ap.add_argument("--meta-every", type=int, default=1,
+                    help="快慢双循环里外循环每 N 步更新一次 (lm3 用 10)")
+    ap.add_argument("--reptile-lr", type=float, default=0.0,
+                    help="OML 里 Reptile init 平均步长 (lm1 meta_step 的 init_lr; 0=关闭)")
+    ap.add_argument("--consolidate-every", type=int, default=10,
+                    help="OML 把适应后的头合并回本体的间隔步数 (lm3 用 10; 0=不合并)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default=str(ROOT / "results" / "lm4_wave"))
     args = ap.parse_args()
@@ -557,8 +674,16 @@ def main():
             joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
         results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
 
-    for replay in (() if args.joint_only else (False, True)):
-        print(f"\n=== {'Replay' if replay else 'Naive sequential'} ===", flush=True)
+    if args.joint_only:
+        runs = []
+    elif args.cl_method in ("oml", "oml2"):
+        # 双循环方法: 单次运行, 默认带回放 (lm4 聚合所有有利于 CL 的机制)
+        runs = [(args.cl_method, True)]
+    else:
+        runs = [("naive", False), ("replay", True)]
+
+    for key, replay in runs:
+        print(f"\n=== {key} ===", flush=True)
         M, doms = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
@@ -567,9 +692,14 @@ def main():
                                  seed=args.seed, n_domains=args.domains,
                                  n_feat=d_feat, pool=args.pool,
                                  agg_path=args.agg_path,
-                                 shuffle_domains=args.shuffle_domains)
+                                 shuffle_domains=args.shuffle_domains,
+                                 cl_method=(key if key in ("oml", "oml2") else "naive"),
+                                 pln_d=args.pln_d, inner_k=args.inner_k,
+                                 inner_lr=args.inner_lr, outer_lr=args.outer_lr,
+                                 meta_every=args.meta_every,
+                                 reptile_lr=args.reptile_lr,
+                                 consolidate_every=args.consolidate_every)
         s = summarize(M, doms)
-        key = "replay" if replay else "naive"
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
 
@@ -610,6 +740,10 @@ def main():
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
         "pool": args.pool, "agg_path": args.agg_path,
         "shuffle_domains": args.shuffle_domains,
+        "cl_method": args.cl_method, "pln_d": args.pln_d,
+        "inner_k": args.inner_k, "inner_lr": args.inner_lr,
+        "outer_lr": args.outer_lr, "meta_every": args.meta_every,
+        "reptile_lr": args.reptile_lr, "consolidate_every": args.consolidate_every,
         "joint_steps": args.joint_steps, "batch": args.batch, "lr": args.lr,
         "replay_ratio": args.replay_ratio, "domains": args.domains,
         "seed": args.seed, "n_windows": int(X.shape[0]), "n_feat": d_feat,
