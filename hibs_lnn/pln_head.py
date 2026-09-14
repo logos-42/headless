@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hibs_lnn.swifttd_head import SwiftTDHead
+
 
 class PLNHead(nn.Module):
     """预测学习网络 (Prediction Learning Network).
@@ -157,5 +159,106 @@ def oml_step(model, head: PLNHead, enc, h_sup, y_sup, h_qry, y_qry,
 
     with torch.no_grad():
         loss_s = F.cross_entropy(PLNHead.fwd_with(
+            [w.detach() for w in W], h_sup), y_sup).item()
+    return loss_q.item(), loss_s
+
+
+# ============================================================
+# SwiftTD 头 (lm1 hibs_lnn/swifttd_head.py 的适配器)
+# ============================================================
+class SwiftTDAdapter(nn.Module):
+    """把 lm1 的 SwiftTDHead 适配成分类头, 接口与 PLNHead 对齐。
+
+    SwiftTD 与 PLN 的本质差异:
+      PLN     — 内循环用 Meta-SGD 梯度, step_beta 是 **meta 参数**, 外循环可学
+      SwiftTD — 内循环用**局部规则** (δ·φ), 每参数步长 θ 由 IDBD 在线自适应,
+                外循环不需要学它 (θ 靠 bound/decay 自己调节)
+
+    两者都提供 step_graph (可微版本), 所以都能直接插进 OML 双循环。
+    """
+
+    def __init__(self, input_dim, n_classes, beta_init=0.01, kappa=0.05,
+                 eta=0.1, eps=0.99, tau_norm=None):
+        super().__init__()
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+        self.head = SwiftTDHead(d_model=input_dim, world_vocab=n_classes,
+                                n_resp=1, input_dim=input_dim,
+                                beta_init=beta_init, kappa=kappa,
+                                eta=eta, eps=eps, tau_norm=tau_norm)
+        s = 1.0 / math.sqrt(input_dim)
+        self.w1 = nn.Parameter(torch.randn(input_dim, input_dim) * s)
+        self.b1 = nn.Parameter(torch.zeros(input_dim))
+        self.w2 = nn.Parameter(torch.randn(n_classes, input_dim) * s)
+        self.b2 = nn.Parameter(torch.zeros(n_classes))
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.head.to(self.w1.device)
+        return self
+
+    def clone_params(self):
+        return [self.w1.clone(), self.b1.clone(),
+                self.w2.clone(), self.b2.clone()]
+
+    def load_cloned(self, W):
+        with torch.no_grad():
+            self.w1.copy_(W[0]); self.b1.copy_(W[1])
+            self.w2.copy_(W[2]); self.b2.copy_(W[3])
+
+    @staticmethod
+    def fwd_with(W, h):
+        x = torch.tanh(h @ W[0].t() + W[1])
+        return x @ W[2].t() + W[3]
+
+    def forward(self, h):
+        return self.fwd_with([self.w1, self.b1, self.w2, self.b2], h)
+
+    def step_size_stats(self):
+        return self.head.step_size_stats()
+
+
+def inner_adapt_swifttd(head: SwiftTDAdapter, h_sup, y_sup, K: int = 1):
+    """SwiftTD 内循环: 逐样本应用局部规则 (W 保持计算图, 供外循环 BPTT)。
+
+    SwiftTD 是**在线单样本**规则 (见 lm1 adapt_graph), 所以内循环按样本串行。
+    K 是在同一批 support 上扫的遍数。
+    """
+    W = head.clone_params()
+    B = h_sup.shape[0]
+    for _ in range(K):
+        for b in range(B):
+            hb = h_sup[b:b + 1]
+            x = torch.tanh(hb @ W[0].t() + W[1])
+            logits = (x @ W[2].t() + W[3]).view(1, 1, head.n_classes)
+            p = F.softmax(logits, dim=-1)
+            onehot = F.one_hot(y_sup[b:b + 1], head.n_classes).float()
+            errs = (p - onehot).reshape(-1)
+            W = head.head.step_graph(W, hb[0], x[0], errs)
+    return W
+
+
+def oml_step_swifttd(model, head: SwiftTDAdapter, h_sup, y_sup, h_qry, y_qry,
+                     opt_outer, K: int = 1, consolidate: bool = True,
+                     reptile_lr: float = 0.0):
+    """SwiftTD 版 OML 双循环 (与 oml_step 同协议, 只换内循环规则)。"""
+    W = inner_adapt_swifttd(head, h_sup, y_sup, K=K)
+
+    opt_outer.zero_grad()
+    loss_q = F.cross_entropy(SwiftTDAdapter.fwd_with(W, h_qry), y_qry)
+    loss_q.backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in model.parameters() if p.requires_grad], 1.0)
+    opt_outer.step()
+
+    if consolidate:
+        head.load_cloned([w.detach() for w in W])
+    if reptile_lr > 0.0:
+        with torch.no_grad():
+            for p, w in zip(head.parameters(), W):
+                p.add_(reptile_lr * (w.detach() - p))
+
+    with torch.no_grad():
+        loss_s = F.cross_entropy(SwiftTDAdapter.fwd_with(
             [w.detach() for w in W], h_sup), y_sup).item()
     return loss_q.item(), loss_s

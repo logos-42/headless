@@ -418,6 +418,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         if cl_method == "oml2":
             # 真 OML: 外循环更新全部 meta 参数 (表示 + 头初始化 + per-feature 步长)
             opt_outer = torch.optim.Adam(model.parameters(), lr=(outer_lr or lr))
+            # lm3 的 oml2 是**两部分**: OML 元步 + 常规训练步(含 replay)。
+            # 只做元步会让头仅靠 K 步内循环学, 合并时被覆盖 -> 什么都不剩。
+            opt_norm = torch.optim.Adam(model.parameters(), lr=lr)
             opt_inner = None
         else:
             # 快慢双循环: 外循环只动表示, 内循环只动头
@@ -470,6 +473,13 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                                      consolidate=(consolidate_every > 0
                                                   and it % consolidate_every == 0),
                                      reptile_lr=reptile_lr)
+                    # ---- lm3 oml2 的第二部分: 头/全模型照常训练, 含 replay ----
+                    # (这才是让 OML 站在 replay 之上而不是取代它的关键)
+                    loss_n = F.cross_entropy(model(XB), YB)
+                    opt_norm.zero_grad(); loss_n.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        [p_ for p_ in model.parameters() if p_.requires_grad], 1.0)
+                    opt_norm.step()
                     loss = torch.tensor(lq, device=device)
                     it += 1
                     continue

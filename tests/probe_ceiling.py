@@ -26,6 +26,7 @@ ap.add_argument("--paths", default="wfr,lshell", help="逗号分隔: wfr / lshel
 ap.add_argument("--domains", type=int, default=6)
 ap.add_argument("--steps", type=int, default=4000)
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--device", default="cpu")
 ap.add_argument("--ssm-ref", type=float, default=None,
                 help="同域数下 WaveSSM 的 joint 参考值; 不给则只报聚合基线")
 args = ap.parse_args()
@@ -51,9 +52,10 @@ idx = rng.permutation(len(agg))
 n_te = len(idx) // 5
 te, tr = idx[:n_te], idx[n_te:]
 mu, sd = agg[tr].mean(0), agg[tr].std(0) + 1e-6
-ftr = torch.tensor((agg[tr] - mu) / sd)
-fte = torch.tensor((agg[te] - mu) / sd)
-ytr = torch.tensor(y_dom[tr]); yte = torch.tensor(y_dom[te])
+DEV = torch.device(args.device)
+ftr = torch.tensor((agg[tr] - mu) / sd, device=DEV)
+fte = torch.tensor((agg[te] - mu) / sd, device=DEV)
+ytr = torch.tensor(y_dom[tr], device=DEV); yte = torch.tensor(y_dom[te], device=DEV)
 
 
 def run_mlp(hidden, layers, steps, tag):
@@ -62,11 +64,12 @@ def run_mlp(hidden, layers, steps, tag):
     for _ in range(layers - 1):
         mods += [nn.Linear(hidden, hidden), nn.ReLU()]
     mods += [nn.Linear(hidden, args.domains)]
-    m = nn.Sequential(*mods)
+    m = nn.Sequential(*mods).to(DEV)
+    torch.manual_seed(args.seed)
     opt = torch.optim.Adam(m.parameters(), lr=1e-3)
     n = len(ftr)
     for _ in range(steps):
-        b = torch.randint(0, n, (128,))
+        b = torch.randint(0, n, (128,), device=DEV)
         loss = nn.functional.cross_entropy(m(ftr[b]), ytr[b])
         opt.zero_grad(); loss.backward(); opt.step()
     with torch.no_grad():
