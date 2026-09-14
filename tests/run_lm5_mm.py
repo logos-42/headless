@@ -458,6 +458,8 @@ def batched_pred(fwd, X, bs=512):
 
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
            causal=None, n_causal_classes=5, backbone="mlp", norm="fixed",
+           proposer="fixed", rounds_per_domain=3, lam=(1.0, 1.0, 1.0, 1.0),
+           proposer_sigma=0.5,
            d_model=192, d_state=12, n_layers=2, vocab=1000,
            n_feat=30, n_wave_classes=6, head_type="pln",
            text_steps=300, wave_epochs=300, batch=32, lr=1e-3,
@@ -589,9 +591,33 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         model.train()
         return out
 
+    # ── 价值函数驱动的训练调度 (V35.19 移植; 见 hibs_lnn/value_proposer.py) ──
+    # 候选 = (域, 第几轮复习); 描述子 = one-hot(域) + 归一化轮次。
+    # 池 = n_dom × rounds_per_domain —— 必须 >> 轮数, 否则价值函数被抹平
+    # (V35.19 v1 的教训: 池 18 个被全覆盖 -> 提议顺序无关 -> λ 扫描零效果)。
+    prop, POOL, prop_trace = None, None, []
+    if proposer != "fixed":
+        _R = max(2, rounds_per_domain)
+        POOL = [(d, r) for d in domains for r in range(_R)]
+        _desc = np.zeros((len(POOL), n_dom + 1))
+        for _i, (_d, _r) in enumerate(POOL):
+            _desc[_i, domains.index(_d)] = 1.0
+            _desc[_i, n_dom] = _r / max(1, _R - 1)
+        from hibs_lnn.value_proposer import RegimeProposer
+        prop = RegimeProposer(_desc, k=1, lam=lam, sigma=proposer_sigma,
+                              tau=0.5, seed=seed * 7919 + 31)
+        print(f"[proposer] 候选池 {len(POOL)} 个 (= {n_dom} 域 x {_R} 轮), "
+              f"调度={proposer}", flush=True)
+
     t0 = time.time()
-    for step, dom in enumerate(domains):
-        print(f"\n--- 域 {step+1}/{n_dom}: {dom} ---", flush=True)
+    for step in range(n_dom):
+        if prop is not None:
+            _ci = (prop.propose(k=1) if proposer == "value"
+                   else prop.pick_random(k=1))[0]
+            dom, cur_cand = POOL[_ci][0], _ci
+        else:
+            dom, cur_cand = domains[step], None
+        print(f"\n--- 轮 {step+1}/{n_dom}: {dom} ---", flush=True)
         model.train()
 
         if dom in ("wave", "causal"):
@@ -669,9 +695,16 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                 x, y = c[0].to(device), c[1].to(device)
                 loss = F.cross_entropy(model.forward_text(x), y)
                 if cl_method == "replay":
-                    for rd, (rids,) in replay_buf.items():
-                        if rd == "wave":
+                    for rd, rbuf in replay_buf.items():
+                        # 只回放**文本域**。非文本域 (wave/causal) 的条目是
+                        # (X, y) 二元组, 不能按文本的 (ids,) 解包。
+                        # 原写法 `for rd, (rids,) in ...` 在解包后才检查 rd,
+                        # 且只排除了 "wave" —— 固定域序里 wave/causal 总排在
+                        # 文本之后, 所以这个 bug 一直没触发; 价值函数调度会把
+                        # 它们排到前面, 于是暴露 (实测 ValueError)。
+                        if rd not in TEXT_DOMAINS:
                             continue
+                        rids = rbuf[0]
                         rc = make_text_chunks(rids, rng, max(4, batch_sz // 8))
                         if rc is None:
                             continue
@@ -686,6 +719,15 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
 
         row = eval_all()
         acc_hist.append(row)
+        # ── 真实反馈: 把该域本轮实测准确率回填价值函数 (持续学习那一环) ──
+        if prop is not None:
+            _a = row.get(dom, float("nan"))
+            if _a == _a:
+                prop.observe(cur_cand, _a)
+            prop_trace.append({"step": step + 1, "domain": dom,
+                               "value": round(prop.value(cur_cand), 4),
+                               "freq": int(prop.freq[cur_cand]),
+                               "acc": None if _a != _a else round(float(_a), 4)})
         seen = [f"{d}:{row[d]:.3f}" for d in domains if d in row and not math.isnan(row[d])]
         print(f"  [{cl_method}] 已见域 → {' '.join(seen)}  ({time.time()-t0:.0f}s)", flush=True)
 
@@ -697,7 +739,7 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         # ★ 平衡准确率列 —— y_do 的多数类基线高达 0.789, 原始准确率会骗人
         report_doms.append("causal_bal")
         report_doms.append("causal_do_bal")
-    return acc_hist, report_doms, chance
+    return acc_hist, report_doms, chance, prop_trace
 
 
 def main():
@@ -725,6 +767,16 @@ def main():
     ap.add_argument("--causal-n", type=int, default=20000, help="因果域样本数")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--proposer", choices=["fixed", "random", "value"],
+                    default="fixed",
+                    help="训练调度: fixed=固定域序(默认) random=随机 value=价值函数驱动")
+    ap.add_argument("--rounds-per-domain", type=int, default=3,
+                    help="候选池里每个域算几轮 (池大小 = 域数 x 此值, 必须 >> 轮数)")
+    ap.add_argument("--lam-sim", type=float, default=1.0, help="简约性权重")
+    ap.add_argument("--lam-con", type=float, default=1.0, help="自洽性权重")
+    ap.add_argument("--lam-cov", type=float, default=1.0, help="覆盖增量权重")
+    ap.add_argument("--lam-fb", type=float, default=1.0, help="真实反馈权重")
+    ap.add_argument("--proposer-sigma", type=float, default=0.5)
     ap.add_argument("--backbone", choices=["mlp", "ssm", "hybrid"], default="mlp",
                     help="统一骨干: mlp=统计特征MLP(新, 默认) ssm=复值SSM(旧)")
     ap.add_argument("--norm", choices=["fixed", "batchnorm", "none"], default="fixed",
@@ -803,7 +855,7 @@ def main():
         print(f"[causal] 训练 {causal_data['X'].shape}, 测试 {cX[c_te].shape}, "
               f"类数 5, 观测/干预双标签", flush=True)
 
-    hist, doms, chance = run_mm(
+    hist, doms, chance, prop_trace = run_mm(
         enc, wave_X, wave_y, wave_test, device, causal=causal_data,
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         vocab=vocab, n_feat=n_feat, n_wave_classes=args.domains,
@@ -812,7 +864,10 @@ def main():
         cl_method=args.cl_method, replay_ratio=args.replay_ratio,
         seed=args.seed, pool=args.pool, agg_path=args.agg_path,
         inner_k=args.inner_k, reptile_lr=args.reptile_lr,
-        backbone=args.backbone, norm=args.norm)
+        backbone=args.backbone, norm=args.norm,
+        proposer=args.proposer, rounds_per_domain=args.rounds_per_domain,
+        lam=(args.lam_sim, args.lam_con, args.lam_cov, args.lam_fb),
+        proposer_sigma=args.proposer_sigma)
 
     # ── 报告 ──
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -834,6 +889,8 @@ def main():
         print(f"  {d:>6s}: {f:+.4f}  (随机基线 {chance.get(d, float('nan')):.4f})")
     rep = {"config": vars(args), "domains": doms,
            "matrix": M.tolist(), "forgets": forgets, "chance": chance}
+    if prop_trace:                        # 价值函数调度轨迹
+        rep["proposer_trace"] = prop_trace
     Path(args.out, "lm5_mm_results.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1))
     print(f"\n报告: {args.out}/lm5_mm_results.json")
