@@ -468,8 +468,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     ht = head_type
     if backbone == "mlp":
         model = StatMLP(n_feat=n_feat or X.shape[-1], n_classes=n_classes,
-                        hidden=d_model, head_type=ht, pln_d=pln_d,
-                        inner_lr=inner_lr).to(device)
+                        hidden=d_model, n_layers=n_layers, head_type=ht,
+                        pln_d=pln_d, inner_lr=inner_lr).to(device)
     else:
         model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
                         d_state=d_state, n_layers=n_layers,
