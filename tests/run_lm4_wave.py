@@ -426,11 +426,17 @@ def build_windows(times, dens, feats, ok, window=WINDOW, stride=None):
     return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
 
 
-def assign_domains(y_log10, n_domains=6):
-    """按 log10(density) 分位数划分域 (等样本量, 保证每域可训练)."""
-    qs = np.quantile(y_log10, np.linspace(0, 1, n_domains + 1))
-    qs[0] -= 1e-6
-    qs[-1] += 1e-6
+def assign_domains(y_log10, n_domains=6, qs=None):
+    """按 log10(density) 分位数划分域 (等样本量, 保证每域可训练).
+
+    qs 不为 None 时**沿用给定边界** —— 跨年/外部分布评估必须这样,
+    否则测试年用自己算的分位数, 域定义与训练年不同, 标签根本对不上
+    (曾因此得到 naive 跨年 1.000 的荒谬结果)。
+    """
+    if qs is None:
+        qs = np.quantile(y_log10, np.linspace(0, 1, n_domains + 1))
+        qs[0] -= 1e-6
+        qs[-1] += 1e-6
     lab = np.digitize(y_log10, qs[1:-1])
     return lab.astype(np.int64), qs
 
@@ -458,7 +464,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
                    consolidate_every=10, stat_input=False, backbone="ssm",
                    head_type="linear", norm="batchnorm",
-                   trace_every=0):
+                   trace_every=0, external_test=None):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -534,6 +540,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         opt_inner = None
 
     acc_matrix = []          # acc_matrix[step][domain]
+    cross = []               # 每个域学完后, 在**外部分布**(如 2016 年)上的准确率
     replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
 
     curves = {}        # dd -> [(step, acc)]  学习效率曲线
@@ -651,6 +658,18 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         row = [evaluate(model, test_loaders[d], device) if d in test_loaders else float('nan')
                for d in domains]
         acc_matrix.append(row)
+        # 跨年/外部分布: 每步评**所有**外部域, 形成外部矩阵。
+        # 只报"刚训完 dd 时在外部 dd 上的准确率"是没有意义的 —— naive 在那个瞬间
+        # 恰好专精于 dd, 会得到 1.0。有意义的量是**全流程训完后**的末行。
+        if external_test:
+            model.eval()
+            with torch.no_grad():
+                cross.append([evaluate(model, external_test[d], device)
+                              if d in external_test else float('nan')
+                              for d in range(n_domains)])
+            model.train()
+        else:
+            cross.append(None)
         if cur:
             curves[dd] = cur
         seen = [f"D{d}:{row[i]:.3f}" for i, d in enumerate(domains) if i <= step]
@@ -662,7 +681,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 idx, size=min(2000, len(idx)), replace=False)
             replay_by_dom[dd] = (torch.from_numpy(X[sel]).to(device),
                                  torch.from_numpy(y_dom[sel]).to(device))
-    return acc_matrix, domains, curves
+    return acc_matrix, domains, curves, cross
 
 
 def efficiency_report(curves, domains, thresholds=(0.5, 0.9)):
@@ -769,6 +788,8 @@ def main():
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
                     help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
+    ap.add_argument("--test-data", default=None,
+                    help="跨年/外部分布测试集目录 (如 data/wave2016 做 2015->2016 泛化)")
     ap.add_argument("--trace-every", type=int, default=0,
                     help="每 N 步评一次当前域, 产出学习效率曲线 (0=关闭)")
     ap.add_argument("--norm", default="batchnorm", choices=["batchnorm", "fixed", "none"],
@@ -823,8 +844,8 @@ def main():
           f"{time.time()-t0:.0f}s", flush=True)
     if len(X) == 0:
         print("ERROR: 无样本 (检查 MAG/WFR 数据是否下载)"); return
-    y_dom, qs = assign_domains(y_log, args.domains)
-    print(f"[domains] 边界 log10(density): {[round(float(q),2) for q in qs]}", flush=True)
+    y_dom, domain_qs = assign_domains(y_log, args.domains)
+    print(f"[domains] 边界 log10(density): {[round(float(q),2) for q in domain_qs]}", flush=True)
     cnt = np.bincount(y_dom, minlength=args.domains)
     print(f"[domains] 每域样本: {cnt.tolist()}", flush=True)
 
@@ -844,6 +865,29 @@ def main():
             joint_mean, {k: round(v, 3) for k, v in joint_accs.items()}), flush=True)
         results["joint"] = {"final_mean_acc": joint_mean, "per_domain": joint_accs}
 
+    # ── 跨年/外部分布测试集 (如 2015 训练 -> 2016 测试) ──
+    ext_test = None
+    if args.test_data:
+        t2, d2, F2, ok2 = build_feature_matrix(
+            args.test_data, bands=args.wfr_bands, use_wfr=not args.no_wfr,
+            use_lshell=args.lshell, use_cache=not args.no_cache)
+        X2, y_log2 = build_windows(t2, d2, F2, ok2, stride=args.stride)
+        y2, _ = assign_domains(y_log2, args.domains, qs=domain_qs)
+        if len(X2):
+            ext_test = {}
+            for dd in range(args.domains):
+                idx = np.where(y2 == dd)[0]
+                if len(idx) < 20:
+                    continue
+                _X = torch.from_numpy(X2[idx].astype(np.float32)).to(device)
+                _y = torch.from_numpy(y2[idx]).to(device)
+                ext_test[dd] = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(_X, _y), batch_size=512)
+            print(f"[cross] 外部测试集 {args.test_data}: {len(X2)} 窗口, "
+                  f"{len(ext_test)} 个域有数据", flush=True)
+        else:
+            print(f"!! 外部测试集 {args.test_data} 无有效窗口", flush=True)
+
     if args.joint_only:
         runs = []
     elif args.cl_method in ("oml", "oml2"):
@@ -854,7 +898,7 @@ def main():
 
     for key, replay in runs:
         print(f"\n=== {key} ===", flush=True)
-        M, doms, curves = run_experiment(X, y_dom, device, d_model=args.d_model,
+        M, doms, curves, cross = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
@@ -872,12 +916,24 @@ def main():
                                  stat_input=args.stat_input,
                                  backbone=args.backbone, head_type=args.head,
                                  norm=args.norm,
-                                 trace_every=args.trace_every)
+                                 trace_every=args.trace_every,
+                                 external_test=ext_test)
         s = summarize(M, doms)
         s["curves"] = {str(k): v for k, v in (curves or {}).items()}
+        s["cross_external"] = cross                 # 外部矩阵 (每步一行)
+        s["cross_external_final"] = (
+            [None if (c != c) else float(c) for c in cross[-1]]
+            if cross and cross[-1] is not None else None)
         s["efficiency"] = efficiency_report(curves, doms)
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
+        if ext_test and cross and cross[-1] is not None:
+            last = cross[-1]
+            ok = [c for c in last if c == c]
+            if ok:
+                print(f"  ── 跨年泛化 (全流程训完后) 平均 {sum(ok)/len(ok):.4f}  各域 "
+                      + " ".join(f"D{i}:{c:.3f}" for i, c in enumerate(last) if c == c),
+                      flush=True)
         if s["efficiency"]:
             print("  ── 学习效率 (达标步数) ──", flush=True)
             for k, v in s["efficiency"].items():
@@ -920,6 +976,7 @@ def main():
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
         "pool": args.pool, "agg_path": args.agg_path, "stat_input": args.stat_input,
         "backbone": args.backbone, "head": args.head, "norm": args.norm,
+        "domain_qs": [float(x) for x in domain_qs],
         "shuffle_domains": args.shuffle_domains,
         "cl_method": args.cl_method, "pln_d": args.pln_d,
         "inner_k": args.inner_k, "inner_lr": args.inner_lr,
