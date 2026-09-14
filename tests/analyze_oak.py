@@ -158,6 +158,53 @@ for arm in ("replay",):
         print("   机制: options=%s  option_starts=%s"
               % (fmt(opt["nopt"]), fmt(opt["starts"])))
 
+# ── 步长 E 表 (E1~E5) ──────────────────────────────────────────────────
+print()
+print("=" * 96)
+print("步长 E 表 (E1 固定步长 / E2 IDBD / E3 idbd-raw / E4 Autostep / E5 Continual-IDBD)")
+print("=" * 96)
+_rows = []
+fx = collect(os.path.join(RES, "oak_e1_fixedalpha_s*"), "replay")
+if fx["dirs"]:
+    _rows.append(("E1 fixed-alpha (mu=0)", fx))
+for algo, lbl in [("idbd", "E2 IDBD"), ("idbd-raw", "E3 idbd-raw"),
+                  ("autostep", "E4 Autostep"), ("cidbd", "E5 Continual-IDBD")]:
+    d = collect(os.path.join(RES, "oak_algo_%s_s*" % algo), "replay")
+    if d["dirs"]:
+        _rows.append((lbl, d))
+if _rows:
+    print("  %-24s %-30s %-30s %s" % ("臂", "any_time", "最差遗忘界", "最终 acc"))
+    for lbl, d in _rows:
+        print("  %-24s %-30s %-30s %s" % (lbl, fmt(d["any_time"]), fmt(d["forget"]), fmt(d["final"])))
+    base = _rows[0][1]
+    print("  ── 相对 E1(固定步长)的差 ──")
+    for lbl, d in _rows[1:]:
+        ta, pa = welch(d["any_time"], base["any_time"])
+        tf, pf = welch(d["forget"], base["forget"])
+        print("     %-22s any_time Δ=%+.4f (p=%.3f)   遗忘 Δ=%+.4f (p=%.3f)"
+              % (lbl, np.nanmean(d["any_time"]) - np.nanmean(base["any_time"]), pa,
+                 np.nanmean(d["forget"]) - np.nanmean(base["forget"]), pf))
+
+# ── lm5 加长配置 ───────────────────────────────────────────────────────
+print()
+print("=" * 96)
+print("lm5 加长配置 (text 400 / wave 400 / causal 40k / rounds 200)")
+print("=" * 96)
+e9_5 = collect(os.path.join(RES, "oak5L_e9_s*"), "replay")
+e10_5 = collect(os.path.join(RES, "oak5L_e10_s*"), "replay")
+for lbl, d in [("lm5L E9 (无 Options)", e9_5), ("lm5L E10 (有 Options)", e10_5)]:
+    if not d["dirs"]:
+        continue
+    print("  %-24s any_time %s" % (lbl, fmt(d["any_time"])))
+    print("  %-24s 遗忘     %s" % ("", fmt(d["forget"])))
+    print("  %-24s 机制     options=%s  starts=%s" % ("", fmt(d["nopt"]), fmt(d["starts"])))
+if e9_5["dirs"] and e10_5["dirs"]:
+    t, pv = welch(e10_5["any_time"], e9_5["any_time"])
+    if np.isfinite(t):
+        print("  any_time Δ=%+.4f  t=%+.2f  p=%.4f  %s"
+              % (np.nanmean(e10_5["any_time"]) - np.nanmean(e9_5["any_time"]), t, pv,
+                 "**显著**" if pv < 0.05 else "不显著"))
+
 print()
 print("=" * 96)
 print("判读口径 (防止过度解读)")
