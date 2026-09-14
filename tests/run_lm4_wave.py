@@ -543,6 +543,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    stream="fixed", rounds=0, freq_profile=None,
                    y_log=None, bands=13, use_lshell=False,
                    rl_mu=0.05, rl_alpha0=0.2, rl_explore_w=0.5, rl_algo="autostep",
+                   rl_know=0,
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
@@ -623,10 +624,15 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         from hibs_lnn.rl_proposer import RLProposer
         # 候选池 (与 value 臂同构, 便于公平对照)
         _nf = int(fine.max()) + 1
+        # ★ 内部知识维度: 6 域能力画像 + 6 域访问次数(归一) + any_time + 平均遗忘
+        _know_dim = int(rl_know) if rl_know else 0
         rlprop = RLProposer(fine_desc, tau=0.5, k=proposer_k,
                             mu=rl_mu, alpha0=rl_alpha0,
-                            explore_w=rl_explore_w, algo=rl_algo,
+                            explore_w=rl_explore_w, algo=rl_algo, n_know=_know_dim,
                             seed=(seed * 7919 + 29))
+        if _know_dim:
+            print("[rl] 内部知识已启用: %d 维 (能力画像 6 + 访问次数 6 + any_time + 遗忘)"
+                  % _know_dim, flush=True)
         for _f in range(_nf):
             _idx = np.where(fine == _f)[0]
             if len(_idx) >= 20:
@@ -917,6 +923,18 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         # 必须放在 row 算完之后: reward = Δ(any-time 准确率), 而 any-time 是
         # **刚训练过的那个区间**通过改变模型能力而影响到的量 —— reward 因此
         # 真正依赖动作, 而不是外生给定的。
+        if rlprop is not None and getattr(rlprop, "n_know", 0):
+            # ★ 注入内部知识: 这是「智能体知道自己的什么」——不是手写特征,
+            #   而是它当前的能力画像、对各域的访问程度、以及遗忘信号。
+            #   对应 Horde/GVF 的 "predictive knowledge 进入状态"。
+            _row = np.array([0.0 if (v != v) else float(v) for v in row])
+            _vis = rlprop.visits / max(1.0, rlprop.visits.sum())
+            _forg = float(np.mean([max(0.0, (np.nanmax(row) if row else 0.0) - v)
+                                   for v in _row if v == v])) if len(_row) else 0.0
+            _at = float(np.mean([v for v in row if not math.isnan(v)]))
+            _kv = np.concatenate([_row, _vis, [_at, _forg]])
+            if _kv.size >= rlprop.n_know:
+                rlprop.set_knowledge(_kv[:rlprop.n_know])
         if rlprop is not None:
             _accs = [evaluate(model, loader_for(fine_test[f]), device)
                      for f in pick if f in fine_test]
@@ -972,6 +990,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         extra["proposer_freq"] = [int(x) for x in rlprop.visits]
         extra["proposer_stats"] = rlprop.stats()
         extra["rl_trace"] = rlprop.trace
+        extra["rl_n_know"] = int(getattr(rlprop, "n_know", 0))
     return acc_matrix, domains, curves, cross, prop_rows, extra
 
 
@@ -1102,9 +1121,15 @@ def main():
     ap.add_argument("--rl-alpha0", type=float, default=0.2,
                     help="每权重初始步长; 实测 <0.2 时 IDBD 不分化 (步长死亡)")
     ap.add_argument("--rl-explore-w", type=float, default=0.5)
-    ap.add_argument("--rl-algo", choices=["idbd", "autostep"], default="autostep",
-                    help="步长自适应算法。idbd=Sutton1992(对 mu 敏感, 实测 3/8 档发散);"
-                         " autostep=Mahmood2012(归一化, 实测 0 档发散, 免调参)")
+    ap.add_argument("--rl-know", type=int, default=0,
+                    help="内部知识维度 (0=关)。14 = 6域能力画像 + 6域访问次数 + "
+                         "any_time + 平均遗忘 —— 让智能体自己的预测进入状态 (Horde/GVF)")
+    ap.add_argument("--rl-algo",
+                    choices=["idbd", "idbd-raw", "idbd-acc", "autostep", "cidbd"],
+                    default="cidbd",
+                    help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
+                         "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
+                         "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
     ap.add_argument("--proposer",
                     choices=["fixed", "bins", "random", "random-matched",
                              "value", "value-nofb", "rl"],
@@ -1300,7 +1325,7 @@ def main():
                                  proposer_k=args.proposer_k,
                                  proposer_sigma=args.proposer_sigma,
                                  rl_mu=args.rl_mu, rl_alpha0=args.rl_alpha0,
-                                 rl_algo=args.rl_algo,
+                                 rl_algo=args.rl_algo, rl_know=args.rl_know,
                                  rl_explore_w=args.rl_explore_w,
                                  stream=args.stream, rounds=args.rounds,
                                  freq_profile=freq_prof,

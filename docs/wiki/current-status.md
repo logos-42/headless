@@ -11,6 +11,20 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**步长自适应（IDBD / Autostep / Continual-IDBD）—— 最终测不出效应（诚实负面结论）**
+  - 建 `hibs_lnn/rl_proposer.py` 五种步长算法 + **内部知识注入**（`--rl-know 14`，φ 9→23 维）
+  - **主结论（n=11）**：`idbd-raw` vs `value` 最差遗忘界 Δ=+0.0026（p=0.965）；
+    IDBD 系 vs value 系 Δ=−6.2%（**p=0.564**）；any_time p=0.53 —— **全部不显著**
+  - **★ 自我纠错**：n=3–5 时看到的「−24% 一致方向」与 **p=0.0049** 是**池化不同代码版本**的假象，
+    补 seed 后效应消失，**原结论作废**
+  - **分化机制（真知识）**：`h` 在 Autostep 里分化**比 IDBD 更强**（1.16 vs 0.45）→ 不是特征不可分；
+    alpha 不分的元凶是**逐分量归一化把指数卡死在 μ**（`|e|max ≡ μ`）
+  - **Regime-shift**：autostep 最稳（MSE_B 0.564），我的 cidbd 最差（8.640，α 顶死 + recovery 触发 311 次）
+  - **修 6 个 bug**，其中两个是诊断性缺陷：driver 里 `$(date)` 先执行会**重置 `$?`** → 失败的 run 报 `rc=0`；
+    以及本轮第二次「参数加了但调用点没接」
+  - **alberta-framework 装不了**（要求 Python ≥ 3.13，当前 3.11）
+  - 文档 `docs/stepsize_idbd_results.md`
+
 - 2026-09-14：**真 RL 提议器 + IDBD/Autostep 步长自适应 —— 分化成立但无收益（诚实负面结论）**
   - 用户要求「动作→环境→奖励→参数更新」的真闭环 + 「步长为主导的 policy 积累」+「redefine 也要探索 policy 的积累」
   - **新建** `hibs_lnn/rl_proposer.py`（θ 可学；reward = **Δ any-time 准确率**；`h` 信用迹累积；
