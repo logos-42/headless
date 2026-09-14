@@ -185,10 +185,14 @@ def build_causal_data(n=20000, L=8, seed=0, n_bins=5):
         for t in range(L):
             obs = np.asarray(scm.observe(perm, rng), dtype=np.float32)
             X[i, t] = np.concatenate([sig, [cyc], obs])
+        # ★ 观测/干预必须用**同一个**噪声水平, 否则两边标签难度不同,
+        #   "干预比观测准"会是纯假象 (do_intervene 内部写死 noise=0)。
         a = scm.acc(perm, atoms)
-        y[i] = min(n_bins - 1, max(0, int(a * n_bins)))
         a_do = scm.do_intervene(perm, atoms)
-        y_do[i] = min(n_bins - 1, max(0, int(a_do * n_bins)))
+        # 给干预版补上同样的观测噪声
+        a_do_n = float(np.clip(a_do + rng.normal(0, 0.08), 0.02, 0.98))
+        y[i] = min(n_bins - 1, max(0, int(a * n_bins)))
+        y_do[i] = min(n_bins - 1, max(0, int(a_do_n * n_bins)))
     return X, y, y_do
 
 
@@ -388,6 +392,8 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         seen = [f"{d}:{row[d]:.3f}" for d in domains if d in row and not math.isnan(row[d])]
         print(f"  [{cl_method}] 已见域 → {' '.join(seen)}  ({time.time()-t0:.0f}s)", flush=True)
 
+    # 注意: report_doms 可以比 acc_hist 的列多 (causal_do 由同一次评估派生),
+    # 报告端必须按 row.get 取值, 不能用位置索引。
     report_doms = list(domains)
     if "causal" in domains:
         report_doms.append("causal_do")     # 干预版单列, 与观测版对比
@@ -506,9 +512,10 @@ def main():
     Path(args.out).mkdir(parents=True, exist_ok=True)
     M = np.array([[row.get(d, float('nan')) for d in doms] for row in hist])
     print("\n=== 跨模态遗忘矩阵 (行=学到第几域, 列=各域指标) ===")
-    print("       " + " ".join(f"{d:>8s}" for d in doms))
-    for i, d in enumerate(doms):
-        print(f"  域{i+1}({d:>4s}) " + " ".join(f"{v:8.3f}" for v in M[i]))
+    print("       " + " ".join(f"{d:>9s}" for d in doms))
+    for i in range(M.shape[0]):          # ← 按矩阵行数迭代, 不是按 doms
+        tag = doms[i] if i < len(doms) else f"step{i+1}"
+        print(f"  域{i+1}({tag:>4s}) " + " ".join(f"{v:9.3f}" for v in M[i]))
     # 遗忘
     forgets = {}
     for j, d in enumerate(doms):
