@@ -1,0 +1,62 @@
+[
+ {
+  "tag": "m1_d3",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--backbone",
+   "mlp",
+   "--d-model",
+   "512",
+   "--device",
+   "cuda",
+   "--joint-steps",
+   "0",
+   "--cl-method",
+   "replay",
+   "--head",
+   "linear",
+   "--domains",
+   "3",
+   "--epochs-per-domain",
+   "1000",
+   "--replay-ratio",
+   "2.0",
+   "--seed",
+   "42"
+  ]
+ },
+ {
+  "tag": "m1_pln_wide",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--backbone",
+   "mlp",
+   "--d-model",
+   "512",
+   "--device",
+   "cuda",
+   "--joint-steps",
+   "0",
+   "--cl-method",
+   "replay",
+   "--head",
+   "pln",
+   "--pln-d",
+   "384",
+   "--epochs-per-domain",
+   "1000",
+   "--replay-ratio",
+   "2.0",
+   "--seed",
+   "42"
+  ]
+ }
+]

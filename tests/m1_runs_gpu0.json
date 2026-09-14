@@ -1,0 +1,58 @@
+[
+ {
+  "tag": "m1_replay",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--backbone",
+   "mlp",
+   "--d-model",
+   "512",
+   "--device",
+   "cuda",
+   "--joint-steps",
+   "0",
+   "--cl-method",
+   "replay",
+   "--head",
+   "linear",
+   "--epochs-per-domain",
+   "1000",
+   "--replay-ratio",
+   "2.0",
+   "--seed",
+   "42"
+  ]
+ },
+ {
+  "tag": "m1_replay_rr1",
+  "args": [
+   "--wfr-bands",
+   "13",
+   "--pool",
+   "cat",
+   "--agg-path",
+   "--backbone",
+   "mlp",
+   "--d-model",
+   "512",
+   "--device",
+   "cuda",
+   "--joint-steps",
+   "0",
+   "--cl-method",
+   "replay",
+   "--head",
+   "linear",
+   "--epochs-per-domain",
+   "1000",
+   "--replay-ratio",
+   "1.0",
+   "--seed",
+   "42"
+  ]
+ }
+]
