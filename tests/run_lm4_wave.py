@@ -457,7 +457,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
                    consolidate_every=10, stat_input=False, backbone="ssm",
-                   head_type="linear", norm="batchnorm"):
+                   head_type="linear", norm="batchnorm",
+                   trace_every=0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -535,10 +536,12 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     acc_matrix = []          # acc_matrix[step][domain]
     replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
 
+    curves = {}        # dd -> [(step, acc)]  学习效率曲线
     for step, dd in enumerate(domains):
         dl = loader_for(train_by_dom[dd], shuffle=True)
         model.train()
         it = 0
+        cur = []
         while it < epochs_per_domain:
             for xb, yb in dl:
                 if it >= epochs_per_domain:
@@ -635,10 +638,21 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                     loss = loss + F.cross_entropy(model(rx), ry)
                 opt.zero_grad(); loss.backward(); opt.step()
                 it += 1
+                # ── 学习效率追踪: 每 trace_every 步评一次**当前域** ──
+                if (trace_every and it % trace_every == 0
+                        and dd in test_loaders):
+                    was_training = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        a = evaluate(model, test_loaders[dd], device)
+                    model.train(was_training)
+                    cur.append((it, a))
         # 记录: 已见域整体准确率
         row = [evaluate(model, test_loaders[d], device) if d in test_loaders else float('nan')
                for d in domains]
         acc_matrix.append(row)
+        if cur:
+            curves[dd] = cur
         seen = [f"D{d}:{row[i]:.3f}" for i, d in enumerate(domains) if i <= step]
         print(f"  [{'replay' if replay else 'naive '}] step{step+1} (域{dd}) → {' '.join(seen)}", flush=True)
         # 存回放样本 (每域固定 2000, 预置 device 避免逐步搬运)
@@ -648,7 +662,29 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 idx, size=min(2000, len(idx)), replace=False)
             replay_by_dom[dd] = (torch.from_numpy(X[sel]).to(device),
                                  torch.from_numpy(y_dom[sel]).to(device))
-    return acc_matrix, domains
+    return acc_matrix, domains, curves
+
+
+def efficiency_report(curves, domains, thresholds=(0.5, 0.9)):
+    """学习效率: 每个域达到其最终准确率 50%/90% 需要多少步。
+
+    这是"更新产生效率"的直接度量 —— 与"压缩/天花板"无关。
+    """
+    if not curves:
+        return {}
+    out = {}
+    for dd, cur in curves.items():
+        if not cur:
+            continue
+        final = max(a for _, a in cur)
+        d = domains[dd] if dd < len(domains) else str(dd)
+        row = {}
+        for th in thresholds:
+            tgt = final * th
+            hit = next((st for st, a in cur if a >= tgt), None)
+            row[f"{int(th*100)}"] = hit
+        out[f"D{d}(终{final:.3f})"] = row
+    return out
 
 
 def summarize(acc_matrix, domains):
@@ -733,6 +769,8 @@ def main():
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
                     help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
+    ap.add_argument("--trace-every", type=int, default=0,
+                    help="每 N 步评一次当前域, 产出学习效率曲线 (0=关闭)")
     ap.add_argument("--norm", default="batchnorm", choices=["batchnorm", "fixed", "none"],
                     help="StatMLP 归一化: batchnorm (随域漂移) / fixed (冻结全局 mu/sd) / none")
     ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
@@ -816,7 +854,7 @@ def main():
 
     for key, replay in runs:
         print(f"\n=== {key} ===", flush=True)
-        M, doms = run_experiment(X, y_dom, device, d_model=args.d_model,
+        M, doms, curves = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
@@ -833,10 +871,17 @@ def main():
                                  consolidate_every=args.consolidate_every,
                                  stat_input=args.stat_input,
                                  backbone=args.backbone, head_type=args.head,
-                                 norm=args.norm)
+                                 norm=args.norm,
+                                 trace_every=args.trace_every)
         s = summarize(M, doms)
+        s["curves"] = {str(k): v for k, v in (curves or {}).items()}
+        s["efficiency"] = efficiency_report(curves, doms)
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
+        if s["efficiency"]:
+            print("  ── 学习效率 (达标步数) ──", flush=True)
+            for k, v in s["efficiency"].items():
+                print(f"     {k}: " + "  ".join(f"{m}%→{st}步" for m, st in v.items()), flush=True)
 
     # 对比报告
     feat_desc = (f"MAG 4 维" if args.no_wfr
