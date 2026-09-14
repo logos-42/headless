@@ -11,6 +11,17 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**分离 δ^pred 与 δ^RL 两条学习信号 + 覆盖度门控（Q15/Q8）**
+  - Q15 要求「两个不要混成一个东西」—— 此前 `RLProposer` 只有 reward=Δ(any-time)，没有独立预测通路
+  - 新建 `hibs_lnn/dual_proposer.py` `DualSignalProposer`：
+    **通路 P**（world model，`W_p` 只由 `δ^pred` 更新）／**通路 V**（value，`θ_v/α/h` 只由 `δ^RL` 更新，IDBD 步长）；
+    预测输出只作为 `φ_v` 的一个分量进入价值通路
+  - **覆盖度门控（Q8）**：`g=1/√(1+n)`，预测按 g 缩放；`counterfactual()` 对未覆盖候选报不可信
+  - **验证三项全过**：① 信号隔离（只喂一路时另一路参数变化 = **0.000000000000**）
+    ② 门控生效（未访问 trustworthy=False）③ **规划幻觉对策**：零覆盖候选的预测值反而最高（0.6450 vs 0.5721），
+    门控挡住它 —— 实测对照 0.9582 预测 / 0.4357 真实
+  - 提交 `25158a9`
+
 - 2026-09-14：**步长自适应（IDBD / Autostep / Continual-IDBD）—— 最终测不出效应（诚实负面结论）**
   - 建 `hibs_lnn/rl_proposer.py` 五种步长算法 + **内部知识注入**（`--rl-know 14`，φ 9→23 维）
   - **主结论（n=11）**：`idbd-raw` vs `value` 最差遗忘界 Δ=+0.0026（p=0.965）；
