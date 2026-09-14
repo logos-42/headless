@@ -133,6 +133,31 @@ for arm in ("replay", "naive"):
               % (name, d, rel, t, p, verdict,
                  "**显著**" if p < 0.05 else "不显著"))
 
+# ── E11 / E12: regime shift ────────────────────────────────────────────
+print()
+print("=" * 96)
+print("regime shift (E11 单次 / E12 反复) —— T(s,a) 本身改变后的适应")
+print("=" * 96)
+for arm in ("replay",):
+    for tag, lbl in [("e11", "E11 单次漂移 @40"), ("e12", "E12 反复漂移 @30 每25")]:
+        opt = collect(os.path.join(RES, "oak_%sopt_s*" % tag), arm)
+        no = collect(os.path.join(RES, "oak_%snoopt_s*" % tag), arm)
+        if not opt["dirs"] and not no["dirs"]:
+            continue
+        print()
+        print("── %s (arm=%s) " % (lbl, arm) + "─" * 46)
+        print("   有 Options  : 最终 %s" % fmt(opt["final"]))
+        print("                 遗忘 %s" % fmt(opt["forget"]))
+        print("   无 Options  : 最终 %s" % fmt(no["final"]))
+        print("                 遗忘 %s" % fmt(no["forget"]))
+        t, pv = welch(opt["forget"], no["forget"])
+        if np.isfinite(t):
+            d = np.nanmean(opt["forget"]) - np.nanmean(no["forget"])
+            print("   遗忘 Δ=%+.4f  t=%+.2f  p=%.4f  %s"
+                  % (d, t, pv, "**显著**" if pv < 0.05 else "不显著"))
+        print("   机制: options=%s  option_starts=%s"
+              % (fmt(opt["nopt"]), fmt(opt["starts"])))
+
 print()
 print("=" * 96)
 print("判读口径 (防止过度解读)")
