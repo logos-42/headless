@@ -88,7 +88,9 @@ class MultiModalSSM(nn.Module):
 
     # ---- 文本: (B, L) ids -> (B, L, vocab) logits ----
     def forward_text(self, ids):
-        return self.text_head(self._trunk(self.text_stem(ids)))
+        # 取末位 logits -> (B, vocab): 与统计池化骨干统一成"由上下文预测末位 token",
+        # 两边才可比 (整序列 next-token 与单点预测不是同一个任务)。
+        return self.text_head(self._trunk(self.text_stem(ids)))[:, -1]
 
     # ---- 电磁波: (B, L, n_feat) -> 表示 (B, d_wave) ----
     def _pool(self, h):
@@ -126,6 +128,100 @@ class MultiModalSSM(nn.Module):
                 if n.startswith("wave_head.")]
 
 
+class MultiModalMLP(nn.Module):
+    """文本 + 电磁波 + 因果 的统一骨干 —— 用**统计特征 MLP** 取代 SSM 主干。
+
+    依据 (docs/lm4_backbone_final_verdict.md): 在电磁波数据上 StatMLP 在
+      天花板 / 保留率 / seed 稳定性 / 速度 四个轴上全面优于复值 SSM。
+    跨模态沿用同一结论: 各模态先投影到公共 d_model, 再走**共享 MLP 主干**。
+
+    各模态的"池化表示":
+      text    : token embedding 的 [mean, last] 拼接 -> Linear -> d_model
+                (文本任务相应改为"由上下文池化预测末位 token")
+      wave    : window_agg (5*n_feat)        -> Linear -> d_model
+      causal  : window_agg (5*CAUSAL_FEAT)   -> Linear -> d_model
+
+    归一化默认 fixed (冻结全局 mu/sd) —— BatchNorm 的 running stats
+    会随域漂移, 是持续学习的隐性杀手。定点统计量在投影**之后**做。
+    """
+
+    def __init__(self, vocab, n_feat, n_wave_classes, n_causal_classes=5,
+                 d_model=192, hidden=512, n_layers=2, head_type="linear",
+                 pln_d=64, pool="cat", agg_path=False, norm="fixed"):
+        super().__init__()
+        self.norm_mode = norm
+        self.pool = pool
+        self.d_model = d_model
+        # ── 各模态 -> 公共 d_model ──
+        self.text_emb = nn.Embedding(vocab, d_model)
+        self.text_proj = nn.Linear(2 * d_model, d_model)
+        self.wave_proj = nn.Linear(5 * n_feat, d_model)
+        self.causal_proj = nn.Linear(5 * CAUSAL_FEAT, d_model)
+        # ── 共享主干 ──
+        if norm == "batchnorm":
+            nml = nn.BatchNorm1d(d_model)
+        elif norm == "fixed":
+            nml = nn.BatchNorm1d(d_model)
+        else:
+            nml = nn.Identity()
+        self.norm_layer = nml
+        mods = [nml, nn.Linear(d_model, hidden), nn.GELU()]
+        for _ in range(n_layers - 1):
+            mods += [nn.Linear(hidden, hidden), nn.GELU()]
+        self.body = nn.Sequential(*mods)
+        d_head = hidden
+        self.d_head = d_head
+        # ── 任务头 ──
+        self.text_head = nn.Linear(d_head, vocab)
+        if head_type == "swifttd":
+            from hibs_lnn.pln_head import SwiftTDAdapter
+            self.wave_head = SwiftTDAdapter(d_head, n_wave_classes)
+            self.causal_head = SwiftTDAdapter(d_head, n_causal_classes)
+        elif head_type == "pln":
+            from hibs_lnn.pln_head import PLNHead
+            self.wave_head = PLNHead(d_head, pln_d, n_wave_classes)
+            self.causal_head = PLNHead(d_head, pln_d, n_causal_classes)
+        else:
+            self.wave_head = nn.Linear(d_head, n_wave_classes)
+            self.causal_head = nn.Linear(d_head, n_causal_classes)
+
+    # ---- 文本: 由上下文池化预测末位 token ----
+    def forward_text(self, ids):
+        e = self.text_emb(ids)                       # (B, L, d)
+        pooled = torch.cat([e.mean(1), e[:, -1, :]], dim=-1)
+        return self.text_head(self.body(self.text_proj(pooled)))
+
+    # ---- 电磁波 / 因果: 窗口统计 ----
+    def encode_wave(self, x):
+        return self.body(self.wave_proj(window_agg(x)))
+
+    def forward_wave(self, x):
+        return self.wave_head(self.encode_wave(x))
+
+    def encode_causal(self, x):
+        return self.body(self.causal_proj(window_agg(x)))
+
+    def forward_causal(self, x):
+        return self.causal_head(self.encode_causal(x))
+
+    # ---- fixed 归一化 ----
+    def set_fixed_stats(self, feats):
+        """feats: (N, d_model) 各类模态投影后的拼接, 用于算全局 mu/sd。"""
+        if self.norm_mode != "fixed":
+            return
+        with torch.no_grad():
+            self.norm_layer.running_mean.copy_(feats.mean(0))
+            self.norm_layer.running_var.copy_(feats.std(0).clamp(min=1e-6) ** 2)
+            self.norm_layer.num_batches_tracked.fill_(1)
+        self.norm_layer.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "norm_mode", None) == "fixed":
+            self.norm_layer.eval()
+        return self
+
+
 # ============================================================
 # 数据
 # ============================================================
@@ -140,13 +236,17 @@ def load_text_domains(data_dir, limit=2_000_000):
 
 
 def make_text_chunks(ids, rng, batch, chunk=CHUNK):
-    """从 ids 流里切 (x, y): x=(B,chunk) y=(B,chunk) 下一个 token。"""
+    """x = 上下文 (B, chunk-1); y = 末位 token (B,) 要预测的目标。
+
+    统一成"由上下文预测末位 token" —— 统计池化骨干只能出单点预测,
+    SSM 骨干也改用同一任务, 两边才可比。
+    """
     n = len(ids)
     if n < chunk + 2:
         return None
     starts = [rng.randrange(0, n - chunk - 1) for _ in range(batch)]
-    x = torch.tensor([ids[s:s + chunk] for s in starts], dtype=torch.long)
-    y = torch.tensor([ids[s + 1:s + chunk + 1] for s in starts], dtype=torch.long)
+    x = torch.tensor([ids[s:s + chunk - 1] for s in starts], dtype=torch.long)
+    y = torch.tensor([ids[s + chunk - 1] for s in starts], dtype=torch.long)
     return x, y
 
 
@@ -199,6 +299,32 @@ def build_causal_data(n=20000, L=8, seed=0, n_bins=5):
 # ============================================================
 # 持续学习主循环
 # ============================================================
+def balanced_acc(pred, y, n_classes):
+    """宏平均召回 (balanced accuracy) —— 对类不平衡免疫。
+
+    为什么必须要它: 因果域 y_do 的类分布是 {0:0.001, 1:0.029, 2:0.015,
+    3:0.165, 4:0.789}, 多数类基线就高达 0.789。此时**原始准确率毫无意义**
+    —— 一个常数预测器就能拿到 0.789, 看起来"干预任务学得很好"。
+    必须用宏平均召回, 每类等权, 才能看出模型是否真的学到了结构。
+    """
+    pred = np.asarray(pred); y = np.asarray(y)
+    rs = []
+    for c in range(n_classes):
+        m = (y == c)
+        if m.sum() > 0:
+            rs.append(float((pred[m] == c).mean()))
+    return float(np.mean(rs)) if rs else float('nan')
+
+
+def majority_baseline(y, n_classes):
+    """常数预测器的得分 (取最高频类) —— 任何低于它的"准确率"都是假象。"""
+    y = np.asarray(y)
+    if len(y) == 0:
+        return float('nan')
+    cnt = np.bincount(y, minlength=n_classes)
+    return float(cnt.max() / len(y))
+
+
 def batched_pred(fwd, X, bs=512):
     """分批前向再 argmax —— 一次性喂整个测试集会 OOM
     (SSM 的 Ab 张量是 (B,L,d,s) 复数, B=1.2万 时 ~5GB)。"""
@@ -209,7 +335,7 @@ def batched_pred(fwd, X, bs=512):
 
 
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
-           causal=None, n_causal_classes=5,
+           causal=None, n_causal_classes=5, backbone="mlp", norm="fixed",
            d_model=192, d_state=12, n_layers=2, vocab=1000,
            n_feat=30, n_wave_classes=6, head_type="pln",
            text_steps=300, wave_epochs=300, batch=32, lr=1e-3,
@@ -219,11 +345,43 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     rng = random.Random(seed)
 
-    model = MultiModalSSM(vocab, n_feat, n_wave_classes,
-                          n_causal_classes=n_causal_classes, d_model=d_model,
-                          d_state=d_state, n_layers=n_layers,
-                          head_type=head_type, pool=pool,
-                          agg_path=agg_path).to(device)
+    if backbone == "mlp":
+        model = MultiModalMLP(vocab, n_feat, n_wave_classes,
+                              n_causal_classes=n_causal_classes, d_model=d_model,
+                              hidden=d_model, n_layers=n_layers,
+                              head_type=head_type, pool=pool,
+                              agg_path=agg_path, norm=norm).to(device)
+    else:
+        model = MultiModalSSM(vocab, n_feat, n_wave_classes,
+                              n_causal_classes=n_causal_classes, d_model=d_model,
+                              d_state=d_state, n_layers=n_layers,
+                              head_type=head_type, pool=pool,
+                              agg_path=agg_path).to(device)
+    # fixed 归一化: 从各模态的投影特征算一次全局 mu/sd 然后冻结。
+    # (BatchNorm 的 running stats 随域漂移 = 持续学习的隐性杀手)
+    if backbone == "mlp" and norm == "fixed":
+        with torch.no_grad():
+            rows = []
+            for d in list(text_domains)[:3]:
+                ids = torch.tensor(text_domains[d][:30000], dtype=torch.long)
+                if len(ids) < CHUNK + 2:
+                    continue
+                hi = len(ids) - CHUNK - 1
+                st = np.random.randint(0, hi, min(256, hi))
+                xx = torch.stack([ids[t:t + CHUNK - 1] for t in st]).to(device)
+                e = model.text_emb(xx)
+                rows.append(model.text_proj(torch.cat([e.mean(1), e[:, -1, :]], -1)))
+            if wave_X is not None and len(wave_X):
+                rows.append(model.wave_proj(window_agg(torch.as_tensor(
+                    wave_X[:256]).float().to(device))))
+            if causal is not None and causal.get("X") is not None and len(causal["X"]):
+                cx = torch.as_tensor(causal["X"][:256]).float().to(device)
+                rows.append(model.causal_proj(window_agg(cx)))
+            if rows:
+                model.set_fixed_stats(torch.cat(rows, 0))
+                print(f"[norm] fixed 统计量: {sum(len(r) for r in rows)} 个投影特征",
+                      flush=True)
+
     use_pln = head_type in ("pln", "swifttd")
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     opt_outer = opt
@@ -242,6 +400,9 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     if "causal" in domains:
         chance["causal"] = 1.0 / n_causal_classes
         chance["causal_do"] = 1.0 / n_causal_classes
+        # 平衡准确率的随机线 = 1/类数 (宏平均召回下常数预测器只能拿到 ~1/K)
+        chance["causal_bal"] = 1.0 / n_causal_classes
+        chance["causal_do_bal"] = 1.0 / n_causal_classes
 
     # 回放缓冲: 每域固定量
     replay_buf = {}
@@ -269,22 +430,28 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                     else:
                         Xo, yo = causal["test_obs"]
                         Xd, yd = causal["test_do"]
-                        out["causal"] = float(
-                            (batched_pred(model.forward_causal, Xo) == yo).float().mean())
-                        out["causal_do"] = float(
-                            (batched_pred(model.forward_causal, Xd) == yd).float().mean())
+                        po = batched_pred(model.forward_causal, Xo).cpu().numpy()
+                        pd_ = batched_pred(model.forward_causal, Xd).cpu().numpy()
+                        yo_n, yd_n = yo.cpu().numpy(), yd.cpu().numpy()
+                        out["causal"] = float((po == yo_n).mean())
+                        out["causal_do"] = float((pd_ == yd_n).mean())
+                        # ★ 平衡准确率: 因果域的标签严重偏斜, 原始准确率会骗人
+                        out["causal_bal"] = balanced_acc(po, yo_n, n_causal_classes)
+                        out["causal_do_bal"] = balanced_acc(pd_, yd_n, n_causal_classes)
+                        # 首次评估时把常数基线记下来, 供报告判读
+                        if "causal_base" not in out:
+                            out["causal_base"] = majority_baseline(yo_n, n_causal_classes)
+                            out["causal_do_base"] = majority_baseline(yd_n, n_causal_classes)
                 else:
                     ids = torch.tensor(text_domains[d][:60000], dtype=torch.long)
                     if len(ids) < CHUNK + 2:
                         out[d] = float('nan'); continue
-                    s = 0
-                    tot = 0
+                    s = tot = 0
                     for _ in range(8):
                         st = rng.randrange(0, len(ids) - CHUNK - 1)
-                        x = ids[st:st + CHUNK].unsqueeze(0).to(device)
-                        y = ids[st + 1:st + CHUNK + 1].unsqueeze(0).to(device)
-                        logits = model.forward_text(x)
-                        s += int((logits.argmax(-1) == y).sum())
+                        x = ids[st:st + CHUNK - 1].unsqueeze(0).to(device)
+                        y = ids[st + CHUNK - 1].unsqueeze(0).to(device)
+                        s += int((model.forward_text(x).argmax(-1) == y).sum())
                         tot += y.numel()
                     out[d] = s / max(1, tot)
         model.train()
@@ -368,8 +535,7 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                 if c is None:
                     break
                 x, y = c[0].to(device), c[1].to(device)
-                logits = model.forward_text(x)
-                loss = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
+                loss = F.cross_entropy(model.forward_text(x), y)
                 if cl_method == "replay":
                     for rd, (rids,) in replay_buf.items():
                         if rd == "wave":
@@ -378,8 +544,7 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                         if rc is None:
                             continue
                         rx, ry = rc[0].to(device), rc[1].to(device)
-                        rl = F.cross_entropy(model.forward_text(rx).reshape(-1, vocab),
-                                             ry.reshape(-1))
+                        rl = F.cross_entropy(model.forward_text(rx), ry)
                         loss = loss + replay_ratio * rl
                 opt.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -397,6 +562,9 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     report_doms = list(domains)
     if "causal" in domains:
         report_doms.append("causal_do")     # 干预版单列, 与观测版对比
+        # ★ 平衡准确率列 —— y_do 的多数类基线高达 0.789, 原始准确率会骗人
+        report_doms.append("causal_bal")
+        report_doms.append("causal_do_bal")
     return acc_hist, report_doms, chance
 
 
@@ -405,7 +573,8 @@ def main():
     ap.add_argument("--text-data", default=str(ROOT / "data" / "text"))
     ap.add_argument("--wave-data", default=str(ROOT / "data" / "wave"))
     ap.add_argument("--cl-method", default="replay", choices=["naive", "replay", "oml2"])
-    ap.add_argument("--head", default="pln", choices=["pln", "swifttd"])
+    ap.add_argument("--head", choices=["linear", "pln", "swifttd"], default="linear",
+                    help="任务头; linear=普通线性(默认) pln/swifttd=元学习头")
     ap.add_argument("--d-model", type=int, default=192)
     ap.add_argument("--d-state", type=int, default=12)
     ap.add_argument("--n-layers", type=int, default=2)
@@ -424,6 +593,10 @@ def main():
     ap.add_argument("--causal-n", type=int, default=20000, help="因果域样本数")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--backbone", choices=["mlp", "ssm"], default="mlp",
+                    help="统一骨干: mlp=统计特征MLP(新, 默认) ssm=复值SSM(旧)")
+    ap.add_argument("--norm", choices=["fixed", "batchnorm", "none"], default="fixed",
+                    help="MLP 归一化; fixed=冻结全局mu/sd (默认, 抗 BN 漂移)")
     ap.add_argument("--out", default=str(ROOT / "results" / "lm5_mm"))
     args = ap.parse_args()
     device = torch.device(args.device)
@@ -506,7 +679,8 @@ def main():
         wave_epochs=args.wave_epochs, batch=args.batch, lr=args.lr,
         cl_method=args.cl_method, replay_ratio=args.replay_ratio,
         seed=args.seed, pool=args.pool, agg_path=args.agg_path,
-        inner_k=args.inner_k, reptile_lr=args.reptile_lr)
+        inner_k=args.inner_k, reptile_lr=args.reptile_lr,
+        backbone=args.backbone, norm=args.norm)
 
     # ── 报告 ──
     Path(args.out).mkdir(parents=True, exist_ok=True)
