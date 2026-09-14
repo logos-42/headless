@@ -530,6 +530,8 @@ def build_modality_consistency(domains, wave_X, causal, text_domains):
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
            causal=None, n_causal_classes=5, backbone="mlp", norm="fixed",
            proposer="fixed", rounds_per_domain=3, lam=(1.0, 1.0, 1.0, 1.0),
+           oak_options=1, oak_gate=1, oak_refresh=4,
+           rl_mu=0.05, rl_alpha0=0.2, rl_algo="autostep",
            proposer_sigma=0.5, stream="fixed", rounds=0, freq_profile=None,
            d_model=192, d_state=12, n_layers=2, vocab=1000,
            n_feat=30, n_wave_classes=6, head_type="pln",
@@ -723,13 +725,30 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         print(f"[proposer] 候选池 {len(POOL)} 个 (= {n_dom} 域 x {_R} 轮), "
               f"调度={proposer}" + (" [频率对齐]" if prof is not None else ""),
               flush=True)
+
+    oakprop = None
+    if proposer == "oak":
+        # ★ OaK 提议器: 包住 RLProposer + InternalKnowledge + Options。
+        #   lm5 的动作 = POOL 里第几个候选 (域 x 复习轮次);
+        #   state = 各域实测准确率向量 (与 lm4 的"能力画像"同构)。
+        from hibs_lnn.oak_proposer import OAKProposer
+        oakprop = OAKProposer(_desc, n_fine=len(POOL), k=1,
+                              seed=seed * 7919 + 29, tau=0.5,
+                              mu=rl_mu, alpha0=rl_alpha0, algo=rl_algo,
+                              n_know=0, use_options=bool(oak_options),
+                              use_gate=bool(oak_gate), refresh_every=oak_refresh)
+        print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s"
+              % (len(POOL), oak_options, oak_gate, rl_algo), flush=True)
     else:
         print(f"[stream] {stream} -> 轮次序列 {dom_seq}", flush=True)
 
     t0 = time.time()
     any_time = []
     for step in range(n_rounds):
-        if prop is not None:
+        if oakprop is not None:
+            _ci = int(oakprop.act()[0])
+            dom, cur_cand = POOL[_ci][0], _ci
+        elif prop is not None:
             if proposer in ("value", "value-nofb"):
                 _ci = prop.propose(k=1)[0]
             elif prof is not None:
@@ -847,6 +866,16 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
                  if k in domains and isinstance(v, float) and v == v]
         any_time.append(float(np.mean(_vals)) if _vals else float("nan"))
         # ── 真实反馈: 把该域本轮实测准确率回填价值函数 (持续学习那一环) ──
+        if oakprop is not None:
+            _oa = row.get(dom, float("nan"))
+            _vec = np.nan_to_num(
+                np.array([row.get(d, np.nan) for d in domains], dtype=float), nan=0.0)
+            oakprop.observe([cur_cand],
+                            acc=(float(_oa) if _oa == _oa else 0.5),
+                            any_time=(any_time[-1] if any_time else 0.5))
+            oakprop.set_pick([cur_cand])      # 必须先于 set_state
+            oakprop.set_state(_vec)
+            oakprop.update([cur_cand])
         if prop is not None:
             _a = row.get(dom, float("nan"))
             if _a == _a:
@@ -879,6 +908,12 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     if prop is not None:
         extra["proposer_freq"] = [int(x) for x in prop.freq]
         extra["proposer_stats"] = prop.stats()
+    if oakprop is not None:
+        extra["proposer_stats"] = oakprop.stats()
+        _kex = oakprop.stats_extra()
+        extra["oak"] = _kex["oak"]
+        extra["knowledge"] = _kex["knowledge"]
+        extra["oak_transitions"] = int(len(oakprop.trans))
     return acc_hist, report_doms, chance, prop_trace, extra
 
 
@@ -914,7 +949,7 @@ def main():
     ap.add_argument("--freq-profile", default="",
                     help="random-matched 臂: 从该 JSON 读取 value 臂的提议频率分布")
     ap.add_argument("--proposer",
-                    choices=["fixed", "random", "random-matched", "value",
+                    choices=["fixed", "random", "random-matched", "value", "oak",
                              "value-nofb"], default="fixed",
                     help="调度: fixed=用 --stream / random / random-matched(频率对齐"
                          "对照) / value=价值函数 / value-nofb=去掉反馈项的消融")
@@ -925,6 +960,16 @@ def main():
     ap.add_argument("--lam-cov", type=float, default=1.0, help="覆盖增量权重")
     ap.add_argument("--lam-fb", type=float, default=1.0, help="真实反馈权重")
     ap.add_argument("--proposer-sigma", type=float, default=0.5)
+    ap.add_argument("--oak-options", type=int, default=1,
+                    help="OaK: 1=启用 Options/时间抽象 (E10), 0=关闭 (E9)")
+    ap.add_argument("--oak-gate", type=int, default=1,
+                    help="OaK: 1=启用 coverage+uncertainty 门控")
+    ap.add_argument("--oak-refresh", type=int, default=4,
+                    help="每积累多少条转移重建一次 world model")
+    ap.add_argument("--rl-mu", type=float, default=0.05)
+    ap.add_argument("--rl-alpha0", type=float, default=0.2)
+    ap.add_argument("--rl-algo", default="autostep",
+                    choices=["idbd", "idbd-raw", "idbd-acc", "autostep", "cidbd"])
     ap.add_argument("--backbone", choices=["mlp", "ssm", "hybrid"], default="mlp",
                     help="统一骨干: mlp=统计特征MLP(新, 默认) ssm=复值SSM(旧)")
     ap.add_argument("--norm", choices=["fixed", "batchnorm", "none"], default="fixed",
@@ -1026,7 +1071,10 @@ def main():
         lam=(args.lam_sim, args.lam_con, args.lam_cov, args.lam_fb),
         proposer_sigma=args.proposer_sigma,
         stream=args.stream, rounds=args.rounds,
-        freq_profile=freq_prof)
+        freq_profile=freq_prof,
+        oak_options=args.oak_options, oak_gate=args.oak_gate,
+        oak_refresh=args.oak_refresh, rl_mu=args.rl_mu,
+        rl_alpha0=args.rl_alpha0, rl_algo=args.rl_algo)
 
     # ── 报告 ──
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -1051,6 +1099,18 @@ def main():
     if prop_trace:                        # 价值函数调度轨迹
         rep["proposer_trace"] = prop_trace
     rep.update(lm5_extra)                 # any-time / 最差遗忘界 / 调度诊断
+    # ★ 回读断言: 证明 oak 的 flag 真传到了 run_mm
+    #   (lm4 侧踩过: str.replace 未匹配会静默 no-op -> 配置没生效却毫无提示)
+    if args.proposer == "oak":
+        _os = (lm5_extra or {}).get("oak")
+        assert _os is not None, "--proposer oak 但结果里没有 oak 诊断块 -> 配置没生效"
+        assert bool(_os.get("use_options")) == bool(args.oak_options), (
+            "oak_options 未传到 run_mm: 期望 %s 实得 %s"
+            % (args.oak_options, _os.get("use_options")))
+        assert bool(_os.get("use_gate")) == bool(args.oak_gate), "oak_gate 未传到 run_mm"
+        print("[verify] lm5 oak 回读 OK: options=%s gate=%s n_trans=%s options_found=%s"
+              % (_os.get("use_options"), _os.get("use_gate"), _os.get("n_trans"),
+                 ((lm5_extra or {}).get("knowledge") or {}).get("n_options")), flush=True)
     Path(args.out, "lm5_mm_results.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1))
     print(f"\n报告: {args.out}/lm5_mm_results.json")

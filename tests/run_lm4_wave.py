@@ -545,7 +545,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    rl_mu=0.05, rl_alpha0=0.2, rl_explore_w=0.5, rl_algo="autostep",
                    rl_know=0, schedule_str="",
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0,
-                   oak_options=1, oak_gate=1, oak_refresh=4):
+                   oak_options=1, oak_gate=1, oak_refresh=4,
+                    shift_at=0, shift_every=0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -787,7 +788,30 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     prop_rows = []     # 价值函数调度轨迹
     n_fine_all = int(fine.max()) + 1 if fine is not None else 0
     any_time = []          # 每轮的"已见域平均准确率" (在线性能)
+    # ── ★ Regime shift (E11/E12) ────────────────────────────────────────
+    # 机制: 在 `--shift-at K` 轮之后**置换「动作索引 -> 物理细区间」的映射**。
+    # 于是同一个动作 `f` 从此训练的是**另一个物理区**, 而 `fine` / `fine_test`
+    # 本身不变 (按物理区索引)。语义 = 「**动作的含义变了**」——
+    # 这正是 OaK 主张要检验的**动力学漂移**: T(s,a) 本身发生变化,
+    # 已积累的内部知识 (coverage / 不确定性 / 选项) 必须重新适应。
+    # `--shift-every M` = 反复漂移 (E12)。
+    _n_fine_shift = int(fine.max()) + 1 if fine is not None else 0
+    action_perm = np.arange(_n_fine_shift)
+    n_shifts = 0
+
+    def _apply_shift(rnd):
+        nonlocal action_perm, n_shifts
+        action_perm = np.random.RandomState(seed * 31 + 7 + rnd).permutation(_n_fine_shift)
+        n_shifts += 1
+        print("[shift] regime shift #%d @ round %d: 动作->物理区映射已置换"
+              % (n_shifts, rnd), flush=True)
+
     for step in range(n_rounds):
+        if shift_at and _n_fine_shift:
+            if step == shift_at:
+                _apply_shift(step)
+            elif shift_every and step > shift_at and (step - shift_at) % shift_every == 0:
+                _apply_shift(step)
         dd = domains[step] if step < len(domains) else domains[-1]
         if oakprop is not None:
             pick = oakprop.act()                    # ← 动作 (含 option / 门控)
@@ -807,7 +831,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         if schedule is not None or prop is not None or rlprop is not None or oakprop is not None:
             if prop is None and rlprop is None and oakprop is None:
                 pick = schedule[step]
-            idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
+            _phys = [int(action_perm[f]) if f < _n_fine_shift else int(f) for f in pick]
+            idx_tr = np.concatenate([np.where(fine == f)[0] for f in _phys])
             np.random.RandomState(seed * 131 + step).shuffle(idx_tr)
             dl = loader_for(idx_tr, shuffle=True)
             # ★ 公平性: proposer 每轮只覆盖 len(pick)/n_fine 的样本。
@@ -932,8 +957,10 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                     model.train(was_training)
                     cur.append((it, a))
         # ── 价值函数的真实反馈: 测每个刚学过的细区间, 回填 prop ──
+        _phys_fb = ([int(action_perm[f]) if f < _n_fine_shift else int(f) for f in pick]
+                    if _n_fine_shift else list(pick))
         if prop is not None:
-            for f in pick:
+            for f in _phys_fb:
                 if f in fine_test:
                     prop.observe(f, evaluate(model, loader_for(fine_test[f]), device))
         # 记录: 已见域整体准确率
@@ -961,7 +988,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 rlprop.set_knowledge(_kv[:rlprop.n_know])
         if oakprop is not None:
             _accs = [evaluate(model, loader_for(fine_test[f]), device)
-                     for f in pick if f in fine_test]
+                     for f in _phys_fb if f in fine_test]
             _at = float(np.mean([v for v in row if not math.isnan(v)]))
             oakprop.observe(pick, acc=(float(np.mean(_accs)) if _accs else 0.5),
                             any_time=_at)
@@ -973,7 +1000,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             oakprop.update(pick)                     # 奖励 → 参数更新 + 知识维护
         if rlprop is not None:
             _accs = [evaluate(model, loader_for(fine_test[f]), device)
-                     for f in pick if f in fine_test]
+                     for f in _phys_fb if f in fine_test]
             _at = float(np.mean([v for v in row if not math.isnan(v)]))
             rlprop.observe(pick, acc=(float(np.mean(_accs)) if _accs else 0.5),
                            any_time=_at)
@@ -1018,6 +1045,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         "n_rounds": int(n_rounds),
         "stream": stream,
         "proposer": proposer,
+        "n_shifts": n_shifts,
     }
     if prop is not None:
         extra["proposer_freq"] = [int(x) for x in prop.freq]
@@ -1175,6 +1203,10 @@ def main():
                     help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
                          "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
                          "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
+    ap.add_argument("--shift-at", type=int, default=0,
+                    help="E11: 第 K 轮后触发 regime shift (置换动作->物理区映射)。0=关")
+    ap.add_argument("--shift-every", type=int, default=0,
+                    help="E12: 之后每 M 轮再漂移一次 (反复漂移)。0=只漂移一次")
     ap.add_argument("--oak-options", type=int, default=1,
                     help="OaK: 1=启用 Options/时间抽象 (E10), 0=关闭 (E9). "
                          "★ 这是 E9 vs E10 的**唯一**变量 —— 同一 base、同一门控")
@@ -1383,6 +1415,8 @@ def main():
                                  oak_options=args.oak_options,
                                  oak_gate=args.oak_gate,
                                  oak_refresh=args.oak_refresh,
+                                 shift_at=args.shift_at,
+                                 shift_every=args.shift_every,
                                  stream=args.stream, rounds=args.rounds,
                                  freq_profile=freq_prof,
                                  y_log=y_log, bands=args.wfr_bands,
