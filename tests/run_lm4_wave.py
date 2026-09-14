@@ -832,6 +832,13 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "results" / "lm4_wave"))
     args = ap.parse_args()
 
+    # oml/oml2 是元学习过程, 需要"可适应的头参数"(PLN 的 clone_params/step_beta)。
+    # 普通 nn.Linear 头没有可适应参数 -> 自动切到 pln 并说明, 避免跑到一半才崩。
+    if args.cl_method in ("oml", "oml2") and args.head == "linear":
+        args.head = "pln"
+        print("[warn] --cl-method %s 需要可适应头, --head 已自动改为 pln "
+              "(Linear 头无 clone_params / step_beta)" % args.cl_method, flush=True)
+
     device = torch.device(args.device)
     t0 = time.time()
     times, dens, F_mat, ok = build_feature_matrix(
