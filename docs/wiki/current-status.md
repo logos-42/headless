@@ -11,6 +11,16 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**OAKProposer 接入 lm4 主回路 + E9/E10 对照启动（本轮最大缺口已补上）**
+  - `hibs_lnn/oak_proposer.py`：state = 粗域能力画像、action = 选哪个细区间训练、reward = Δ(any-time)
+    —— **`T(s,a)→s'` 是真可学、数据里天然存在的转移**
+  - **E9 vs E10 只差 `--oak-options`**：同一 base、同一门控，唯一变量是时间抽象
+  - 修 5 个 bug：签名漏接（`str.replace` 静默 no-op + 缺 assert）、知识层维度混用、
+    **门控语义错误（零覆盖重定向导致 `coverage=[0,9,0,0,0,0]` 探索崩塌）**、
+    `Option.stats()` 不暴露 actions、option 启动不执行第一个动作
+  - 服务器冒烟：`n_trans=72 options_found=6`，序列 `[0,5]/[0,5,1]/[5,1,5]`，acc 0.7325
+  - `tests/oak_driver.sh` 5seed×{E9,E10} 已在 GPU0 运行；完成时服务器 watcher 自动跑 `analyze_oak.py`
+
 - 2026-09-14：**InternalKnowledge 内部知识层（Knowledge ≠ Parameter）**
   - 新建 `hibs_lnn/knowledge.py`：四层知识 + 三类元知识；**不暴露 θ/W/α，只暴露知识查询**
   - `knowledge_of(s,a)` 给出三种判定「我知道 / 不太确定 / 我不知道」——

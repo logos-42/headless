@@ -279,3 +279,80 @@ g = δ·φ·h,  迹的稳态 h* = α·φ·δ/(α·φ²) = δ/φ
 
 **诚实标注**:分化是**真实但弱**的(ratio ≈ 1.22)。这与本项目此前两条独立
 负面结论一致 —— per-weight 步长元学在我们这类任务上**至多是小幅效应**。
+
+
+---
+
+## 7. 接入 lm4 主回路 (`hibs_lnn/oak_proposer.py`) + E9/E10 实验
+
+### 7.1 状态/动作的定义 —— 这个闭环是真问题,不是硬凑的
+
+```
+state  = 各**粗域**的能力画像 (维度 = --domains)     "我现在会什么"
+action = 选哪个**细区间**训练 (0..n_fine-1)          "去练哪块"
+next   = 训练后的新能力画像
+reward = Δ(any-time 准确率)
+```
+
+`T(s,a) -> s'` 因此是一个**真正可学、数据里天然存在**的转移:**动作是"去练哪块",
+环境是"练完能力怎么变"。** 这正是 `transition_model` 该用在的地方。
+
+### 7.2 结构
+
+```
+OAKProposer
+  ├── base    : RLProposer        (Level 3, 复用已验证机制)
+  └── know    : InternalKnowledge (Level 1/2/4 + 三类元知识, 惰性创建)
+```
+
+**E9 vs E10 就是一个 flag** —— `--oak-options {0,1}`,同一 base、同一门控,
+**唯一变量是时间抽象**。
+
+### 7.3 为什么 `--rounds 120` 而不是之前 benchmark 的 12
+
+动力学模型的特征是 `[state(6), onehot(action)(18)]` = **24 维**。
+**12 条转移对 24 维是严重欠定**(12×24 矩阵 rank ≤ 12),集成分歧和 option 发现
+都会退化成噪声。120 条转移给出 ~5 样本/参数。
+
+同时把 `epochs-per-domain` 从 300 降到 100,使
+`总步数 = 120 轮 × (100×18/6/3 = 100) 步 = 12000`,
+**与 BM2 的 `12 轮 × 1000 步 = 12000` 完全等量** —— 既喂饱了动力学模型,
+又**没有**靠堆步数占便宜。
+
+### 7.4 接入时修掉的 5 个 bug(全部有回读验证)
+
+| # | Bug | 症状 / 修法 |
+|:--|:--|:--|
+| A | **签名漏接** —— `str.replace` 未匹配时**静默 no-op**,而我忘了加 `assert` | `TypeError: unexpected keyword argument 'oak_options'`。修:五处静态核对 + **回读断言**(运行时打印 `[verify] oak 配置回读 OK`) |
+| B | **知识层维度混用** | state 是**粗域**准确率 (len(domains)=3),我却按 n_fine=6 建 GVF → `size 3 is different from 6`。修:惰性初始化,从第一个状态推断维度 |
+| C | **门控语义错误(最严重)** | 我把零覆盖动作重定向到 `argmin(visits)` 的已覆盖动作 → 实测 `coverage=[0,9,0,0,0,0]`,**9 轮只练 1 个区间,探索彻底崩塌**。Q8 约束的是**模型驱动的规划决策**,不是阻止 base policy 探索 —— 往零覆盖区探索恰恰是想要的(覆盖度只能这样长)。修:门控只作用于**模型被咨询处**(option 选择 / rollout) |
+| D | `Option.stats()` 不暴露 `actions` | 日志里全是 `actions=None` —— **多步动作序列正是 option 的全部意义**,丢了等于把最有信息量的部分扔掉 |
+| E | option 启动时**不执行**它的第一个动作 | 只排队 `actions[1:]`,假设"起点那步已经执行过了" → `option_steps` 实测只有 1~2。修:启动时返回 `actions[0]`,并加 `option_starts` 计数 |
+
+### 7.5 冒烟验证(服务器,`--rounds 45`)
+
+```
+[verify] oak 配置回读 OK: options=True gate=True n_trans=72 options_found=6
+  → 最终平均 acc 0.7325, 平均遗忘 0.2050
+
+option actions=[0, 5]      len=2
+option actions=[0, 5, 1]   len=3
+option actions=[5, 1, 5]   len=3
+option actions=[1, 5, 1]   len=3
+```
+
+**多步动作序列可见了 —— 这才叫时间抽象。**
+
+### 7.6 正在跑的实验
+
+`tests/oak_driver.sh`:5 seed × {E9, E10},GPU0,预计 ~2 小时。
+`tests/analyze_oak.py` 在 `OAK_DONE` 出现时由服务器端 watcher 自动执行,
+结果落盘 `results/oak_analysis.txt`。
+
+**判读口径(写进分析脚本,防止过度解读)**:
+
+1. `option_steps ≈ 0` → **机制没被触发**,不能得出「Options 无效」—— 必须先修触发条件
+2. `p > 0.05` → 如实写负面结论,不用「方向一致」搪塞
+3. `std > mean/2` 的指标不可用于结论
+4. **没有真实 actuator** → 口径只能是 "predictive/control-policy learning on
+   passive observations",不能写成 "完成了磁通控制实验"
