@@ -11,6 +11,16 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**InternalKnowledge 内部知识层（Knowledge ≠ Parameter）**
+  - 新建 `hibs_lnn/knowledge.py`：四层知识 + 三类元知识；**不暴露 θ/W/α，只暴露知识查询**
+  - `knowledge_of(s,a)` 给出三种判定「我知道 / 不太确定 / 我不知道」——
+    **对未见的 (s,a) 承认识不知道，而不是编一个数**
+  - `to_dict()` + `growth()`：知识能留下来，且增长**逐项可测**（coverage/GVF/dynamics/β 的变化量）
+  - **实测两件事**：(a) 知识层必须对未知输入容错（修 `value()` + `verdict` 字段）；
+    (b) **把 α 的更新从学习里孤立出来是测试方法错误** —— `g = δ²/φ` 恒正 → β 单向漂移，
+    8 种稳定化手段全部撞界；β 能停的唯一原因是 δ 随 w 收敛趋 0，故必须**闭环**测
+  - 闭环结果：α[真特征] > α[噪声] ✓、β 全程有界 ✓，但分化**真实而弱**（ratio 1.22）
+
 - 2026-09-14：**OaK 结构件三件套：Option manager + 反事实 rollout + coverage/uncertainty 门控**
   - 按用户指点**停止堆 RL 算法**（会变成"算法动物园"），转而补 OaK 的结构性组件：
     `Prediction → Abstraction → Options → World Model → Planning`
