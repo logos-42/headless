@@ -459,7 +459,7 @@ def batched_pred(fwd, X, bs=512):
 def run_mm(text_domains, wave_X, wave_y, wave_test, device,
            causal=None, n_causal_classes=5, backbone="mlp", norm="fixed",
            proposer="fixed", rounds_per_domain=3, lam=(1.0, 1.0, 1.0, 1.0),
-           proposer_sigma=0.5,
+           proposer_sigma=0.5, stream="fixed", rounds=0, freq_profile=None,
            d_model=192, d_state=12, n_layers=2, vocab=1000,
            n_feat=30, n_wave_classes=6, head_type="pln",
            text_steps=300, wave_epochs=300, batch=32, lr=1e-3,
@@ -595,29 +595,71 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
     # 候选 = (域, 第几轮复习); 描述子 = one-hot(域) + 归一化轮次。
     # 池 = n_dom × rounds_per_domain —— 必须 >> 轮数, 否则价值函数被抹平
     # (V35.19 v1 的教训: 池 18 个被全覆盖 -> 提议顺序无关 -> λ 扫描零效果)。
+    # ── 任务流 / 调度 ───────────────────────────────────────────────────
+    # 与 lm4 同一套判据 (leo 2026-09-14): 固定顺序预设了智能体不会有的知识
+    # (任务集已知 / 最优顺序已知 / 单趟不复习), 而且它恰是 replay 最有利的顺序
+    # -> 系统性偏袒要被打败的基线。改用**流分布** + 全 oracle-free 基线。
+    #
+    #   stream   : fixed(启发式基线) / perm / revisit / nonstationary
+    #   proposer : fixed(= 用 stream) / random / random-matched(频率对齐对照)
+    #              / value / value-nofb(消融反馈项)
+    n_rounds = rounds if rounds and rounds > 0 else n_dom
+    rng_sched = np.random.RandomState(seed * 7919 + 31)
+    if stream == "fixed":
+        dom_seq = [domains[i % n_dom] for i in range(n_rounds)]
+    elif stream == "perm":
+        _p = list(rng_sched.permutation(n_dom))
+        dom_seq = [domains[i % n_dom] for i in _p[:n_rounds]] if n_rounds <= n_dom \
+            else [domains[i] for i in (list(_p) * (n_rounds // n_dom + 1))[:n_rounds]]
+    elif stream == "revisit":
+        dom_seq = [domains[int(x)] for x in rng_sched.randint(0, n_dom, size=n_rounds)]
+    elif stream == "nonstationary":
+        dom_seq = []
+        for _r in range(n_rounds):
+            _w = 1.0 + 0.9 * np.sin(2 * np.pi * _r / max(2, n_rounds // 2)
+                                   + rng_sched.uniform(0, 2 * np.pi))
+            _w = np.clip(_w, 0.05, None) * (1.0 + 0.5 * rng_sched.rand(n_dom))
+            dom_seq.append(domains[int(rng_sched.choice(n_dom, p=_w / _w.sum()))])
+    else:
+        dom_seq = [domains[i % n_dom] for i in range(n_rounds)]
+
     prop, POOL, prop_trace = None, None, []
+    prof = None
     if proposer != "fixed":
-        _R = max(2, rounds_per_domain)
+        _R = max(2, rounds_per_domain, int(np.ceil(n_rounds / max(1, n_dom))))
         POOL = [(d, r) for d in domains for r in range(_R)]
         _desc = np.zeros((len(POOL), n_dom + 1))
         for _i, (_d, _r) in enumerate(POOL):
             _desc[_i, domains.index(_d)] = 1.0
             _desc[_i, n_dom] = _r / max(1, _R - 1)
         from hibs_lnn.value_proposer import RegimeProposer
-        prop = RegimeProposer(_desc, k=1, lam=lam, sigma=proposer_sigma,
+        _lam = (lam[0], lam[1], lam[2], 0.0) if proposer == "value-nofb" else lam
+        prop = RegimeProposer(_desc, k=1, lam=_lam, sigma=proposer_sigma,
                               tau=0.5, seed=seed * 7919 + 31)
+        if proposer == "random-matched" and freq_profile:
+            _pr = np.asarray(freq_profile, dtype=np.float64)
+            prof = (_pr / _pr.sum()) if _pr.sum() > 0 else None
         print(f"[proposer] 候选池 {len(POOL)} 个 (= {n_dom} 域 x {_R} 轮), "
-              f"调度={proposer}", flush=True)
+              f"调度={proposer}" + (" [频率对齐]" if prof is not None else ""),
+              flush=True)
+    else:
+        print(f"[stream] {stream} -> 轮次序列 {dom_seq}", flush=True)
 
     t0 = time.time()
-    for step in range(n_dom):
+    any_time = []
+    for step in range(n_rounds):
         if prop is not None:
-            _ci = (prop.propose(k=1) if proposer == "value"
-                   else prop.pick_random(k=1))[0]
+            if proposer in ("value", "value-nofb"):
+                _ci = prop.propose(k=1)[0]
+            elif prof is not None:
+                _ci = int(rng_sched.choice(prop.n, size=1, p=prof)[0])
+                prop.freq[_ci] += 1
+            else:
+                _ci = prop.pick_random(k=1)[0]
             dom, cur_cand = POOL[_ci][0], _ci
         else:
-            dom, cur_cand = domains[step], None
-        print(f"\n--- 轮 {step+1}/{n_dom}: {dom} ---", flush=True)
+            dom, cur_cand = dom_seq[step], None
+        print(f"\n--- 轮 {step+1}/{n_rounds}: {dom} ---", flush=True)
         model.train()
 
         if dom in ("wave", "causal"):
@@ -719,6 +761,10 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
 
         row = eval_all()
         acc_hist.append(row)
+        # any-time: 本轮"已见域/全部域"的平均准确率 (在线性能, 边缘设备必须边学边可用)
+        _vals = [v for k, v in row.items()
+                 if k in domains and isinstance(v, float) and v == v]
+        any_time.append(float(np.mean(_vals)) if _vals else float("nan"))
         # ── 真实反馈: 把该域本轮实测准确率回填价值函数 (持续学习那一环) ──
         if prop is not None:
             _a = row.get(dom, float("nan"))
@@ -739,7 +785,20 @@ def run_mm(text_domains, wave_X, wave_y, wave_test, device,
         # ★ 平衡准确率列 —— y_do 的多数类基线高达 0.789, 原始准确率会骗人
         report_doms.append("causal_bal")
         report_doms.append("causal_do_bal")
-    return acc_hist, report_doms, chance, prop_trace
+    _M = np.array([[r.get(d, np.nan) for d in report_doms] for r in acc_hist],
+                  dtype=float)
+    _fin, _best = _M[-1], np.nanmax(_M, axis=0)
+    extra = {
+        "any_time_acc": float(np.nanmean(any_time)) if any_time else float("nan"),
+        "any_time_curve": [None if (a != a) else round(float(a), 4) for a in any_time],
+        "worst_case_forget": float(np.nanmax(_best - _fin)),
+        "mean_forget_all": float(np.nanmean(_best - _fin)),
+        "n_rounds": int(n_rounds), "stream": stream, "proposer": proposer,
+    }
+    if prop is not None:
+        extra["proposer_freq"] = [int(x) for x in prop.freq]
+        extra["proposer_stats"] = prop.stats()
+    return acc_hist, report_doms, chance, prop_trace, extra
 
 
 def main():
@@ -767,9 +826,17 @@ def main():
     ap.add_argument("--causal-n", type=int, default=20000, help="因果域样本数")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--proposer", choices=["fixed", "random", "value"],
-                    default="fixed",
-                    help="训练调度: fixed=固定域序(默认) random=随机 value=价值函数驱动")
+    ap.add_argument("--stream", default="fixed",
+                    choices=["fixed", "perm", "revisit", "nonstationary"],
+                    help="任务流类型 (proposer=fixed 时生效); 固定序只是启发式基线")
+    ap.add_argument("--rounds", type=int, default=0, help="总轮数 (0 = 等于域数)")
+    ap.add_argument("--freq-profile", default="",
+                    help="random-matched 臂: 从该 JSON 读取 value 臂的提议频率分布")
+    ap.add_argument("--proposer",
+                    choices=["fixed", "random", "random-matched", "value",
+                             "value-nofb"], default="fixed",
+                    help="调度: fixed=用 --stream / random / random-matched(频率对齐"
+                         "对照) / value=价值函数 / value-nofb=去掉反馈项的消融")
     ap.add_argument("--rounds-per-domain", type=int, default=3,
                     help="候选池里每个域算几轮 (池大小 = 域数 x 此值, 必须 >> 轮数)")
     ap.add_argument("--lam-sim", type=float, default=1.0, help="简约性权重")
@@ -855,7 +922,16 @@ def main():
         print(f"[causal] 训练 {causal_data['X'].shape}, 测试 {cX[c_te].shape}, "
               f"类数 5, 观测/干预双标签", flush=True)
 
-    hist, doms, chance, prop_trace = run_mm(
+    freq_prof = None
+    if getattr(args, "freq_profile", ""):
+        try:
+            _fp = json.loads(Path(args.freq_profile).read_text())
+            freq_prof = _fp.get("proposer_freq") or _fp
+            print("[freq-matched] 载入频率分布: %d 项" % len(freq_prof), flush=True)
+        except Exception as e:
+            print("!! --freq-profile 读取失败:", e, flush=True)
+
+    hist, doms, chance, prop_trace, lm5_extra = run_mm(
         enc, wave_X, wave_y, wave_test, device, causal=causal_data,
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         vocab=vocab, n_feat=n_feat, n_wave_classes=args.domains,
@@ -867,7 +943,9 @@ def main():
         backbone=args.backbone, norm=args.norm,
         proposer=args.proposer, rounds_per_domain=args.rounds_per_domain,
         lam=(args.lam_sim, args.lam_con, args.lam_cov, args.lam_fb),
-        proposer_sigma=args.proposer_sigma)
+        proposer_sigma=args.proposer_sigma,
+        stream=args.stream, rounds=args.rounds,
+        freq_profile=freq_prof)
 
     # ── 报告 ──
     Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -891,6 +969,7 @@ def main():
            "matrix": M.tolist(), "forgets": forgets, "chance": chance}
     if prop_trace:                        # 价值函数调度轨迹
         rep["proposer_trace"] = prop_trace
+    rep.update(lm5_extra)                 # any-time / 最差遗忘界 / 调度诊断
     Path(args.out, "lm5_mm_results.json").write_text(
         json.dumps(rep, ensure_ascii=False, indent=1))
     print(f"\n报告: {args.out}/lm5_mm_results.json")

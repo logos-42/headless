@@ -466,6 +466,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    head_type="linear", norm="batchnorm",
                    trace_every=0, external_test=None,
                    fine=None, fine_desc=None, proposer="fixed",
+                   stream="fixed", rounds=0, freq_profile=None,
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.5):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
@@ -500,25 +501,98 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             torch.from_numpy(X[idxs]), torch.from_numpy(y_dom[idxs]))
         return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=shuffle)
 
-    # ── 训练调度 (价值函数 / 随机 / 固定) ──
-    # 评估域仍是原来的 n_domains 个粗域 (保证与历史结果可比);
-    # 调度只改"每轮喂哪批样本"。
+    # ── 训练调度 ──────────────────────────────────────────────────────
+    # 为什么不再用"固定域序"当 benchmark (leo 2026-09-14):
+    #   固定序预设了三件真实智能体不会有的事 —— ① 任务集已知 ② 最优顺序已知
+    #   ③ 单趟不复习。而且它**恰好是 replay 最有利的顺序** (排序课程把域间
+    #   干扰压到最低), 因此系统性偏袒要被打败的基线。
+    #   改为: 从**流分布**采样 + 全部 oracle-free 基线 + 可复现的对照臂。
+    #
+    # stream  (任务流):
+    #   fixed        每个粗域各来一次, 按序            (降级为启发式基线)
+    #   perm         每个粗域各来一次, 随机排列
+    #   revisit      每轮按均匀分布抽一个粗域 (允许重复) <- 边缘设备反复遇到同类场景
+    #   nonstationary 粗域占比随轮次漂移 (正弦权重)
+    # proposer (每轮内部怎么选候选):
+    #   bins         该粗域的全部细区间 (配 stream 用)
+    #   random       均匀随机提议 k 个细区间
+    #   random-matched 按 `--freq-profile` 里记录的频率分布提议 (对照臂, 见下)
+    #   value        完整价值函数
+    #   value-nofb   价值函数去掉真实反馈项 (消融: 隔离"探索"与"价值")
     prop, schedule, fine_test = None, None, {}
-    if proposer != "fixed" and fine is not None:
-        from hibs_lnn.value_proposer import RegimeProposer
-        n_fine = int(fine.max()) + 1
-        prop = RegimeProposer(fine_desc, groups=None, lam=lam,
-                              sigma=proposer_sigma, k=proposer_k,
-                              seed=(seed * 7919 + 29))
-        schedule = []
-        for _r in range(len(domains)):
-            schedule.append(prop.propose() if proposer == "value"
-                            else prop.pick_random())
-        # 每个细区间的测试子集 (取该区间样本的 10%)
+    n_fine = int(fine.max()) + 1 if fine is not None else 0
+    n_rounds = rounds if rounds and rounds > 0 else len(domains)
+    rng_sched = np.random.RandomState(seed * 7919 + 29)
+
+    if fine is not None:
+        # 细区间 -> 粗域 (取该区间样本的众数域)
+        fine_group = np.zeros(n_fine, dtype=int)
+        for f in range(n_fine):
+            idx_f = np.where(fine == f)[0]
+            fine_group[f] = (np.bincount(y_dom[idx_f]).argmax()
+                             if len(idx_f) else -1)
+        bins_of = {d: [f for f in range(n_fine) if fine_group[f] == d]
+                   for d in range(n_domains)}
+        # 测试子集
         for f in range(n_fine):
             idx_f = np.where(fine == f)[0]
             if len(idx_f) >= 20:
                 fine_test[f] = idx_f[:max(20, len(idx_f) // 10)]
+
+    if proposer == "bins":
+        # 由 stream 决定粗域序列, 每轮用该域的全部细区间
+        if stream == "fixed":
+            dom_seq = list(range(n_domains))
+        elif stream == "perm":
+            dom_seq = list(rng_sched.permutation(n_domains))
+        elif stream == "revisit":
+            dom_seq = list(rng_sched.randint(0, n_domains, size=n_rounds))
+        elif stream == "nonstationary":
+            # 权重按正弦漂移: 不同轮次由不同域主导
+            dom_seq = []
+            for r in range(n_rounds):
+                w = 1.0 + 0.9 * np.sin(2 * np.pi * r / max(2, n_rounds // 2)
+                                      + rng_sched.uniform(0, 2 * np.pi))
+                w = np.clip(w, 0.05, None)
+                w = w * np.ones(n_domains) * (1.0 + 0.5 * rng_sched.rand(n_domains))
+                dom_seq.append(int(rng_sched.choice(n_domains, p=w / w.sum())))
+        else:
+            dom_seq = list(range(n_domains))
+        # 长度对齐到 n_rounds: fixed/perm 天然只有 n_domains 项, 轮数更多时循环续接
+        if len(dom_seq) < n_rounds:
+            _rep = int(np.ceil(n_rounds / max(1, len(dom_seq))))
+            dom_seq = (dom_seq * _rep)[:n_rounds]
+        dom_seq = [int(x) for x in dom_seq[:n_rounds]]
+        schedule = [bins_of.get(d, []) for d in dom_seq]
+        print("[stream] %s -> 粗域序列 %s" % (stream, dom_seq), flush=True)
+    elif proposer != "fixed":
+        from hibs_lnn.value_proposer import RegimeProposer
+        if proposer == "value-nofb":
+            lam = (lam[0], lam[1], lam[2], 0.0)      # 关掉真实反馈项
+        prop = RegimeProposer(fine_desc, groups=None, lam=lam,
+                              sigma=proposer_sigma, k=proposer_k,
+                              seed=(seed * 7919 + 29))
+        if proposer == "random-matched" and freq_profile:
+            # ★ 频率对齐对照: 用 value 臂实测的提议频率分布驱动 random 臂。
+            #   否则 value 有 cov(p)=1/(1+freq) 会主动均匀化覆盖, 和"均匀随机"
+            #   的复习频率分布本就不同 -> value vs random 说不清是"更聪明"还是
+            #   "复习更均匀"。
+            prof = np.asarray(freq_profile, dtype=np.float64)
+            prof = (prof / prof.sum()) if prof.sum() > 0 else None
+        else:
+            prof = None
+        schedule = []
+        for _r in range(n_rounds):
+            if proposer in ("value", "value-nofb"):
+                schedule.append(prop.propose())
+            elif prof is not None:
+                idx = rng_sched.choice(prop.n, size=min(proposer_k, prop.n),
+                                       replace=False, p=prof)
+                for i in idx:
+                    prop.freq[i] += 1
+                schedule.append(list(map(int, idx)))
+            else:
+                schedule.append(prop.pick_random())
 
     test_loaders = {d: loader_for(test_by_dom[d]) for d in domains}
     n_classes = n_domains
@@ -568,7 +642,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     curves = {}        # dd -> [(step, acc)]  学习效率曲线
     prop_rows = []     # 价值函数调度轨迹
     n_fine_all = int(fine.max()) + 1 if fine is not None else 0
-    for step, dd in enumerate(domains):
+    any_time = []          # 每轮的"已见域平均准确率" (在线性能)
+    for step in range(n_rounds):
+        dd = domains[step] if step < len(domains) else domains[-1]
         if schedule is not None:
             pick = schedule[step]
             idx_tr = np.concatenate([np.where(fine == f)[0] for f in pick])
@@ -704,6 +780,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         row = [evaluate(model, test_loaders[d], device) if d in test_loaders else float('nan')
                for d in domains]
         acc_matrix.append(row)
+        _seen = [row[j] for j, d in enumerate(domains)
+                 if not math.isnan(row[j]) and row[j] > 0]
+        any_time.append(float(np.mean(_seen)) if _seen else float('nan'))
         if prop is not None:
             prop_rows.append({"step": step + 1, "picks": pick,
                               "value": [round(prop.value(f), 4) for f in pick],
@@ -731,7 +810,24 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 idx, size=min(2000, len(idx)), replace=False)
             replay_by_dom[dd] = (torch.from_numpy(X[sel]).to(device),
                                  torch.from_numpy(y_dom[sel]).to(device))
-    return acc_matrix, domains, curves, cross, prop_rows
+    # ── 边缘设备关心的指标 ──
+    _M = np.array(acc_matrix, dtype=float)
+    _fin = _M[-1]
+    _best = np.nanmax(_M, axis=0)
+    worst_forget = float(np.nanmax(_best - _fin)) if _M.size else float('nan')
+    extra = {
+        "any_time_acc": float(np.nanmean(any_time)) if any_time else float('nan'),
+        "any_time_curve": [None if (a != a) else round(float(a), 4) for a in any_time],
+        "worst_case_forget": worst_forget,
+        "mean_forget_all": float(np.nanmean(_best - _fin)) if _M.size else float('nan'),
+        "n_rounds": int(n_rounds),
+        "stream": stream,
+        "proposer": proposer,
+    }
+    if prop is not None:
+        extra["proposer_freq"] = [int(x) for x in prop.freq]
+        extra["proposer_stats"] = prop.stats()
+    return acc_matrix, domains, curves, cross, prop_rows, extra
 
 
 def efficiency_report(curves, domains, thresholds=(0.5, 0.9)):
@@ -846,7 +942,16 @@ def main():
                     help="StatMLP 归一化: batchnorm (随域漂移) / fixed (冻结全局 mu/sd) / none")
     ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
                     help="分类头: linear (原) / pln (Meta-SGD 逐参数步长) / swifttd (lm1 局部规则)")
-    ap.add_argument("--proposer", choices=["fixed", "random", "value"],
+    ap.add_argument("--stream", default="fixed",
+                    choices=["fixed", "perm", "revisit", "nonstationary"],
+                    help="任务流类型; 配 --proposer bins 使用")
+    ap.add_argument("--rounds", type=int, default=0,
+                    help="总轮数 (0 = 等于域数)")
+    ap.add_argument("--freq-profile", default="",
+                    help="random-matched 臂: 从该 JSON 读取 value 臂的提议频率分布")
+    ap.add_argument("--proposer",
+                    choices=["fixed", "bins", "random", "random-matched",
+                             "value", "value-nofb"],
                     default="fixed",
                     help="训练调度: fixed=固定域序(默认) random=随机区间 value=价值函数驱动")
     ap.add_argument("--fine-bins", type=int, default=18,
@@ -988,9 +1093,18 @@ def main():
         print("[proposer] 候选池 %d 个区间, 描述子 %d 维, 调度=%s, 每轮提议 %d"
               % (nf, _D.shape[1], args.proposer, args.proposer_k), flush=True)
 
+    freq_prof = None
+    if args.freq_profile:
+        try:
+            _fp = json.loads(Path(args.freq_profile).read_text())
+            freq_prof = _fp.get("proposer_freq") or _fp
+            print("[freq-matched] 载入频率分布: %d 项" % len(freq_prof), flush=True)
+        except Exception as e:
+            print("!! --freq-profile 读取失败:", e, flush=True)
+
     for key, replay in runs:
         print(f"\n=== {key} ===", flush=True)
-        M, doms, curves, cross, prop_rows = run_experiment(X, y_dom, device, d_model=args.d_model,
+        M, doms, curves, cross, prop_rows, extra = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
@@ -1014,7 +1128,9 @@ def main():
                                  proposer=args.proposer,
                                  lam=(args.lam_sim, args.lam_con,
                                       args.lam_cov, args.lam_fb),
-                                 proposer_k=args.proposer_k)
+                                 proposer_k=args.proposer_k,
+                                 stream=args.stream, rounds=args.rounds,
+                                 freq_profile=freq_prof)
         s = summarize(M, doms)
         s["curves"] = {str(k): v for k, v in (curves or {}).items()}
         s["cross_external"] = cross                 # 外部矩阵 (每步一行)
@@ -1025,6 +1141,7 @@ def main():
         # 价值函数调度轨迹 (提议了哪些区间 / 当时的价值 / 累计次数)
         if prop_rows:
             s["proposer_trace"] = prop_rows
+        s.update(extra)                  # any-time / 最差遗忘界 / 调度诊断
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
         if ext_test and cross and cross[-1] is not None:
