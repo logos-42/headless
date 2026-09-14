@@ -11,7 +11,33 @@ status: current
 
 ## 最近更新
 
-- 2026-09-14：**Benchmark 结算 —— 价值函数未能优于频率对齐对照（负面结论）**
+- 2026-09-14：**修正版 benchmark 结算 —— 价值函数四项全活后依然不敌频率对齐对照（诚实负面结论）**
+  - **先作废一批**：`docs/bm_benchmark_results.md` 原记录的 `bm_*` 结果**全部作废** —— 那批的价值函数是半成品
+    （`con` 未实现 / `sim≡1` / `fb≡1`，实跑退化成「均匀化采样器」）
+  - **修正版**（`results/bm2_*` lm4 + `results/bm5b_*` lm5，con 连续强度 / sim σ 自适应 / 池 18→60 / 在线逐轮提案，
+    `value_cv` 0.089→0.4711，四项 `term_std`>0）× 3 seed：
+    - **① `value` vs `random-matched`（唯一干净对照）**：lm4 replay Δ=**+0.0013**（t=+0.23，p=0.84）、
+      平均遗忘反而**多 0.028**；lm5 末轮均值 Δ=**−0.0274**（t=−0.50，p=0.66）、any-time Δ=+0.0073（t=+0.35）
+      → **两个 benchmark 符号相反 ⇒ 只能判「测不出效应」，不能判「有效」**
+    - **② `value` vs `value-nofb`（隔离真实反馈项 λ_fb）**：lm4 提议序列**已发散**（修复生效）但性能
+      Δ=−0.0024（t=−0.41）/ any-time Δ=+0.0015（t=+0.09）不显著；lm5 **3 seed 遗忘矩阵逐位相同**
+      → `λ_fb` 在 lm5 对调度**零影响**（等价死项）
+  - **「方差稳定器」再次被推翻**：lm5 `value` 的 CV **36.2%** 为全场最大（`random-matched` 5.5%、`perm` 7.9%）；
+    lm4 `value` CV 1.2% 也没小于 `random-matched` 0.6%
+  - **lm5 负 Δ 的具体机制**（不是玄学）：`value` 24 次提议只点了 **2 次** `causal*` 域（seed 1 一次没点），
+    因果系四域占末轮均值 4/8 → **覆盖偏置**，`cov=1/(1+freq)` 在 8 域 × 8 轮的池子上不足以强制覆盖
+  - 仍能站住的只有 **「在线调度 > 预先定死的任务流」**（lm4 `value` vs `perm` Δ=+0.0210，t=+3.27，p=0.034），
+    且 `random` / `random-matched` 同样赢 `perm` → **红利属于「调度」这件事，不属于价值函数的判别力**
+  - **顺带挖出真 bug 并恢复数据**：lm4 `random-matched` 3/3 `rc=1` —— `run_lm4_wave.py` 的 `json.dump` 缺
+    `default=` 转换器，`int64` 触发 `TypeError` 使 **dump 到一半崩掉**，json 截断成非法文件，
+    `any-time` / 最差遗忘界**永久丢失**（`report.md` 在 dump 之前写，故准确率没丢）。
+    用 monkeypatch 序列化器重跑 seed 42 得 0.7635，与 driver 日志**逐位相同** → 同修订版内完全可复现
+  - **并发干扰（已记录）**：服务器 `tests/run_lm4_wave.py` 被**另一路会话**在 08:14 / 08:19 UTC 改了两次并重跑
+    `random-matched` 的 seed 1/7 → 该臂主口径取「与 `value` 同修订版」的日志值，另报敏感性
+    （两种读法 Δ=−0.0009 / −0.0054，**都远不显著**，结论不随修订版漂移）
+  - 报告 `docs/bm_benchmark_results.md`；脚本 `tests/analyze_benchmark.py`（lm4 全臂）/ `tests/analyze_bm2_full.py`（lm4+lm5）
+
+~~- 2026-09-14：**Benchmark 结算 —— 价值函数未能优于频率对齐对照（负面结论）**
   - lm4 + lm5 新 benchmark 全臂（8 + 7 臂 × 3 seed）结算，报告 `docs/bm_benchmark_results.md`，脚本 `tests/analyze_bm_full.py`
   - **唯一干净对照 `value` vs `random-matched`**：lm4 replay Δ=−0.0045（t=−0.32）/ any-time Δ=+0.0125（t=+0.47）
     —— **不显著且数值略低**；lm4 **最差遗忘界 Δ=+0.1509（t=+2.22）显著更差**；
@@ -25,6 +51,7 @@ status: current
   - 唯一站得住的是 **「在线调度 > 预先定死的任务流」**（`value` vs `perm`：replay t=+3.44 / any-time t=+4.31 显著），
     但 `random` / `random-matched` 同样具备该优势 → **是「调度」的功劳，不是「价值函数」的功劳**
   - 顺带修 lm4 `random-matched` 首次 3/3 `rc=1` 的 profile 加载 bug（driver 把嵌套结果文件整拷作 profile）
+~~（⚠️ **作废**：该批价值函数是半成品，见上条修正版结算）~~
 - 2026-09-14：**LM4 骨干替换完成 + 价值函数接入**（本日为最大一次推进）
   - **骨干替换四轴全胜**：StatMLP（窗口统计 + MLP + **冻结归一化**）vs 复值 SSM
     - joint（6 域）0.8104 vs 0.7213（+0.089）
@@ -56,7 +83,10 @@ status: current
 - **lm4 价值函数 3 臂 × 6 seed**（`vp2_*`，18 run）：验证「提议器降低 naive 遗忘」的 +0.20 效应是否可复现
 - **lm4 因果发现可扩展到干预效应估计**：当前 `causal_intervene.py` 的 DAG 为物理先验手工定向，缺太阳风/地磁/MLT 混杂
 - **已完成（负面）**：lm5 价值函数正式 3 seed 对照 —— 见上，干净对照下测不出稳定增益
-- 待办：**查 `λ_fb` 为何对调度零影响**（`value` 与 `value-nofb` 逐位相同）—— 价值函数里的反馈闭环目前是死代码
+- 待办：**修 lm4 `json.dump` 的 int64 序列化 bug**（`default=lambda o: o.item() if hasattr(o,'item') else str(o)`）—— 已造成一个臂的 `any-time`/最差遗忘界永久丢失，且 `rc=1` 被 driver 当普通失败记录，极易漏看
+- 待办：**`λ_fb` 在 lm5 仍是死项**（3 seed 遗忘矩阵逐位相同）；lm4 已发散但无性能贡献 → 反馈闭环整体仍无价值
+- 待办：**`random` 臂的提议不随 seed 变**（三 seed replay 0.7731/0.7732/0.7732，CV 0.0%）—— 需查是否漏用 seed 种子化
+- 待办：**lm5 `value` 的覆盖偏置**（因果系四域只被点 2/24 次）—— `cov` 项在 8 域 × 8 轮池上不足以强制覆盖
 - 待办：提高 seed 数（现 `n=3`，`|t|≈2` 只能算边缘证据，ddof 口径一变结论就翻转）
 - 待办：**lm5 补 `random`（均匀随机）臂** —— 现缺该臂，无法在 lm5 上复现混淆对照
 - 待办：新 benchmark 全臂开启 `--trace-every`（学习效率/达标步数指标仍缺）

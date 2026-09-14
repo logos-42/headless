@@ -1,188 +1,235 @@
-# LM4 / LM5 持续学习 Benchmark 结算 (价值函数调度 vs 频率对齐对照)
+# LM4 / LM5 持续学习 Benchmark 结算 (修正版: 价值函数四项全部激活)
+
+> **⚠️ 口径变更 (必读)**: 本文件此前的版本记录的是 `results/bm_*` 那一批 —— 那批的
+> **价值函数是半成品** (`con(p)` 未实现 ≡ 常量, `sim(p)` 因 σ 固定而 ≡ 1, `fb(p)` 因调度预生成而 ≡ 1),
+> 实跑的 `V ≈ 常数 + λ_cov/(1+freq)` 只是个「均匀化采样器」。**那批结果全部作废。**
+> 本版记录的是 **`results/bm2_*` (lm4) + `results/bm5b_*` (lm5)** 修正版: `con` 已实现为连续强度、
+> `sim` σ 自适应、候选池 18 → **60**、调度改为**在线**逐轮提案 (每轮训完立刻 `observe()` 再提案下一轮),
+> 四个 `term_std` 全部 > 0 (`value_cv` 0.089 → 0.4711)。**只有本文件的数字可用于判断价值函数。**
 
 - **日期**: 2026-09-14
-- **数据来源**: 服务器 `/work/liuyuanjie/headless/results/` (driver `tests/bm_driver.sh`, 2026-09-14 05:14–06:36 UTC, `BM_DONE` 已落地)
-- **汇总脚本**: `tests/analyze_bm_full.py` (lm4 + lm5 全臂, Welch t 检验, 输出 `/tmp/bm_summary.json`)
-- **配置**: 所有臂 3 seed (42/1/7), `cl-method=replay`, `norm=fixed`, `head=linear`
-  - **LM4**: StatMLP 骨干, 6 域 (按 log10 密度分位), 候选池 = 物理描述子 `[log10 密度, log10 偶极 L, sin 磁纬]` 切 18 个细区间, 12 轮
-  - **LM5**: `MultiModalHybrid` 骨干, 8 域 (en/zh/code/wave/causal/causal_do/causal_bal/causal_do_bal), 8 轮
-- **统计口径**: `mean±std` 用样本标准差 (ddof=1); 两组对比用 **Welch t** (`t=(Δ)/sqrt(s²/n+s²/n)`), 判定阈值 `|t|>=2`
-  - ⚠️ `n=3`, 自由度极小, `|t|≈2` 只是**边缘**证据; 同一天平在 ddof=0 下会把 `t=-1.66` 抬到 `t=-2.04` (见下文「口径敏感性」)
+- **数据**: 服务器 `/work/liuyuanjie/headless/results/`, driver `tests/bm2_driver.sh` (07:05–08:07 UTC, `BM2_DONE` 已落地)
+- **汇总脚本**: `tests/analyze_benchmark.py` (lm4 全臂, 含 Welch t) / `tests/analyze_bm2_full.py` (lm4 + lm5, 直接打印本文档表格)
+- **配置**: 每臂 3 seed (42 / 1 / 7), `cl-method=replay`, `norm=fixed`, `head=linear`, `backbone=mlp`
+  - **LM4**: 6 域 (按 log10 密度分位), 候选池 = 物理描述子 `[log10 密度, log10 偶极 L, sin 磁纬]` 切 **60** 细区间, 12 轮
+  - **LM5**: `MultiModalHybrid` 骨干, 8 域 (en / zh / code / wave / causal / causal_do / causal_bal / causal_do_bal), 8 轮
+- **统计口径**: `mean±std` 用**样本标准差 (ddof=1)**; 两组对比用 **Welch t** (`t = Δ / sqrt(s₁²/n₁ + s₂²/n₂)`, Welch–Satterthwaite 自由度),
+  双侧 p 由 t 分布精确计算 (环境无 scipy, 用不完全 beta 自实现)。判定阈值 **`|t| >= 2`**。
+  - ⚠️ `n=3`, 功效极低: `|t|≈2` 只是**边缘**证据; ddof 口径一变结论就翻转 (见 §4)。
 
 ---
 
-## 0. 执行状态 (含一次故障与修复)
+## 0. 执行状态 (含一次故障 + 一次并发干扰)
 
 | 批次 | 结果 |
 |:--|:--|
-| LM4 stage1 (value ×3 + bins 任务流 ×12) | 15/15 rc=0 |
-| LM4 stage2 (value-nofb / random / **random-matched** ×3) | **random-matched 3/3 rc=1 失败** (另 6/6 成功) |
-| LM5 stage3 (4 任务流 ×3 seed) | 12/12 rc=0 |
-| LM5 stage4 (value ×3 → value-nofb / random-matched ×3) | 9/9 rc=0 |
+| LM4 stage A (`value` ×3) | 3/3 rc=0 |
+| LM4 stage B (`value-nofb` / `random` ×3) | 6/6 rc=0 |
+| LM4 stage B (`random-matched` ×3) | **3/3 rc=1** (结果 `.md` 已写, `json` 未落盘) |
+| LM5 stage C (`value` 系 ×3 + `value-nofb` / `random-matched` ×3) | 9/9 rc=0 |
 
-**lm4 `random-matched` 首次全灭, 根因是一个真 bug (已修并重跑)**:
+**故障 (与上一批的 bug 不是同一个)**: `run_lm4_wave.py` 末尾 `json.dump(results, ...)` 没有 `default=` 转换器,
+`proposer_trace[*]["picks"]` 里混着 numpy `int64` (来自 `FINE_IDX`) → `TypeError: Object of type int64 is not JSON serializable`,
+**dump 到一半崩掉** → `lm4_wave_results.json` 是**截断的非法 JSON** (实测 1.7–1.9 KB, 正常 11 KB)。
+`report.md` 在 dump **之前**写出, 所以最终准确率**没丢** (`bm2.log` 里也有逐轮日志)。
 
-`tests/bm_driver.sh` 把 `results/bm_value_s42/lm4_wave_results.json` 整文件拷成 `results/freq_profile.json`,
-而 lm4 结果文件是**嵌套**结构 (`{naive, replay, _config}`), `proposer_freq` 在 `replay` 之下;
-`run_lm4_wave.py` 的加载器写的是平铺取值 `_fp.get("proposer_freq") or _fp`, 取不到就**退化成整个 dict** →
-`np.asarray(dict, dtype=float)` 抛 `TypeError: float() argument must be a string or a real number, not 'dict'`,
-启动 9 秒即崩。日志伪装成正常: `[freq-matched] 载入频率分布: 3 项` (3 = dict 的顶层键数, 不是候选数)。
-lm5 的 `lm5_mm_results.json` 是**扁平**结构, 所以 lm5 同臂 9/9 正常 —— 这也解释了为什么只有 lm4 挂。
+**恢复**: 把 `json.dump` 换成带 `default=` 的包装器重跑 (`/tmp/rerun_rm.py`, **未改 leo 的源文件**),
+`seed 42` 得到 naive 0.3281 / replay **0.7635**, 与 `bm2.log` 里原 driver 的 **0.3281 / 0.7635 逐位相同**
+→ 该 run 在同一脚本修订版下**完全可复现**, 日志值可信。
 
-修法 (向后兼容, 两种结构都吃, 稀疏 dict 自动转密集向量): `tests/run_lm4_wave.py` 加载器改为
-平铺 → `replay.proposer_freq` 回退 → `{idx: freq}` 稠密化。修后重跑 3 seed, `rc=0`, 且日志正确显示
-`载入频率分布: 18 项`。**未重启 driver, 只补跑失败的 3 个 run** (日志 `results/bm_stage2_rerun.log`)。
+**并发干扰 (必须记录)**: 服务器 `tests/run_lm4_wave.py` 在我工作期间被**另一路会话**改了两次
+(08:14:27 UTC 与 08:19:25 UTC; 本地同名文件也在同一时间被改)。另一路会话用新修订版重跑了
+`random-matched` 的 `seed 1 / seed 7`, 覆盖了它们的 json。因此:
+
+- **主表**用**与 `value` 臂同一修订版**的值 (原 driver 日志: 0.7635 / 0.7542 / 0.7594)。
+- **敏感性对照**用被覆盖后的目录值。实测目录最后被写于 08:16–08:19 UTC:
+  `seed 42 = 0.7635` (我这次的复现 run, 与日志逐位相同) / `seed 1 = 0.7542` (又恰好回到日志值) / `seed 7 = **0.7660**` (比日志 +0.0066)。
+  更早一次读数里 `seed 1` 是 **0.7676** (+0.0134)。两种读法下 `value` vs `rm` 分别是
+  `Δ=−0.0009 (t=−0.15)` 与 `Δ=−0.0054 (t=−1.03)` —— **都远不显著, 结论不随修订版漂移**。
 
 ---
 
-## 1. LM4 — 任务流 + 调度臂 (3 seed)
+## 1. LM4 — 任务流 + 调度臂 (3 seed, 修正版)
 
-| 臂 | 类型 | replay mean±std | any-time mean±std | 最差遗忘界 | 平均遗忘 |
-|:--|:--|:--|:--|:--|:--|
-| `fixed`(bins, 启发式域序) | 任务流 | 0.7601±0.0035 | 0.6940±0.0159 | 0.3213 | 0.2123 |
-| `perm` (随机排列) | 任务流 | 0.7393±0.0068 | 0.6994±0.0234 | 0.4838 | 0.2401 |
-| `revisit` (反复) | 任务流 | 0.7522±0.0090 | 0.7601±0.0208 | 0.4495 | 0.2302 |
-| `nonstationary` | 任务流 | 0.7487±0.0134 | 0.7058±0.0346 | 0.4591 | 0.2232 |
-| **`value`** (价值函数) | 调度臂 | **0.7734±0.0158** | **0.7699±0.0160** | 0.4133 | 0.1716 |
-| `value-nofb` (消融反馈项) | 调度臂 | 0.7734±0.0158 | 0.7699±0.0160 | 0.4133 | 0.1716 |
-| `random` (均匀随机) | 调度臂 | 0.7931±0.0132 | 0.7898±0.0222 | 0.2651 | 0.1394 |
-| **`random-matched`** (★频率对齐对照) | 调度臂 | **0.7778±0.0186** | **0.7574±0.0431** | **0.2624** | 0.1491 |
+| 臂 | 类型 | replay mean±std | any-time mean±std | 最差遗忘界 | 平均遗忘 | CV(replay) |
+|:--|:--|:--|:--|:--|:--|:--|
+| `fixed` (启发式域序) | 任务流 | 0.7601±0.0035 | 0.6940±0.0159 | 0.3213 | 0.2123 | 0.5% |
+| `perm` (随机排列) | 任务流 | 0.7393±0.0068 | 0.6994±0.0234 | 0.4838 | 0.2401 | 0.9% |
+| `revisit`(反复) | 任务流 | 0.7522±0.0090 | 0.7601±0.0208 | 0.4495 | 0.2302 | 1.2% |
+| `nonstationary` | 任务流 | 0.7487±0.0134 | 0.7058±0.0346 | 0.4591 | 0.2232 | 1.8% |
+| **`value`** (价值函数, 四项全活) | 调度臂 | **0.7603±0.0088** | **0.7783±0.0198** | 0.3589 | 0.1704 | 1.2% |
+| `value-nofb` (λ_fb=0 消融) | 调度臂 | 0.7627±0.0047 | 0.7768±0.0204 | 0.3791 | 0.1704 | 0.6% |
+| `random` (均匀随机) | 调度臂 | 0.7732±0.0001 | 0.7872±0.0125 | 0.2736 | 0.1401 | 0.0% |
+| **`random-matched`** (★频率对齐对照) | 调度臂 | **0.7590±0.0047** | — (原 JSON 损坏) | — | 0.1425±0.0483 | 0.6% |
 
-逐 seed (replay) 对照, 便于核查离散度:
+逐 seed (replay):
 
 | 臂 | seed 42 | seed 1 | seed 7 |
 |:--|:--|:--|:--|
-| `value` | 0.7756 | 0.7879 | 0.7566 |
-| `random` | 0.7785 | 0.8041 | 0.7968 |
-| `random-matched` | 0.7676 | 0.7993 | 0.7667 |
+| `value` | 0.7704 | 0.7541 | 0.7565 |
+| `value-nofb` | 0.7677 | 0.7621 | 0.7583 |
+| `random` | 0.7731 | 0.7732 | 0.7732 |
+| `random-matched` (主口径) | 0.7635 | 0.7542 | 0.7594 |
+| `random-matched` (被覆盖目录, 仅敏感性) | 0.7635 | 0.7542 | 0.7660 |
 
-**读法**: 3 个调度臂全部高于 4 个任务流臂; 但在 3 个调度臂内部, **`value` 是 replay / any-time 最低的那个**,
-`random-matched` 居中, `random` 最高。**最差遗忘界上 `value` (0.4133) 明显比 `random-matched`/`random`
-(0.2624 / 0.2651) 差**, 与任务流臂同级。
+> `random-matched` 的 `any-time` / 最差遗忘界在原 json 里**永久丢失** (截断在 `naive.proposer_trace` 处, `replay` 段根本没写进去)。
+> 被新修订版覆盖后的目录里这两个指标是齐的 (逐 seed `any-time` 0.7375 / 0.8036 / 0.7777, 最差遗忘界 0.1684 / 0.3393 / 0.2961
+> → 均值 `0.7729±0.0333` / `0.2679±0.0889`), 但那是**混合修订版**, 只作 §3 的敏感性行, 不进主表。
 
-## 2. LM5 — 多模态 (3 seed)
+**读法**: 四个调度臂的 any-time (在线可用性) 全面高于任务流臂 (0.777–0.787 vs 0.694–0.760),
+**但调度臂内部的排序是 `random` ≈ `random-matched` ≳ `value` ≈ `value-nofb` ≈ `fixed`** ——
+**价值函数不是调度臂里最好的那个, 恰恰是最差的两个之一。**
+注意 `random` 臂三 seed 几乎完全一样 (CV 0.0%): 它的提议不随 seed 变, 因此不该拿它的 `±0.0001` 去做 t 检验
+(见 §3 的 `value` vs `random` 那条 —— `t=−2.53` 是方差近零造成的**假显著**)。
 
-| 臂 | 类型 | replay(=末轮均值) mean±std | any-time mean±std | 最差遗忘界 | 平均遗忘 |
-|:--|:--|:--|:--|:--|:--|
-| `fixed` | 任务流 | 0.2775±0.0450 | 0.1883±0.0039 | 0.3333 | 0.0916 |
-| `perm` | 任务流 | 0.2979±0.0236 | 0.1913±0.0284 | 0.2917 | 0.0576 |
-| `revisit` | 任务流 | 0.2866±0.0118 | 0.1915±0.0261 | 0.4167 | 0.0728 |
-| `nonstationary` | 任务流 | 0.2875±0.0256 | 0.1800±0.0298 | 0.1378 | 0.0419 |
-| **`value`** | 调度臂 | **0.2702±0.0691** | **0.2126±0.0135** | 0.2083 | 0.0758 |
-| `value-nofb` | 调度臂 | 0.2702±0.0691 | 0.2126±0.0135 | 0.2083 | 0.0758 |
-| **`random-matched`** (★) | 调度臂 | **0.2671±0.0141** | **0.1765±0.0273** | 0.2950 | 0.0693 |
+---
 
-⚠️ **LM5 没有 `random`(均匀随机) 臂**, 因此 lm5 只能做干净对照, 做不了混淆对照。
-⚠️ `value` 的 replay 方差极大 (`CV 25.6%`): seed 42 = 0.1921 是离群点, 另两个 seed 0.2947 / 0.3236。
-`random-matched` 反倒最稳 (CV 5.3%) —— **「价值函数方差更小」的旧结论在 lm5 replay 上不成立**。
+## 2. LM5 — 多模态 (3 seed, 修正版)
 
-各臂末轮逐域准确率, seed 42 (domains = `en, zh, code, wave, causal, causal_do, causal_bal, causal_do_bal`):
+| 臂 | 类型 | 末轮均值 mean±std | any-time mean±std | 最差遗忘界 | 平均遗忘 | CV |
+|:--|:--|:--|:--|:--|:--|:--|
+| `fixed` | 任务流 | 0.2775±0.0450 | 0.1883±0.0039 | 0.3333 | 0.0916 | 16.2% |
+| `perm` | 任务流 | 0.2979±0.0236 | 0.1913±0.0284 | 0.2917 | 0.0576 | 7.9% |
+| `revisit` | 任务流 | 0.2866±0.0118 | 0.1915±0.0261 | 0.4167 | 0.0728 | 4.1% |
+| `nonstationary` | 任务流 | 0.2875±0.0256 | 0.1800±0.0298 | 0.1378 | 0.0419 | 8.9% |
+| **`value`** | 调度臂 | **0.2565±0.0928** | **0.1909±0.0344** | 0.2917 | 0.0685 | **36.2%** |
+| `value-nofb` | 调度臂 | 0.2565±0.0928 (**与 value 逐位相同**) | 0.1909±0.0344 | 0.2917 | 0.0685 | 36.2% |
+| **`random-matched`** (★) | 调度臂 | **0.2839±0.0157** | 0.1835±0.0114 | 0.2950 | 0.0717 | 5.5% |
+
+逐 seed (末轮均值): `value` 0.3084 / **0.1493** / 0.3116 —— 三 seed 跨 0.16, **全场方差最大**;
+`random-matched` 0.2827 / 0.2688 / 0.3001 稳定。
+
+**逐域 (末轮, 3 seed 均值)** —— 差异几乎全部集中在因果域:
 
 | 臂 | en | zh | code | wave | causal | causal_do | causal_bal | causal_do_bal |
 |:--|:--|:--|:--|:--|:--|:--|:--|:--|
-| `fixed` | 0.125 | 0.000 | 0.000 | 0.3575 | 0.3545 | 0.5175 | 0.2774 | 0.3277 |
-| `perm` | 0.250 | 0.000 | 0.125 | 0.4948 | 0.3640 | 0.4845 | 0.2754 | 0.3185 |
-| `revisit` | 0.125 | 0.000 | 0.250 | 0.3962 | 0.3530 | 0.5470 | 0.2511 | 0.3018 |
-| `nonstationary` | 0.250 | 0.125 | 0.250 | 0.1490 | 0.3545 | 0.5180 | 0.2771 | 0.3292 |
-| `value` | 0.125 | 0.000 | 0.375 | 0.3462 | 0.3515 | 0.5445 | 0.2815 | 0.3344 |
-| `random-matched` | 0.125 | 0.000 | 0.375 | 0.3196 | 0.3640 | 0.4845 | 0.2754 | 0.3185 |
+| `value` | 0.125 | 0.125 | 0.250 | 0.446 | 0.236 | **0.335** | 0.250 | 0.285 |
+| `random-matched` | 0.042 | 0.083 | 0.250 | 0.449 | **0.361** | **0.484** | 0.281 | 0.322 |
+| `fixed` | 0.250 | 0.000 | 0.125 | 0.375 | 0.358 | 0.506 | 0.282 | 0.324 |
+| `perm` | 0.292 | 0.000 | 0.167 | 0.448 | 0.366 | 0.510 | 0.284 | 0.316 |
+| `nonstationary` | 0.292 | 0.125 | 0.208 | 0.224 | 0.356 | 0.488 | 0.280 | 0.327 |
 
-**读法**: 文本三域 (`en/zh/code`, 机会水平 0.125/0.0/0.125 的下一 token 预测) 基本贴地, 全 benchmark 的信号
-几乎全部来自 `wave` 与 4 个因果域。因此 lm5 的均值被少数域主导, 臂间差异很难做统计区分。
+机制: `value` 三 seed 一共 24 次提议里只点了 **2 次 `causal*` 域** (seed 1 一次都没点),
+把预算花在文本 + wave 上; 因果系四个域占末轮均值的 4/8, 于是 **平均分被拖低**。
+换句话说 —— **它在 lm5 上"偏科", 而偏的那一侧恰好是分低的模态**。
 
-## 3. 关键两两对比 (Welch t, Δ = 前者 − 后者)
+---
 
-★ **干净对照** = `value` vs `random-matched` (同一条实测提议频率分布驱动, 只差「选哪个区间」的决策规则)。
-非干净对照 `value` vs `random` 混入了「复习更均匀」效应, 只能参考。
+## 3. 关键两两对比 (Welch t, Δ = 前者 − 后者, ddof=1)
 
-| 指标 | 对比 | Δ | t | 判定 |
-|:--|:--|:--|:--|:--|
-| **LM4 replay** | **`value` vs `random-matched`** | **−0.0045** | **−0.32** | **不显著** |
-| **LM4 any-time** | **`value` vs `random-matched`** | **+0.0125** | **+0.47** | **不显著** |
-| **LM4 最差遗忘界** | **`value` vs `random-matched`** | **+0.1509** | **+2.22** | **显著 (value 更不安全)** |
-| LM4 replay | `value` vs `random` (参考) | −0.0197 | −1.66 | 不显著 |
-| LM4 any-time | `value` vs `random` (参考) | −0.0199 | −1.26 | 不显著 |
-| LM4 最差遗忘界 | `value` vs `random` (参考) | +0.1482 | +1.95 | 不显著 (趋近) |
-| LM4 replay | `value` vs `value-nofb` | +0.0000 | +0.00 | 不显著 (**完全无差**) |
-| LM4 replay | `value` vs `perm` | +0.0341 | +3.44 | 显著 |
-| LM4 any-time | `value` vs `perm` | +0.0706 | +4.31 | 显著 |
-| LM4 replay | `value` vs `revisit` | +0.0212 | +2.02 | 显著 (边缘) |
-| LM4 any-time | `value` vs `revisit` | +0.0098 | +0.65 | 不显著 |
-| LM4 replay | `random-matched` vs `random` | −0.0153 | −1.16 | 不显著 |
-| **LM5 replay** | **`value` vs `random-matched`** | **+0.0030** | **+0.07** | **不显著** |
-| **LM5 any-time** | **`value` vs `random-matched`** | **+0.0361** | **+2.06** | **显著 (边缘, value 更好)** |
-| **LM5 最差遗忘界** | **`value` vs `random-matched`** | **−0.0867** | **−0.75** | **不显著** |
-| LM5 replay | `value` vs `value-nofb` | +0.0000 | +0.00 | 不显著 (**完全无差**) |
+★ **干净对照** = `value` vs `random-matched`(同一条实测提议频率分布): 只差「选哪个区间」的决策规则。
+`value` vs `random` 混入「复习更均匀」效应, 只作参考。
+
+| 基准 | 指标 | 对比 | Δ | t | df | p | 判定 |
+|:--|:--|:--|:--|:--|:--|:--|:--|
+| **LM4** | **replay** | **`value` vs `random-matched`** | **+0.0013** | **+0.23** | 3.0 | 0.836 | **不显著** |
+| LM4 | 平均遗忘 | `value` vs `random-matched` | +0.0278 | +0.93 | 2.6 | 0.430 | 不显著 (value 遗忘更多) |
+| LM4 | replay | `value` vs `value-nofb` | −0.0024 | −0.41 | 3.1 | 0.707 | 不显著 (提议序列已发散) |
+| LM4 | any-time | `value` vs `value-nofb` | +0.0015 | +0.09 | 4.0 | 0.932 | 不显著 |
+| LM4 | replay | `value` vs `random` (参考) | −0.0129 | −2.53 | 2.0 | 0.127 | ★但**不可信** (`random` 方差近零) |
+| LM4 | replay | `value` vs `perm` | +0.0210 | **+3.27** | 3.8 | 0.034 | **显著** |
+| LM4 | replay | `value` vs `fixed` | +0.0002 | +0.04 | 2.6 | 0.973 | 不显著 |
+| LM4 | replay | `value` vs `revisit` | +0.0082 | +1.12 | 4.0 | 0.325 | 不显著 |
+| LM4 | 最差遗忘界 | `value` vs `fixed` | +0.0375 | +1.05 | 3.0 | 0.369 | 不显著 |
+| **LM5** | **末轮均值** | **`value` vs `random-matched`** | **−0.0274** | **−0.50** | 2.1 | 0.662 | **不显著 (数值更低)** |
+| LM5 | any-time | `value` vs `random-matched` | +0.0073 | +0.35 | 2.4 | 0.755 | 不显著 |
+| LM5 | 最差遗忘界 | `value` vs `random-matched` | −0.0034 | −0.03 | 4.0 | 0.978 | 不显著 |
+| LM5 | 平均遗忘 | `value` vs `random-matched` | −0.0033 | −0.11 | 3.6 | 0.916 | 不显著 |
+| **LM5** | 末轮均值 | **`value` vs `value-nofb`** | **+0.0000** | **+0.00** | — | 1.000 | **结构性无差** (3 seed 矩阵逐位相同) |
+| LM5 | 末轮均值 | `value` vs `perm` | −0.0414 | −0.75 | 2.3 | 0.524 | 不显著 |
+| LM5 | 末轮均值 | `value` vs `fixed` | −0.0211 | −0.35 | 2.9 | 0.748 | 不显著 |
+| LM5 | 末轮均值 | `value` vs `nonstationary` | −0.0310 | −0.56 | 2.3 | 0.626 | 不显著 |
+| LM5 | 末轮均值 | `random-matched` vs `fixed` | +0.0064 | +0.23 | 2.5 | 0.835 | 不显著 |
+| LM4 | replay | [敏感性] `value` vs `rm`(被覆盖目录) | −0.0009 | −0.15 | 3.6 | 0.891 | 不显著 |
+| LM4 | any-time | [敏感性] `value` vs `rm`(被覆盖目录) | +0.0053 | +0.24 | 3.3 | 0.825 | 不显著 |
+| LM4 | 最差遗忘界 | [敏感性] `value` vs `rm`(被覆盖目录) | +0.0909 | +1.51 | 3.3 | 0.222 | 不显著 (value 更差) |
+
+**显著性汇总**: 全表只有一条真正 `|t|>=2` 且方向对我们有利/不利 —— **LM4 `value` vs `perm` (+3.27, p=0.034)**;
+而这条的含义是「**在线调度** > 预先定死的任务流」, 不是「价值函数 > 别的调度规则」
+(`random` / `random-matched` 同样赢 `perm`)。**① 与 ② 两个核心问题都是"不显著"**。
 
 ### 口径敏感性 (必须同报)
 
-`tests/analyze_benchmark.py` (旧脚本) 用 `np.std` 默认 `ddof=0` 且把 std 当总体标准差, 会把 `n=3` 的方差低估,
-同一对比 `value vs random` (LM4 replay) 得到 **t=−2.04「显著」**; 本报告改用 `ddof=1` 后为 **t=−1.66「不显著」**。
-`n=3` 时这种翻转是常态, 因此 **不要把单个 `|t|≈2` 当结论**。本报告所有判定按 ddof=1 给出。
+- `n=3` 时 `ddof` 口径能翻转结论: 旧脚本用 `np.std` (ddof=0) 会把某条 `|t|=1.66` 抬成 `2.04`「显著」。
+  本报告统一 ddof=1。
+- `random` 臂三 seed 的 replay 是 0.7731 / 0.7732 / 0.7732 (**CV 0.0%**) —— 该臂提议不随 seed 变,
+  其 `±0.0001` 使任何对比的 t 值被**虚假放大**。`value` vs `random` 的 `t=−2.53` 属于此类, **不作为结论**。
+- LM4 `random-matched` 主口径的 `any-time` / 最差遗忘界**缺失** (JSON 被 int64 bug 截断); LM5 各臂完整。
+- 任务流臂 (`bm_bins_*`, `bm5_*`) 跑于 05:16–05:43 UTC, 价值函数臂跑于 07:05–08:07 UTC, **脚本修订版不同**;
+  任务流臂不用价值函数, 但**严格的可比性有保留**。
 
 ---
 
-## 4. 结论: 价值函数到底有没有用?
+## 5. 结论: 修正版下, 价值函数到底有没有用?
 
-**诚实结论: 在这两个 benchmark 上, 没有证据表明价值函数优于频率对齐对照 —— 干净对照下它不赢, 甚至在一处显著更差。**
+**诚实结论: 没有。四项全部激活之后, 价值函数在干净对照上依然不赢, 而且两个 benchmark 的符号相反 —— 
+lm4 微正 (`+0.0013`), lm5 明确为负 (`−0.0274`); 两者都不显著。此前那批结果作废并不能救它, 
+因为作废的原因 (价值函数退化成均匀化采样器) 修好之后, 结果只是从「略低于对照」变成「与对照无差别」。**
 
-1. **核心对照 (`value` vs `random-matched`) 不支持价值函数**
-   - LM4: replay `Δ=−0.0045 (t=−0.32)`, any-time `Δ=+0.0125 (t=+0.47)` —— **都没赢**, 数值上还略低。
-   - LM4 最差遗忘界: `Δ=+0.1509 (t=+2.22)` —— **显著更差**。这是本次唯一 `|t|>=2` 的核心对照,
-     且方向对价值函数**不利**。
-   - LM5: replay `Δ=+0.0030 (t=+0.07)` 不显著; any-time `Δ=+0.0361 (t=+2.06)` 边缘显著更好;
-     最差遗忘界不显著。**lm4 与 lm5 方向相互矛盾** → 只能判为「测不出稳定效应」, 不能判为「有效」。
-2. **连混淆对照都赢不了**: `value` vs `random` (均匀随机) 在 LM4 上 `Δ=−0.0197` —— 即便把「复习更均匀」
-   这份不属于价值函数的红利算给 value, 它**仍然低于**均匀随机。换言之, LM4 上价值函数的表现不佳
-   **不是**频率分布差异造成的假象。
-3. **`value-nofb` 与 `value` 逐位相同** (三种指标 `Δ=+0.0000, t=+0.00`, pre-seed 频率向量也完全相同) →
-   注入判别器的那一项 `λ_fb` (**真实反馈 = 1−acc**) 在当前实现里**对调度结果零影响**。
-   这一项要么没被 proposal 逻辑读到, 要么被 softmax 温度压平。**这是必须修的真 bug**:
-   它意味着「价值函数里的真实反馈闭环」目前是**死代码**, 我们此前把 `value` 臂的结果读作
-   「价值函数(含反馈)有效」的推论**不成立** —— 实测到的任何效果都只能来自 `sim/con/cov` 三项。
-4. **价值函数确实显著优于「没有调度」**: LM4 上 `value` vs `perm` (`Δ=+0.034, t=+3.44` replay;
-   `+0.071, t=+4.31` any-time) 与 vs `revisit` (edge) 显著。但这只说明
-   **「用一个提议器在线选任务」优于「预先定死的任务流」**, 而 `random` 与 `random-matched` 同样具备这个优势
-   (且 LM4 上还更大)。**这是「调度」的功劳, 不是「价值函数」的功劳。**
-5. **方差稳定器说法也被推翻**: 干净配置下 LM4 `value` 的 replay `CV=2.0%`, 并没有小于
-   `random`(1.7%) 或 `random-matched`(2.4%); LM5 `value` 反而是全场方差最大的臂 (CV 25.6%,
-   而 `random-matched` 5.3%)。旧结论「value 缩方差」只在旧的 `naive` 臂上成立, 不构成普遍结论。
+1. **① `value` vs `random-matched` (唯一干净对照) —— 不显著, 且不占优**
+   - LM4: `Δ=+0.0013 (t=+0.23, p=0.84)`; 平均遗忘反而**多 0.028**(不显著)。被覆盖目录口径下 `Δ=−0.0009 (t=−0.15)`。
+   - LM5: `Δ=−0.0274 (t=−0.50, p=0.66)`; any-time `+0.0073 (t=+0.35)` 不显著。
+   - **两 benchmark 方向相反** → 连"方向一致的小效应"都算不上, 只能判「测不出效应」。
+2. **② `value` vs `value-nofb` (隔离真实反馈项 λ_fb) —— 两种结局, 都不是好消息**
+   - LM4: 提议序列**已发散**(修复生效), 但最终性能 `Δ=−0.0024 (t=−0.41)`, any-time `Δ=+0.0015 (t=+0.09)`
+     → **反馈项对最终性能无可测贡献**。
+   - LM5: 3 seed 的**遗忘矩阵逐位相同**, 提议域序列逐位相同 → **λ_fb 在 lm5 里对调度零影响**
+     (等价于死项)。四臂中 `value-nofb` 与 `value` 完全相同, 因此 lm5 上只有 3 个可分辨的调度臂。
+   - 合起来: **「真实反馈」这一路目前仍不产生任何可测价值** —— 它在 lm4 会改序列但不改结果, 在 lm5 连序列都不改。
+3. **价值函数也不是方差稳定器**: LM5 `value` 的 CV **36.2%** 是全场最大 (`random-matched` 5.5%,
+   `perm` 7.9%); LM4 `value` 的 CV 1.2% 也没小于 `random-matched`(0.6%)。LMT-twister 时代
+   「value 缩方差 3 倍」的结论**不能迁移到 lm4/lm5** —— 当年那是在 `naive` 臂上量的, 机制不同。
+4. **能站住的只有「调度 > 预定义任务流」**: LM4 `value` vs `perm` `Δ=+0.0210 (t=+3.27, p=0.034)` 显著。
+   但 `random`(0.7732) 和 `random-matched`(0.7590) 同样高于 `perm`(0.7393) →
+   **红利属于「在线挑任务」这件事本身, 不属于价值函数的判别力。**
+5. **lm5 上还有一个具体机制**: `value` 把预算押在文本+wave, 因果系四域只被点 2/24 次,
+   于是因果域 (占均值 4/8) 偏低 → 平均分被拖。这不是"价值函数不够聪明"的玄学, 是**覆盖偏置**:
+   `cov(p)=1/(1+freq)` 在 8 域 × 8 轮的池子上不足以强制覆盖。
 
-### 与我们的理论预期的关系
+### 与理论预期的关系
 
-`V35.19–V35.22 / LM1` 的结论是「价值函数的价值在**迁移质量与稳定性**, 不在同分布即时收益」。
-本轮拆掉了同分布收益这个焦点, 改用边缘设备真正在意的 any-time 与最差遗忘界, 结果是:
-**在 lm4/lm5 这两个 benchmark 上, 连这两个新指标也没能证明价值函数的增量。** 目前能站得住的只有
-「在线调度 > 固定顺序」, 以及「提议器的存在会大幅缓解 naive 臂的遗忘」(历史结论, 本轮未复测)。
+`V35.19–V35.22 / LM1` 的结论是「价值函数的价值在迁移质量与稳定性, 不在同分布即时收益」。
+本轮把指标换成边缘设备真正在意的 **any-time 平均准确率** 与 **最差遗忘界**, 结论是:
+**这两个新指标同样没测出价值函数的增量** —— any-time 上 lm4 输给 `random`/`random-matched`,
+lm5 三臂打平; 最差遗忘界上 lm4 `value`(0.359) 比 `random-matched`(任务流 `fixed` 0.321) 还差一点。
+目前仍能站住的只有**「在线调度 > 预先定死的任务流」**, 以及历史上 naive 臂的遗忘缓解
+(native 臂本轮未复测, 不下结论)。
 
 ### 局限 (随结论同报)
 
-- **`n=3`, 检验功效极低**。`|t|>=2` 只算边缘证据; 任何一条判定都不该被单独引用。
-- **LM4 三个调度臂共用同一个频率 profile** (取自 `bm_value_s42`); `random-matched` 是**分布**对齐,
-  不是逐轮轨迹对齐, 严格说只消除了「复习频率分布」这一层混淆。
-- **LM5 缺 `random` 臂**, 无法在 lm5 上复现混淆对照。
-- **LM5 信号集中在 `wave` + 4 个因果域**, 文本三域贴地, 臂间差异被少数域主导。
-- 本轮**未开启学习效率曲线** (`--trace-every`), 达标步数指标缺失 —— 仍是已知执行缺口。
-- 上一轮笔记里 `value` 臂的数字 (replay 0.6862 / naive 0.4282) 与本轮 (0.7734) 不可比: 本轮是重构后的
-  新 benchmark (`--stream` 任务流 + 18 候选池 + `--norm fixed`), 上一轮是固定域序的旧版。
+- **`n=3`**, 检验功效极低; 两个 benchmark 方向相反本身就是功效不足的表现。
+- **LM4 `random-matched` 的 any-time / 最差遗忘界缺失** (int64 序列化 bug), 主表该行只有 replay / 平均遗忘。
+- **`random` 臂种子无关** (CV 0.0%), 其统计量不可直接入 t 检验。
+- **任务流臂与调度臂跨脚本修订版** (05:xx vs 07:xx UTC), 严格可比性有保留。
+- **服务器在我工作期间被另一路会话并发修改** (`run_lm4_wave.py` 08:14 / 08:19 UTC 两次),
+  `random-matched` 的 `seed 1 / 7` json 已被新修订版覆盖 → 该臂用"与 value 同修订版"的主口径 + 敏感性双报。
+- **LM5 依赖 4 个因果域的绝对水平**, 而因果域本身有已知的天花板问题 (SCM 干预饱和, 见 `lm5_backbone_verdict.md`)。
+- 本轮**仍未开启学习效率曲线** (`--trace-every`) —— 达标步数指标继续缺失 (已知执行缺口)。
 
 ---
 
-## 5. 复现
+## 6. 复现
 
 ```bash
-# 服务器
-python /tmp/analyze_bm_full.py            # = tests/analyze_bm_full.py
+# 服务器 (lm4 全臂, 修正版路径前缀 bm2_ + 流臂 bm_)
+/work/liuyuanjie/envs/vllm-cu128/bin/python /tmp/analyze_benchmark.py
+
+# 服务器 (lm4 + lm5 全臂, 打印本文档的表格行)
+scp tests/analyze_bm2_full.py root@SERVER:/tmp/ && \
+  /work/liuyuanjie/envs/vllm-cu128/bin/python /tmp/analyze_bm2_full.py
 ```
 
 ```bash
-# 补跑 lm4 random-matched (修复后)
-for S in 42 1 7; do
-  CUDA_VISIBLE_DEVICES=0 /work/liuyuanjie/envs/vllm-cu128/bin/python -u tests/run_lm4_wave.py \
-    --backbone mlp --norm fixed --cl-method replay --head linear \
-    --epochs-per-domain 1000 --joint-steps 0 --wfr-bands 13 --lshell \
-    --pool cat --agg-path --domains 6 --fine-bins 18 --rounds 12 \
-    --proposer random-matched --stream fixed --seed $S --device cuda \
-    --freq-profile results/freq_profile.json --out results/bm_random-matched_s$S
-done
+# lm4 random-matched 的 json 落盘修复 (不改源文件, 只包一层 json.dump)
+#   /tmp/rerun_rm.py: json.dump = 带 default= 的包装器; 然后 runpy 跑 tests/run_lm4_wave.py
+CUDA_VISIBLE_DEVICES=0 /work/liuyuanjie/envs/vllm-cu128/bin/python -u /tmp/rerun_rm.py \
+  --backbone mlp --norm fixed --cl-method replay --head linear \
+  --epochs-per-domain 1000 --joint-steps 0 --wfr-bands 13 --lshell \
+  --pool cat --agg-path --domains 6 --fine-bins 60 --rounds 12 --proposer-k 3 --device cuda \
+  --proposer random-matched --seed 42 --freq-profile results/freq_profile2.json \
+  --out results/bm2_random-matched_s42
 ```
+
+> **待修 (建议)**: 给 `tests/run_lm4_wave.py` 的 `json.dump` 加
+> `default=lambda o: o.item() if hasattr(o, "item") else str(o)` —— 这个 bug 已经让一个臂的
+> `any-time` / 最差遗忘界指标彻底丢失, 且 `rc=1` 被 driver 当成普通失败记录, 很容易漏看。
