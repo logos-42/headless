@@ -543,7 +543,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    stream="fixed", rounds=0, freq_profile=None,
                    y_log=None, bands=13, use_lshell=False,
                    rl_mu=0.05, rl_alpha0=0.2, rl_explore_w=0.5, rl_algo="autostep",
-                   rl_know=0,
+                   rl_know=0, schedule_str="",
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
@@ -643,8 +643,12 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
 
     if proposer == "bins":
         # ★ 显式 schedule 优先: 用于执行规划器给出的序列 (真实环境验证)
-        _explicit = [int(x) for x in args.schedule.split(",") if x.strip() != ""] \
-            if getattr(args, "schedule", "") else []
+        # ★ 不能用 args: run_experiment 是独立函数, args 只存在于 main。
+        #   本行曾写成 getattr(args, "schedule", "") -> NameError, 导致
+        #   `--proposer bins` 整条路径直接崩 (后续实验用 --proposer rl/value
+        #   绕过了这段, 所以一直没暴露)。
+        _explicit = ([int(x) for x in schedule_str.split(",") if x.strip() != ""]
+                     if schedule_str else [])
         if _explicit:
             dom_seq = _explicit
             print("[schedule] 显式序列 -> %s" % dom_seq, flush=True)
@@ -1326,6 +1330,7 @@ def main():
                                  proposer_sigma=args.proposer_sigma,
                                  rl_mu=args.rl_mu, rl_alpha0=args.rl_alpha0,
                                  rl_algo=args.rl_algo, rl_know=args.rl_know,
+                                 schedule_str=args.schedule,
                                  rl_explore_w=args.rl_explore_w,
                                  stream=args.stream, rounds=args.rounds,
                                  freq_profile=freq_prof,
