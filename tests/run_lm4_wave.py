@@ -127,15 +127,25 @@ class StatMLP(nn.Module):
 
     def __init__(self, n_feat=N_FEAT, n_classes=6, hidden=512, n_layers=3,
                  head_type="linear", pln_d=64, inner_lr=0.1, dropout=0.0,
-                 stat_input=True, **kw):
+                 stat_input=True, norm="batchnorm", **kw):
         super().__init__()
         self.n_feat = n_feat
         self.head_type = head_type
+        self.norm_mode = norm
         # 聚合特征: mean/std/last/first/斜率 = 5*n_feat
         d_in = 5 * n_feat
         # ★ 必须标准化。探针 (probe_ceiling.py) 对聚合特征做了 (x-mu)/sd, 实测
         #   6 域 0.8065; 不做标准化的 StatMLP 只有 0.6558 —— 差 0.15 全在这一点。
-        mods = [nn.BatchNorm1d(d_in), nn.Linear(d_in, hidden), nn.GELU()]
+        # ★ BN 有已知的持续学习陷阱: running stats 随域漂移 -> 旧域被错误归一化
+        #   -> 灾难性遗忘。fixed 模式用冻结的全局 mu/sd 来验证这一点。
+        if norm == "batchnorm":
+            nml = nn.BatchNorm1d(d_in)
+        elif norm == "fixed":
+            nml = nn.BatchNorm1d(d_in)
+        else:
+            nml = nn.Identity()
+        self.norm_layer = nml
+        mods = [nml, nn.Linear(d_in, hidden), nn.GELU()]
         if dropout > 0:
             mods.append(nn.Dropout(dropout))
         for _ in range(n_layers - 1):
@@ -153,6 +163,24 @@ class StatMLP(nn.Module):
             self.head = PLNHead(hidden, pln_d, n_classes, inner_lr=inner_lr)
         else:
             self.head = nn.Linear(hidden, n_classes)
+
+    def set_fixed_stats(self, agg):
+        """fixed 模式: 用整个训练集的 mu/sd 填 BN running stats 并冻结。"""
+        if self.norm_mode != "fixed":
+            return
+        with torch.no_grad():
+            mu = agg.mean(0)
+            sd = agg.std(0).clamp(min=1e-6)
+            self.norm_layer.running_mean.copy_(mu)
+            self.norm_layer.running_var.copy_(sd ** 2)
+            self.norm_layer.num_batches_tracked.fill_(1)
+        self.norm_layer.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "norm_mode", None) == "fixed":
+            self.norm_layer.eval()          # 永远 eval, 统计量不漂移
+        return self
 
     def encode(self, x, agg=None):
         """x: (B, L, F) -> (B, hidden)。agg 参数仅为接口兼容。"""
@@ -429,7 +457,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
                    consolidate_every=10, stat_input=False, backbone="ssm",
-                   head_type="linear"):
+                   head_type="linear", norm="batchnorm"):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -469,7 +497,13 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     if backbone == "mlp":
         model = StatMLP(n_feat=n_feat or X.shape[-1], n_classes=n_classes,
                         hidden=d_model, n_layers=n_layers, head_type=ht,
-                        pln_d=pln_d, inner_lr=inner_lr).to(device)
+                        pln_d=pln_d, inner_lr=inner_lr, norm=norm).to(device)
+        if norm == "fixed":
+            _ti = np.concatenate([train_by_dom[d] for d in domains])
+            with torch.no_grad():
+                _all = torch.from_numpy(X[_ti]).to(device)
+                model.set_fixed_stats(window_agg(_all))
+            del _all
     else:
         model = WaveSSM(n_feat=n_feat or X.shape[-1], d_model=d_model,
                         d_state=d_state, n_layers=n_layers,
@@ -699,6 +733,8 @@ def main():
     ap.add_argument("--n-layers", type=int, default=2)
     ap.add_argument("--pool", default="last", choices=["last", "mean", "max", "cat"],
                     help="SSM 时序池化 (last 实测最好: 0.7213 vs cat 0.6681)")
+    ap.add_argument("--norm", default="batchnorm", choices=["batchnorm", "fixed", "none"],
+                    help="StatMLP 归一化: batchnorm (随域漂移) / fixed (冻结全局 mu/sd) / none")
     ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
                     help="分类头: linear (原) / pln (Meta-SGD 逐参数步长) / swifttd (lm1 局部规则)")
     ap.add_argument("--backbone", default="mlp", choices=["mlp", "ssm"],
@@ -796,7 +832,8 @@ def main():
                                  reptile_lr=args.reptile_lr,
                                  consolidate_every=args.consolidate_every,
                                  stat_input=args.stat_input,
-                                 backbone=args.backbone, head_type=args.head)
+                                 backbone=args.backbone, head_type=args.head,
+                                 norm=args.norm)
         s = summarize(M, doms)
         results[key] = s
         print(f"  → 最终平均 acc {s['final_mean_acc']:.4f}, 平均遗忘 {s['mean_forget']:.4f}", flush=True)
@@ -837,7 +874,7 @@ def main():
         "d_model": args.d_model, "d_state": args.d_state,
         "n_layers": args.n_layers, "epochs_per_domain": args.epochs_per_domain,
         "pool": args.pool, "agg_path": args.agg_path, "stat_input": args.stat_input,
-        "backbone": args.backbone, "head": args.head,
+        "backbone": args.backbone, "head": args.head, "norm": args.norm,
         "shuffle_domains": args.shuffle_domains,
         "cl_method": args.cl_method, "pln_d": args.pln_d,
         "inner_k": args.inner_k, "inner_lr": args.inner_lr,
