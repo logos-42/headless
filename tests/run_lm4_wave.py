@@ -546,7 +546,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    rl_know=0, schedule_str="",
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0,
                    oak_options=1, oak_gate=1, oak_refresh=4,
-                    shift_at=0, shift_every=0):
+                    shift_at=0, shift_every=0, opt_frac=1.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -653,7 +653,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                               mu=rl_mu, alpha0=rl_alpha0, explore_w=rl_explore_w,
                               algo=rl_algo, n_know=int(rl_know),
                               use_options=bool(oak_options), use_gate=bool(oak_gate),
-                              refresh_every=oak_refresh)
+                              refresh_every=oak_refresh, opt_frac=opt_frac)
         print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s refresh=%d"
               % (oakprop.n_fine, oak_options, oak_gate, rl_algo, oak_refresh), flush=True)
 
@@ -1203,6 +1203,8 @@ def main():
                     help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
                          "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
                          "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
+    ap.add_argument("--opt-frac", type=float, default=1.0,
+                    help="诊断: 只在一部分轮次启用 option (1.0=每轮都可用)")
     ap.add_argument("--shift-at", type=int, default=0,
                     help="E11: 第 K 轮后触发 regime shift (置换动作->物理区映射)。0=关")
     ap.add_argument("--shift-every", type=int, default=0,
@@ -1415,6 +1417,7 @@ def main():
                                  oak_options=args.oak_options,
                                  oak_gate=args.oak_gate,
                                  oak_refresh=args.oak_refresh,
+                                 opt_frac=args.opt_frac,
                                  shift_at=args.shift_at,
                                  shift_every=args.shift_every,
                                  stream=args.stream, rounds=args.rounds,

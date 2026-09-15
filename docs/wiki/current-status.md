@@ -11,6 +11,17 @@ status: current
 
 ## 最近更新
 
+- 2026-09-14：**OaK 正式对照结果 —— Options 显著有害（诚实负面结论，80 臂双 GPU）**
+  - **E9 vs E10 唯一变量是时间抽象**：lm4 any_time **−1.6%（t=−5.02, p<0.0001）**、最终 acc **−3.7%**
+    （p<0.0001）、naive 臂 **−15.5%**；lm5 长配置 any_time **−1.9%（t=−5.14, p<0.0001）**
+  - **机制确实生效**（option_starts 41.9/75.2，steps 62.3/82.8）→ **不能按「机制没触发」免责**
+  - regime shift（E11/E12）方向一致但不显著（p=0.22/0.31）—— 对「Options 在非平稳环境才有价值」是反证据
+  - 步长 E 表四算法几乎无差别（any_time 差 ~0.4%），与此前三条独立负面结论一致
+  - **修两个统计 bug**：`OAKProposer.stats()` 覆盖 base 真 α 统计（值取自未被更新的死对象）；
+    `analyze_oak` 只读 lm4 的文件名导致 lm5 的 20 臂完全没被读到
+  - 诊断队列（D1 opt_frac 剂量-反应 / D2 refresh 频率 / D3 修好的 α）在跑
+  - 详见 `docs/oak_results.md`
+
 - 2026-09-14：**OAKProposer 接入 lm4 主回路 + E9/E10 对照启动（本轮最大缺口已补上）**
   - `hibs_lnn/oak_proposer.py`：state = 粗域能力画像、action = 选哪个细区间训练、reward = Δ(any-time)
     —— **`T(s,a)→s'` 是真可学、数据里天然存在的转移**

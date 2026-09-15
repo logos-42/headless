@@ -82,6 +82,41 @@ def collect(pat, arm):
     return out
 
 
+def collect5(pat):
+    """lm5 的指标在**顶层** (any_time_acc / worst_case_forget), 不像 lm4 嵌在 arm 下。
+
+    ★ 早先版本只写了一个 collect() 读 lm4 的 `lm4_wave_results.json`,
+      lm5 的 20 个臂 (oak5L_*) 因此**完全没被读到**, 分析报告里那一节是空的。
+    """
+    out = {"any_time": [], "forget": [], "final": [], "opts": [], "starts": [],
+           "steps": [], "ntrans": [], "nopt": [], "dirs": []}
+    for d in sorted(glob.glob(pat)):
+        f = os.path.join(d, "lm5_mm_results.json")
+        if not os.path.exists(f):
+            continue
+        try:
+            j = json.load(open(f))
+        except Exception:
+            continue
+        out["dirs"].append(os.path.basename(d))
+        out["any_time"].append(j.get("any_time_acc", float("nan")))
+        out["forget"].append(j.get("worst_case_forget", float("nan")))
+        # lm5 没有单一 final_mean_acc -> 用最后一行的域均值
+        m = j.get("matrix") or []
+        if m:
+            last = [v for v in m[-1] if v is not None and v == v]
+            out["final"].append(float(np.mean(last)) if last else float("nan"))
+        else:
+            out["final"].append(float("nan"))
+        o = j.get("oak") or {}
+        k = j.get("knowledge") or {}
+        out["starts"].append(o.get("option_starts", float("nan")))
+        out["steps"].append(o.get("option_steps", float("nan")))
+        out["ntrans"].append(o.get("n_trans", float("nan")))
+        out["nopt"].append(k.get("n_options", float("nan")))
+    return out
+
+
 def fmt(v):
     v = np.asarray(v, float); v = v[np.isfinite(v)]
     if len(v) == 0:
@@ -185,13 +220,36 @@ if _rows:
               % (lbl, np.nanmean(d["any_time"]) - np.nanmean(base["any_time"]), pa,
                  np.nanmean(d["forget"]) - np.nanmean(base["forget"]), pf))
 
-# ── lm5 加长配置 ───────────────────────────────────────────────────────
+# ── lm5 两档配置 ───────────────────────────────────────────────────────
 print()
 print("=" * 96)
-print("lm5 加长配置 (text 400 / wave 400 / causal 40k / rounds 200)")
+print("lm5 (多模态) E9 vs E10 —— 两档配置")
 print("=" * 96)
-e9_5 = collect(os.path.join(RES, "oak5L_e9_s*"), "replay")
-e10_5 = collect(os.path.join(RES, "oak5L_e10_s*"), "replay")
+for lbl, pa, pb in [("S4 短配置 (120 轮, 5 seed)", "oak5_e9_s*", "oak5_e10_s*"),
+                    ("S5 长配置 (200 轮, 10 seed)", "oak5L_e9_s*", "oak5L_e10_s*")]:
+    _a, _b = collect5(os.path.join(RES, pa)), collect5(os.path.join(RES, pb))
+    if not _a["dirs"] and not _b["dirs"]:
+        continue
+    print()
+    print("── %s " % lbl + "─" * 44)
+    print("   E9  无 Options: any_time %s" % fmt(_a["any_time"]))
+    print("                  遗忘     %s" % fmt(_a["forget"]))
+    print("   E10 有 Options: any_time %s" % fmt(_b["any_time"]))
+    print("                  遗忘     %s" % fmt(_b["forget"]))
+    print("   机制(E10): options=%s starts=%s steps=%s"
+          % (fmt(_b["nopt"]), fmt(_b["starts"]), fmt(_b["steps"])))
+    t, pv = welch(_b["any_time"], _a["any_time"])
+    if np.isfinite(t):
+        print("   any_time Δ=%+.4f t=%+.2f p=%.4f %s"
+              % (np.nanmean(_b["any_time"]) - np.nanmean(_a["any_time"]), t, pv,
+                 "**显著**" if pv < 0.05 else "不显著"))
+
+print()
+print("=" * 96)
+print("lm5 加长配置细节 (text 400 / wave 400 / causal 40k / rounds 200)")
+print("=" * 96)
+e9_5 = collect5(os.path.join(RES, "oak5L_e9_s*"))
+e10_5 = collect5(os.path.join(RES, "oak5L_e10_s*"))
 for lbl, d in [("lm5L E9 (无 Options)", e9_5), ("lm5L E10 (有 Options)", e10_5)]:
     if not d["dirs"]:
         continue

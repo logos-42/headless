@@ -46,7 +46,7 @@ class OAKProposer:
                  mu=0.05, alpha0=0.2, explore_w=0.5, algo="autostep",
                  n_know=0, use_options=True, use_gate=True,
                  n_models=5, refresh_every=4, min_transitions=40,
-                 n_regions=4, max_opt_len=3):
+                 n_regions=4, max_opt_len=3, opt_frac=1.0):
         from hibs_lnn.rl_proposer import RLProposer
         self.n_fine = int(n_fine)
         self.n = self.n_fine
@@ -58,6 +58,12 @@ class OAKProposer:
         self.min_transitions = int(min_transitions)
         self.n_regions = int(n_regions)
         self.max_opt_len = int(max_opt_len)
+        # ★ 诊断用: 只在一部分轮次允许启用 option。
+        #   若"Options 有害"确实来自 option 执行本身 (提交一段固定动作序列 ->
+        #   减少自适应性 / 降低探索多样性), 那么伤害应当**随 opt_frac 单调放大**。
+        #   若伤害与用量无关, 说明另有来源 (如 discovery 本身在扰动状态)。
+        self.opt_frac = float(opt_frac)
+        self._opt_round = 0
 
         # Level 3: 复用已验证的 RL 提议器
         self.base = RLProposer(fine_desc, tau=tau, k=k, mu=mu, alpha0=alpha0,
@@ -148,9 +154,13 @@ class OAKProposer:
                     if (not np.isfinite(unc)) or (tau and unc >= tau):
                         self.untrusted_picks += 1
 
-        # ③ 起一个新 option
-        if self.use_options and self.know is not None and self.know.options is not None \
-                and self._prev_state is not None:
+        # ③ 起一个新 option (受 opt_frac 限制)
+        self._opt_round += 1
+        _allow_opt = (self.opt_frac >= 1.0
+                      or (self.opt_frac > 0 and
+                          (self._opt_round % max(1, int(round(1.0 / self.opt_frac)))) == 0))
+        if (_allow_opt and self.use_options and self.know is not None
+                and self.know.options is not None and self._prev_state is not None):
             o = self.know.options.select(self._prev_state, exclude_unc=True)
             if o is not None and len(getattr(o, "actions", [])) > 1:
                 self._opt_active = o
@@ -204,9 +214,16 @@ class OAKProposer:
     # ── 诊断 ───────────────────────────────────────────────────────
     def stats(self):
         s = self.base.proposer_stats() if hasattr(self.base, "proposer_stats") else {}
+        # ★ 真步长统计: 取自 base 的最近一条 trace (RLProposer 在那里记录 α)
+        _tr = getattr(self.base, "trace", None) or []
+        if _tr:
+            s["alpha_mean"] = _tr[-1].get("alpha_mean")
+            s["alpha_std"] = _tr[-1].get("alpha_std")
+            s["h_norm"] = _tr[-1].get("h_norm")
         if self.know is None:
             s.update({"n_trans": len(self.trans), "refreshes": 0, "n_options": 0,
                       "option_steps": self.option_steps,
+            "opt_frac": self.opt_frac,
             "option_starts": self.option_starts, "untrusted_picks": self.untrusted_picks,
                       "coverage_total": 0, "tau_U": None, "gvf_steps": [], "alpha_std": 0.0})
             return s
@@ -220,7 +237,11 @@ class OAKProposer:
             "coverage_total": int(self.know.coverage.n_total),
             "tau_U": self.know.uncertainty.tau_U,
             "gvf_steps": [g.steps for g in self.know.predictions.gvfs],
-            "alpha_std": float(self.know.plasticity.alpha.std()),
+            # ★ 不要放在 "alpha_std" 这个键上 —— 它会**覆盖** base.proposer_stats()
+            #   里真正的步长统计。早先版本就是这么写的, 结果 JSON 里几个不同算法
+            #   (idbd / idbd-raw / cidbd) 的 alpha_std 全是同一个**未被更新**的死对象
+            #   的值 (2.78e-17), 看起来像"算法不生效"。真正在用的 α 在 base.trace。
+            "know_alpha_std": float(self.know.plasticity.alpha.std()),
         })
         return s
 
