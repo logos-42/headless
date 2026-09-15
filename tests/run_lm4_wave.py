@@ -547,7 +547,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0,
                    oak_options=1, oak_gate=1, oak_refresh=4,
                     shift_at=0, shift_every=0, opt_frac=1.0,
-                    opt_mode="fixed", term_eps=0.05, stall_tol=0.0):
+                    opt_mode="fixed", term_eps=0.05, stall_tol=0.0,
+                    dyn_model="linear", n_regions_opt=16, use_subgoals=0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -656,7 +657,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                               use_options=bool(oak_options), use_gate=bool(oak_gate),
                               refresh_every=oak_refresh, opt_frac=opt_frac,
                               opt_mode=opt_mode, term_eps=term_eps,
-                              stall_tol=stall_tol)
+                              stall_tol=stall_tol, dyn_model=dyn_model,
+                              n_regions_opt=n_regions_opt,
+                              use_subgoals=use_subgoals)
         print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s refresh=%d"
               % (oakprop.n_fine, oak_options, oak_gate, rl_algo, oak_refresh), flush=True)
 
@@ -1206,6 +1209,11 @@ def main():
                     help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
                          "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
                          "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
+    ap.add_argument("--dyn-model", default="linear",
+                    choices=["linear", "tabular"],
+                    help="世界模型: linear=TransitionEnsemble(ridge) / tabular=计数式")
+    ap.add_argument("--n-regions-opt", type=int, default=16)
+    ap.add_argument("--use-subgoals", type=int, default=0)
     ap.add_argument("--opt-mode", default="fixed",
                     choices=["fixed", "goal", "goal_term", "goal_term_override"],
                     help="Option 执行方式 (用户 K1 矩阵): fixed=O1 固定序列(open-loop); "
@@ -1429,6 +1437,9 @@ def main():
                                  oak_refresh=args.oak_refresh,
                                  opt_frac=args.opt_frac,
                                  opt_mode=args.opt_mode,
+                                 dyn_model=args.dyn_model,
+                                 n_regions_opt=args.n_regions_opt,
+                                 use_subgoals=args.use_subgoals,
                                  term_eps=args.term_eps,
                                  stall_tol=args.stall_tol,
                                  shift_at=args.shift_at,

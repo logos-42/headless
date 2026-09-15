@@ -47,7 +47,8 @@ class OAKProposer:
                  n_know=0, use_options=True, use_gate=True,
                  n_models=5, refresh_every=4, min_transitions=40,
                  n_regions=4, max_opt_len=3, opt_frac=1.0,
-                 opt_mode="fixed", term_eps=0.05, stall_tol=0.0):
+                 opt_mode="fixed", term_eps=0.05, stall_tol=0.0,
+                 dyn_model="linear", n_regions_opt=16, use_subgoals=0):
         from hibs_lnn.rl_proposer import RLProposer
         self.n_fine = int(n_fine)
         self.n = self.n_fine
@@ -77,6 +78,12 @@ class OAKProposer:
         self.override_count = 0
         self.term_reasons = {}
         self.replan_steps = 0
+        # ★ 世界模型 (实测: 线性 ridge 表达不了结构化动力学 —— 在 KeyDoor 这类
+        #   离散/条件性动力学上四个动作预测到**同一个**下一状态, 转移图退化成
+        #   几乎无边, option 发现为 0。计数式表格模型修掉了这个。)
+        self.dyn_model_kind = str(dyn_model)
+        self.n_regions_opt = int(n_regions_opt)
+        self.use_subgoals = int(use_subgoals)
 
         # Level 3: 复用已验证的 RL 提议器
         self.base = RLProposer(fine_desc, tau=tau, k=k, mu=mu, alpha0=alpha0,
@@ -110,6 +117,9 @@ class OAKProposer:
             return self.know
         self.dim_state = int(dim_state)
         self.know = InternalKnowledge(self.n_fine, self.dim_state, **self._know_cfg)
+        if self.dyn_model_kind == "tabular":
+            from hibs_lnn.uncertainty_gate import TabularTransition
+            self.know.dynamics_model = TabularTransition()
         self.know.register_value_fn(
             lambda s, a: float(self._last_acc.get(int(a), np.nan)),
             policy="rl-base")
@@ -284,8 +294,15 @@ class OAKProposer:
                                max_len=self.max_opt_len, seed=self.seed)
             states = np.array([s for s, _, _ in self.trans])
             acts = np.array([a for _, a, _ in self.trans])
-            om.discover(states, acts, n_regions=min(self.n_regions,
-                                                    max(2, len(states) // 10)))
+            # ★ 表格模型下按**真实状态**建图 (不是聚类中心)
+            n_uniq = len(np.unique(np.round(states, 6), axis=0))
+            nreg = (min(self.n_regions_opt, max(4, n_uniq))
+                    if self.dyn_model_kind == "tabular"
+                    else min(self.n_regions, max(2, len(states) // 10)))
+            if self.use_subgoals:
+                om.discover_subgoals(states, acts, n_regions=nreg)
+            else:
+                om.discover(states, acts, n_regions=nreg)
             self.know.register_options(om)
         except Exception as e:      # 知识重建失败不该拖垮主实验
             print("!! knowledge refresh 失败:", e, flush=True)
@@ -304,6 +321,8 @@ class OAKProposer:
                       "option_steps": self.option_steps,
             "opt_frac": self.opt_frac,
             "opt_mode": self.opt_mode,
+            "dyn_model": self.dyn_model_kind,
+            "use_subgoals": self.use_subgoals,
             "replan_steps": self.replan_steps,
             "override_count": self.override_count,
             "term_reasons": dict(self.term_reasons),
@@ -318,6 +337,8 @@ class OAKProposer:
             "option_starts": self.option_starts,
             "opt_frac": self.opt_frac,
             "opt_mode": self.opt_mode,
+            "dyn_model": self.dyn_model_kind,
+            "use_subgoals": self.use_subgoals,
             "replan_steps": self.replan_steps,
             "override_count": self.override_count,
             "term_reasons": dict(self.term_reasons),
