@@ -126,6 +126,72 @@ class TransitionEnsemble:
         return np.array(traj), np.array(uncs), aborted_at
 
 
+class TabularTransition:
+    """计数式转移模型 —— 离散状态空间上的**可表达**动力学。
+
+    ## 为什么必须加它 (实测动机)
+
+    `TransitionEnsemble` 是**线性 ridge 回归** (`[state, onehot(action)] -> next`),
+    对**离散、条件性、非线性**的动力学表达能力不足。实测在 KeyDoor 这类
+    链式任务上: 从区域中心出发, **四个动作预测到同一个下一状态** ->
+    转移图退化成几乎无边 -> `OptionManager` 发现 0 个 option
+    (即使任务里有明显的"拿钥匙→开门"技能链)。
+
+    ★ 结论: option 发现失败**不是 option 逻辑的问题, 而是它依赖的世界模型
+      表达不了结构化动力学**。这里是那个缺口的补丁。
+
+    `predict(x, a)` 与 `TransitionEnsemble` **接口一致**, 可直接替换:
+      返回 (最可能的下一状态, 不确定性)
+    不确定性 = 1 − max_a' P(s'|s,a) —— 即"这个转移有多确定"。
+    """
+    def __init__(self, lam=1.0):
+        self.counts = {}          # (s_key, a) -> {s'_key: n}
+        self.state_map = {}       # s_key -> 原状态向量
+        self.lam = float(lam)
+        self.dim_x = None
+        self.n_dom = None
+
+    @staticmethod
+    def _key(x):
+        return tuple(np.round(np.asarray(x, dtype=float), 6).tolist())
+
+    def fit(self, X, Y, n_dom, visits_dim=None):
+        X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
+        self.dim_x = Y.shape[1]; self.n_dom = int(n_dom)
+        self.counts, self.state_map = {}, {}
+        for i in range(len(X)):
+            x, u, y = X[i, :self.dim_x], int(X[i, -1]), Y[i]
+            sk, yk = self._key(x), self._key(y)
+            self.state_map[sk] = x
+            self.counts.setdefault((sk, u), {})
+            self.counts[(sk, u)][yk] = self.counts[(sk, u)].get(yk, 0) + 1
+        return self
+
+    def predict(self, x, u, visits=None):
+        """返回 (最可能下一状态向量, 不确定性 1−P_max)。未见过的 (s,a) -> 原状态 + unc=inf。"""
+        sk = self._key(x)
+        d = self.counts.get((sk, int(u)))
+        if not d:
+            return np.asarray(x, dtype=float).copy(), float("inf")
+        tot = sum(d.values())
+        yk, c = max(d.items(), key=lambda kv: kv[1])
+        return np.array(yk, dtype=float), float(1.0 - c / tot)
+
+    def rollout(self, x0, actions, visits=None, gate=None):
+        x = np.asarray(x0, dtype=float).copy()
+        traj, uncs, aborted = [x.copy()], [], None
+        for t, u in enumerate(actions):
+            if gate is not None:
+                ok, why = gate.allow(x, u, visits if visits is not None else np.ones(1))
+                if not ok:
+                    aborted = (t, why); break
+            xn, unc = self.predict(x, u, visits)
+            if not np.isfinite(unc):
+                aborted = (t, "unc_inf"); break
+            x = xn; traj.append(x.copy()); uncs.append(unc)
+        return np.array(traj), np.array(uncs), aborted
+
+
 class UncertaintyGate:
     """allow(s,a) = [C(s,a) > tau_C] ∧ [U_T(s,a) < tau_U]
 

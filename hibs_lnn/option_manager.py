@@ -204,7 +204,11 @@ class OptionManager:
             for r, seq in frontier:
                 for u in range(n_dom):
                     e = self.graph.get((r, u))
-                    if e is None or not np.isfinite(e[1]) or e[1] >= tau_U:
+                    if e is None or not np.isfinite(e[1]) or e[1] > tau_U + 1e-12:
+                        # ★ 用 `>` 而不是 `>=`: 确定性转移 (unc=0) 是**最可靠**的,
+                        #   在 tau_U 也等于 0 时绝不能被筛掉 —— 否则"完全可预测的边"
+                        #   全军覆没。实测: 计数式表格模型给出 tau_U=0.0, 旧的 `>=`
+                        #   使 OptionManager 在结构清晰的 MDP 上发现 0 个 option。
                         continue
                     if e[0] == r:
                         continue                      # 不前进的边不走
@@ -243,6 +247,115 @@ class OptionManager:
         return C, a
 
     # ───────── 高层选择 (planning 入口) ─────────
+    # ── ★ 子目标驱动的发现 (用户 2026-09-14 指导的 Option 形式) ──────
+    def discover_subgoals(self, states, actions, n_regions=8, tgt=0.0,
+                          min_path=2, max_path=5):
+        """按 `Option=(I_o, g_o, π_o, β_o)` **目标导向地**发现 option。
+
+        ## 为什么需要它 (实测动机)
+
+        原来的 `discover()` 找的是「**任意**可靠的多步路径」:
+          ① 没有目标导向 —— 终点是不是"有意义的地方"不管
+          ② 路径上**每条**边都要 unc < tau_U(中位数) -> 长度 4 的存活率 ~0.5^4=6%
+          ③ 要求长度**恰好** = L
+        结果: 在一个**有明显的"拿钥匙→开门"技能链**的 MDP 上, 即使图里有
+        50 条前进边, 也只发现 0~1 个 option。**这是实现的问题, 不是环境的。**
+
+        ## 正确做法: 先找**子目标**, 再找通往它的路
+
+          1. 建区域转移图 (同 discover)
+          2. 算每个区域在图上的**介数中心性** —— 高介数 = 通往别处必须经过的
+             咽喉 (bottleneck)。这正是"拿钥匙""开门"这类子目标的特征。
+          3. 每个 bottleneck 区域 b 成为一个子目标:
+               g_o = centers[b]
+               π_o = 从各起点区域到 b 的**最短动作序列** (在图上 BFS)
+               I_o = 那些起点区域
+          4. 允许多条不同长度的路径 (min_path..max_path), 不再要求恰好 = L
+        """
+        self.regions, _ = self._kmeans(np.asarray(states, dtype=float), n_regions)
+        n_dom = self.T.n_dom
+        visits = np.bincount(np.asarray(actions, dtype=int), minlength=n_dom).astype(float)
+
+        # 1. 区域转移图
+        self.graph = {}
+        for r in range(n_regions):
+            for u in range(n_dom):
+                s_next, unc = self.T.predict(self.regions[r], u, visits)
+                self.graph[(r, u)] = (self._nearest_region(s_next), unc)
+
+        uncs = np.array([v[1] for v in self.graph.values() if np.isfinite(v[1])])
+        self.tau_U = float(np.median(uncs)) if len(uncs) else float("inf")
+
+        # 2. 邻接 (每个区域的出边, 按 unc 从小到大)
+        adj = {r: [] for r in range(n_regions)}
+        for (r, u), (nxt, unc) in self.graph.items():
+            if nxt != r and np.isfinite(unc):
+                adj[r].append((nxt, u, unc))
+        for r in adj:
+            adj[r].sort(key=lambda t: t[2])
+
+        # 3. 介数中心性 (无权重近似: 全部最短路径数) -> 找咽喉
+        n = n_regions
+        bc = np.zeros(n)
+        for src in range(n):
+            # BFS
+            dist = {src: 0}; paths = {src: 1.0}; order = [src]
+            qi = 0
+            while qi < len(order):
+                cur = order[qi]; qi += 1
+                for (nxt, _u, _un) in adj[cur]:
+                    if nxt not in dist:
+                        dist[nxt] = dist[cur] + 1; order.append(nxt)
+                    if dist.get(nxt) == dist[cur] + 1:
+                        paths[nxt] = paths.get(nxt, 0.0) + paths[cur]
+            for t in order:
+                if t != src and dist[t] > 0:
+                    for mid in order:
+                        if mid != src and mid != t and dist.get(mid, 0) > 0 \
+                                and dist[mid] < dist[t]:
+                            bc[mid] += paths.get(mid, 0.0) / max(paths.get(t, 1.0), 1e-9)
+        # 4. 每个高介数区域 = 一个子目标; 用 BFS 找通往它的动作序列
+        order_bc = np.argsort(-bc)
+        self.options = []
+        oid = 0
+        for b in order_bc:
+            if bc[b] <= 0:
+                continue
+            for src in range(n_regions):
+                if src == b:
+                    continue
+                seq = self._bfs_action_path(adj, src, b, max_path)
+                if seq is None or len(seq) < min_path:
+                    continue
+                uncs_seq = [self.graph[(src, seq[0])][1]]
+                self.options.append(Option(oid, seq, self.regions[src],
+                                           self.regions[b], uncs_seq))
+                oid += 1
+                if oid >= 40:
+                    break
+            if oid >= 40:
+                break
+        return self.options
+
+    @staticmethod
+    def _bfs_action_path(adj, src, dst, max_len):
+        """在区域图上 BFS 出 src->dst 的**动作序列** (优先低不确定性边)。"""
+        from collections import deque
+        q = deque([(src, [])])
+        seen = {src}
+        while q:
+            cur, path = q.popleft()
+            if len(path) > max_len:
+                continue
+            if cur == dst and path:
+                return path
+            for (nxt, u, _un) in adj[cur]:
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                q.append((nxt, path + [int(u)]))
+        return None
+
     def select(self, s, goal=None, exclude_unc=True):
         """选一个 option: 优先「起点匹配 + 目标最接近 goal + 成功率高」。
 
