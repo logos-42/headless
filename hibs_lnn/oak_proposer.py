@@ -46,7 +46,8 @@ class OAKProposer:
                  mu=0.05, alpha0=0.2, explore_w=0.5, algo="autostep",
                  n_know=0, use_options=True, use_gate=True,
                  n_models=5, refresh_every=4, min_transitions=40,
-                 n_regions=4, max_opt_len=3, opt_frac=1.0):
+                 n_regions=4, max_opt_len=3, opt_frac=1.0,
+                 opt_mode="fixed", term_eps=0.05, stall_tol=0.0):
         from hibs_lnn.rl_proposer import RLProposer
         self.n_fine = int(n_fine)
         self.n = self.n_fine
@@ -64,6 +65,18 @@ class OAKProposer:
         #   若伤害与用量无关, 说明另有来源 (如 discovery 本身在扰动状态)。
         self.opt_frac = float(opt_frac)
         self._opt_round = 0
+        # ★ opt_mode: Option 的**执行方式** (用户 2026-09-14 指导的 K1 矩阵)
+        #   "fixed"              O1  固定动作序列 = open-loop (旧行为, D1 的病灶)
+        #   "goal"               O2  目标条件 + **每步重算动作** (闭环)
+        #   "goal_term"          O3  O2 + 自适应终止 β_o(s)
+        #   "goal_term_override" O4  O3 + 不确定性抢占 (Option 从属于当前证据)
+        self.opt_mode = str(opt_mode)
+        self.term_eps = float(term_eps)
+        self.stall_tol = float(stall_tol)
+        self._opt_stall_d = None
+        self.override_count = 0
+        self.term_reasons = {}
+        self.replan_steps = 0
 
         # Level 3: 复用已验证的 RL 提议器
         self.base = RLProposer(fine_desc, tau=tau, k=k, mu=mu, alpha0=alpha0,
@@ -123,7 +136,37 @@ class OAKProposer:
     # ── 动作选择 ───────────────────────────────────────────────────
     def act(self):
         # ① option 在执行中
-        if self.use_options and self._opt_queue:
+        if self.use_options and self._opt_active is not None and self.opt_mode != "fixed":
+            o = self._opt_active
+            s_now = self._prev_state
+            if s_now is None:
+                self._opt_active = None
+            else:
+                _, unc_a = self.know.predict(s_now, int(o.actions[0]))
+                tau = self.know.uncertainty.tau_U
+                if self.opt_mode == "goal_term_override":
+                    if (not np.isfinite(unc_a)) or (tau and unc_a >= tau):
+                        self.override_count += 1
+                        self.term_reasons["override"] = self.term_reasons.get("override", 0) + 1
+                        self._opt_active = None
+                        return list(self.base.act())
+                if self.opt_mode in ("goal_term", "goal_term_override"):
+                    done, why = o.terminated(
+                        s_now, unc=unc_a, eps=self.term_eps,
+                        tau_U=(tau if self.opt_mode == "goal_term_override" else None),
+                        stall=self.stall_tol)
+                    if done:
+                        self.term_reasons[why] = self.term_reasons.get(why, 0) + 1
+                        self._opt_active = None
+                        return list(self.base.act())
+                a = self._goal_action(o)
+                if a is None:
+                    self._opt_active = None
+                else:
+                    self.replan_steps += 1
+                    self.option_steps += 1
+                    return [int(a)]
+        if self.use_options and self._opt_queue and self.opt_mode == "fixed":
             a = int(self._opt_queue.pop(0))
             self.option_steps += 1
             if not self._opt_queue:
@@ -169,8 +212,44 @@ class OAKProposer:
                 #   只被用了一半, option_steps 实测只有 1~2 步。
                 self._opt_queue = [int(x) for x in o.actions[1:]]
                 self.option_starts += 1
-                return [int(o.actions[0])]
+                if self.opt_mode == "fixed":
+                    self._opt_queue = [int(x) for x in o.actions[1:]]
+                    return [int(o.actions[0])]
+                a = self._goal_action(o)          # 闭环: 立刻按当前状态算
+                if a is None:
+                    self._opt_active = None
+                    return pick
+                self.replan_steps += 1
+                self.option_steps += 1
+                return [int(a)]
         return pick
+
+    def _goal_action(self, opt):
+        """π_o(s_t) —— **按当前状态重算**动作, 而不是回放固定序列。
+
+            a = argmax_a [ ‖g−s‖ − ‖g−T(s,a)‖ ]
+        即"哪一步动作让我朝子目标前进最多"。
+
+        ★ 用户指出的核心修正: **抽象的是目标, 不是动作**。
+          固定序列执行 = "我发现了一段过去有效的脚本, 现在重放它",
+          状态变化不再触发动作重算 -> 适应性下降 (D1 实测 r=-0.80)。
+        """
+        s_now = self._prev_state
+        g = np.asarray(opt.goal_center, dtype=float)
+        d_now = float(np.linalg.norm(np.asarray(s_now, dtype=float) - g))
+        best_a, best_gain = None, -np.inf
+        for a in range(self.n_fine):
+            if self.use_gate:
+                ok, _ = self.know.uncertainty.allow(s_now, a, self.know.coverage.n)
+                if not ok:
+                    continue
+            s_next, unc = self.know.predict(s_now, a)
+            if not np.isfinite(unc):
+                continue
+            gain = d_now - float(np.linalg.norm(np.asarray(s_next, dtype=float) - g))
+            if gain > best_gain:
+                best_a, best_gain = a, gain
+        return best_a
 
     # ── 奖励 → 参数更新 (+ 知识维护) ────────────────────────────────
     def observe(self, pick, acc, any_time):
@@ -224,6 +303,10 @@ class OAKProposer:
             s.update({"n_trans": len(self.trans), "refreshes": 0, "n_options": 0,
                       "option_steps": self.option_steps,
             "opt_frac": self.opt_frac,
+            "opt_mode": self.opt_mode,
+            "replan_steps": self.replan_steps,
+            "override_count": self.override_count,
+            "term_reasons": dict(self.term_reasons),
             "option_starts": self.option_starts, "untrusted_picks": self.untrusted_picks,
                       "coverage_total": 0, "tau_U": None, "gvf_steps": [], "alpha_std": 0.0})
             return s
@@ -233,6 +316,11 @@ class OAKProposer:
             "n_options": len(self.know.skills()),
             "option_steps": self.option_steps,
             "option_starts": self.option_starts,
+            "opt_frac": self.opt_frac,
+            "opt_mode": self.opt_mode,
+            "replan_steps": self.replan_steps,
+            "override_count": self.override_count,
+            "term_reasons": dict(self.term_reasons),
             "untrusted_picks": self.untrusted_picks,
             "coverage_total": int(self.know.coverage.n_total),
             "tau_U": self.know.uncertainty.tau_U,

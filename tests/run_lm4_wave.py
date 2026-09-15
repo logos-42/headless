@@ -546,7 +546,8 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    rl_know=0, schedule_str="",
                    lam=(1.0, 1.0, 1.0, 1.0), proposer_k=1, proposer_sigma=0.0,
                    oak_options=1, oak_gate=1, oak_refresh=4,
-                    shift_at=0, shift_every=0, opt_frac=1.0):
+                    shift_at=0, shift_every=0, opt_frac=1.0,
+                    opt_mode="fixed", term_eps=0.05, stall_tol=0.0):
     """cl_method:
       naive/replay — 单循环 (线性头), 原行为
       oml          — 快慢双循环 (lm3 `oml`): 内循环每步更新头, 外循环低频更新 RLN
@@ -653,7 +654,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                               mu=rl_mu, alpha0=rl_alpha0, explore_w=rl_explore_w,
                               algo=rl_algo, n_know=int(rl_know),
                               use_options=bool(oak_options), use_gate=bool(oak_gate),
-                              refresh_every=oak_refresh, opt_frac=opt_frac)
+                              refresh_every=oak_refresh, opt_frac=opt_frac,
+                              opt_mode=opt_mode, term_eps=term_eps,
+                              stall_tol=stall_tol)
         print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s refresh=%d"
               % (oakprop.n_fine, oak_options, oak_gate, rl_algo, oak_refresh), flush=True)
 
@@ -1203,6 +1206,13 @@ def main():
                     help="步长自适应算法。idbd=RMS归一化版; idbd-raw=官方无归一化"
                          "(真实回路分化最好 0.2357); autostep=Mahmood2012; "
                          "cidbd=Continual-IDBD(逐分量EMA归一化+recovery)")
+    ap.add_argument("--opt-mode", default="fixed",
+                    choices=["fixed", "goal", "goal_term", "goal_term_override"],
+                    help="Option 执行方式 (用户 K1 矩阵): fixed=O1 固定序列(open-loop); "
+                         "goal=O2 目标条件+每步重算(闭环); goal_term=O3 +自适应终止; "
+                         "goal_term_override=O4 +不确定性抢占")
+    ap.add_argument("--term-eps", type=float, default=0.05, help="β_o 目标达成阈值")
+    ap.add_argument("--stall-tol", type=float, default=0.0, help="β_o 停滞阈值 (0=关)")
     ap.add_argument("--opt-frac", type=float, default=1.0,
                     help="诊断: 只在一部分轮次启用 option (1.0=每轮都可用)")
     ap.add_argument("--shift-at", type=int, default=0,
@@ -1418,6 +1428,9 @@ def main():
                                  oak_gate=args.oak_gate,
                                  oak_refresh=args.oak_refresh,
                                  opt_frac=args.opt_frac,
+                                 opt_mode=args.opt_mode,
+                                 term_eps=args.term_eps,
+                                 stall_tol=args.stall_tol,
                                  shift_at=args.shift_at,
                                  shift_every=args.shift_every,
                                  stream=args.stream, rounds=args.rounds,
@@ -1436,8 +1449,15 @@ def main():
                 % (args.oak_options, _oak_st.get("use_options")))
             assert bool(_oak_st.get("use_gate")) == bool(args.oak_gate), (
                 "oak_gate 未传到 run_experiment")
-            print("[verify] oak 配置回读 OK: options=%s gate=%s n_trans=%s options_found=%s"
+            _ps = (extra or {}).get("proposer_stats") or {}
+            assert str(_ps.get("opt_mode")) == str(args.opt_mode), (
+                "opt_mode 未传到 run_experiment: 期望 %s 实得 %s"
+                % (args.opt_mode, _ps.get("opt_mode")))
+            print("[verify] oak 配置回读 OK: options=%s gate=%s mode=%s "
+                  "replan=%s term=%s n_trans=%s options_found=%s"
                   % (_oak_st.get("use_options"), _oak_st.get("use_gate"),
+                     _ps.get("opt_mode"), _ps.get("replan_steps"),
+                     _ps.get("term_reasons"),
                      _oak_st.get("n_trans"),
                      ((extra or {}).get("knowledge") or {}).get("n_options")), flush=True)
         s = summarize(M, doms)

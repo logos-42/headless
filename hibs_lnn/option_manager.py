@@ -79,6 +79,35 @@ class Option:
     def should_terminate(self, s, unc=0.0, thresh=0.5):
         return self.beta_prob(s, unc) >= thresh
 
+    # ── ★ 闭环保守派接口 (用户 2026-09-14 指导) ──────────────────────
+    def goal_distance(self, s):
+        """到子目标的距离 —— 这是 β_o 与 π_o 共用的量。"""
+        return float(np.linalg.norm(np.asarray(s, dtype=float) - self.goal_center))
+
+    def terminated(self, s, unc=0.0, eps=0.05, tau_U=None, stall=0.0):
+        """自适应终止 β_o(s): 任一条件命中即退出。
+
+            β_o(s) = 1  若  ① 目标达成  ||s - g|| < eps
+                            ② 不确定性过高 U_T > tau_U   (风险升高)
+                            ③ 停滞       本轮进展 < stall
+            β_o(s) = 0  否则
+
+        ★ 固定长度执行是 open-loop 的病根: "即使当前情况已经不适合这个 option,
+          它可能还在继续执行"。这里让 option **每步都可以退出**。
+        """
+        if self.goal_distance(s) < eps:
+            return True, "goal_reached"
+        if tau_U is not None and np.isfinite(unc) and unc > tau_U:
+            return True, "high_uncertainty"
+        if stall > 0 and getattr(self, "_last_d", None) is not None:
+            if self._last_d - self.goal_distance(s) < stall:
+                return True, "stalled"
+        return False, ""
+
+    def progress(self, s_from, s_to):
+        """朝目标前进多少 (正 = 更近)。"""
+        return self.goal_distance(s_from) - self.goal_distance(s_to)
+
     def stats(self):
         rate = (self.success / self.visits) if self.visits else 0.0
         # ★ 必须暴露 actions: 多步**动作序列**正是 option 的全部意义
