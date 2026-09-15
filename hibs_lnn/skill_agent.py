@@ -134,15 +134,59 @@ class SkillAgent:
         self.n_discover += 1
 
     def _option_action(self, s):
-        """按 option 出动作 (闭环: π_o 用世界模型算, 或退回动作序列)。"""
+        """按 option 出动作 —— **必须尊重启动集 I_o**。
+
+        ★ 原来的写法是「从技能库里**均匀随机**挑一个 option, 取它的第一个动作」。
+          这既不看 `I_o`(启动集), 也不管目标是否相关, 等于往动作里注入
+          一半的噪声。实测后果 (KeyDoor B 矩阵):
+            技能库涨到 54~60 个后, rediscover 在全部 6 段上都差于 primitive,
+            其中两段**永不收敛** (T_adapt = 上限 300)。
+
+          正确做法 (用户给的 `Option=(I_o,g_o,π_o,β_o)`):
+            用 `OptionManager.select(s, goal=...)` —— 它**会**检查 `initiable(s)`,
+            也就是"当前状态是否落在该 option 的启动集里"。这才是 `I_o` 的语义。
+        """
         if self.om is None or not self.om.options:
             return None
         v = self.mdp.vec()
-        o = self.om.options[int(self.rng.randint(0, len(self.om.options)))]
+        # goal = 当前 regime 的最优终态 (只作为"朝哪走"的先验; 不参与选 option)
+        goal_vec = None
+        try:
+            key_pos, door_pos, goal_pos = self.mdp.regime
+            gv = np.zeros_like(v)
+            gv[goal_pos] = 1.0
+            gv[self.mdp.n_pos] = 1.0      # has_key = 1
+            gv[self.mdp.n_pos + 1] = 1.0  # door_open = 1
+            goal_vec = gv
+        except Exception:
+            pass
+        o = self.om.select(v, goal=goal_vec, exclude_unc=True)
+        if o is None:
+            return None          # 没有可启动的技能 -> 交回 Q (这才是正确的退让)
         acts = [int(x) for x in o.actions]
         if not acts:
             return None
-        return acts[0]
+        # 闭环: 用世界模型算"朝该 option 目标前进最多"的动作; 失败则退回动作序列
+        a = None
+        if self.om.T is not None:
+            a = self._goal_action(v, o.goal_center)
+        if a is None:
+            a = acts[0]
+        return int(a)
+
+    def _goal_action(self, v, g):
+        """π_o(s) = argmax_a [ ‖g−s‖ − ‖g−T(s,a)‖ ], 每步重算。"""
+        g = np.asarray(g, dtype=float)
+        d_now = float(np.linalg.norm(v - g))
+        best_a, best_gain = None, -np.inf
+        for a in range(N_ACT):
+            sn, unc = self.om.T.predict(v, a)
+            if not np.isfinite(unc):
+                continue
+            gain = d_now - float(np.linalg.norm(np.asarray(sn, dtype=float) - g))
+            if gain > best_gain:
+                best_a, best_gain = a, gain
+        return best_a
 
     # ── 一个 episode ────────────────────────────────────────────────
     def run_episode(self):

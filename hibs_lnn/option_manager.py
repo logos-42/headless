@@ -128,6 +128,8 @@ class OptionManager:
         self.T = ensemble
         self.gate = gate
         self.max_len = int(max_len)
+        # 启动集半径: 由 discover 按区域尺度自适应推断
+        self.init_radius = 0.75
         self.min_edges = int(min_edges)
         self.options = []
         self.regions = None          # region 中心
@@ -192,6 +194,11 @@ class OptionManager:
         self.options = list(best.values())
         for i, o in enumerate(self.options):
             o.oid = i
+        # 自适应启动集半径: 最近邻区域距离中位数的 0.75 倍 (与状态空间尺度匹配)
+        if len(self.regions) > 1:
+            _D = np.linalg.norm(self.regions[:, None, :] - self.regions[None, :, :], axis=-1)
+            np.fill_diagonal(_D, np.inf)
+            self.init_radius = float(max(0.5, np.median(_D.min(axis=1)) * 0.75))
         return self.options
 
     def _reliable_paths(self, r0, L, tau_U):
@@ -335,6 +342,11 @@ class OptionManager:
                     break
             if oid >= 40:
                 break
+        # 自适应启动集半径: 最近邻区域距离中位数的 0.75 倍 (与状态空间尺度匹配)
+        if len(self.regions) > 1:
+            _D = np.linalg.norm(self.regions[:, None, :] - self.regions[None, :, :], axis=-1)
+            np.fill_diagonal(_D, np.inf)
+            self.init_radius = float(max(0.5, np.median(_D.min(axis=1)) * 0.75))
         return self.options
 
     @staticmethod
@@ -356,16 +368,25 @@ class OptionManager:
                 q.append((nxt, path + [int(u)]))
         return None
 
-    def select(self, s, goal=None, exclude_unc=True):
+    def select(self, s, goal=None, exclude_unc=True, radius=None):
         """选一个 option: 优先「起点匹配 + 目标最接近 goal + 成功率高」。
 
         goal=None 时选成功率高且不确定性低的那个。
         """
         cands = []
+        # ★ 半径必须与状态空间尺度匹配。one-hot 状态空间里**两个不同状态**的
+        #   L2 距离是 √2 ≈ 1.41, 固定 0.75 会让启动集几乎永不满足
+        #   (实测: 主回路里 option 一次都没被选用, primitive 与 option 臂
+        #    给出**逐位相同**的数字)。
+        _r = radius if radius is not None else self.init_radius
         for o in self.options:
-            if not o.initiable(s, radius=0.75):
+            if not o.initiable(s, radius=_r):
                 continue
-            if exclude_unc and o.uncs and max(o.uncs) >= getattr(self, "tau_U", np.inf):
+            # ★ 同 _reliable_paths 的坑: 用 `>` 而不是 `>=`。
+            #   确定性模型下 tau_U=0 且 uncs=[0.0], `>=` 会把**全部** option
+            #   过滤掉 -> 主回路里 option 一次都没被选用 -> primitive 与 option 臂
+            #   给出逐位相同的数字。
+            if exclude_unc and o.uncs and max(o.uncs) > getattr(self, "tau_U", np.inf) + 1e-12:
                 continue
             rate = (o.success / o.visits) if o.visits else 0.5     # 先验乐观
             score = rate - (float(np.mean(o.uncs)) if o.uncs else 0.0)
