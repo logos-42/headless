@@ -78,6 +78,12 @@ class OAKProposer:
         self.override_count = 0
         self.term_reasons = {}
         self.replan_steps = 0
+        # ★ option 有效期。原实现一旦启动就**永不重选** (实测: 1 个 option
+        #   连跑 105 步 = 训练全程的 87%)。那不是 option, 是"锁死"。
+        #   正确语义: option 是**有名义长度的技能**, 跑完它的长度就结束,
+        #   由外层重新评估该用哪个技能 (或交回 base policy)。
+        self._opt_age = 0
+        self._opt_max_age = int(max_opt_len)
         # ★ 世界模型 (实测: 线性 ridge 表达不了结构化动力学 —— 在 KeyDoor 这类
         #   离散/条件性动力学上四个动作预测到**同一个**下一状态, 转移图退化成
         #   几乎无边, option 发现为 0。计数式表格模型修掉了这个。)
@@ -97,6 +103,7 @@ class OAKProposer:
         self._know_cfg = dict(n_models=n_models, seed=seed, alpha0=alpha0, mu=mu)
         self.know = None
         self.dim_state = None
+        self._state_scale = 0.0
 
         # 转移日志: (state_t, action, state_{t+1})
         self.trans = []
@@ -129,6 +136,11 @@ class OAKProposer:
     def set_state(self, state):
         """每轮训练后由主回路喂入**新**能力画像。"""
         st = np.asarray(state, dtype=float)
+        # 状态尺度 = 相邻两轮状态变化的典型幅度 (用于自适应阈值)
+        if getattr(self, "_prev_state", None) is not None:
+            _d = float(np.linalg.norm(st - np.asarray(self._prev_state, dtype=float)))
+            _a = getattr(self, "_state_scale", 0.0)
+            self._state_scale = _d if _a == 0.0 else 0.9 * _a + 0.1 * _d
         self._ensure_know(st.shape[0])
         if self._prev_state is not None and self._prev_pick is not None:
             for a in (self._prev_pick if isinstance(self._prev_pick, (list, tuple))
@@ -160,9 +172,16 @@ class OAKProposer:
                         self.term_reasons["override"] = self.term_reasons.get("override", 0) + 1
                         self._opt_active = None
                         return list(self.base.act())
+                # ★ 有效期检查 (对**所有**闭环模式生效)
+                self._opt_age += 1
+                if self._opt_age > self._opt_max_age:
+                    self.term_reasons["expired"] = self.term_reasons.get("expired", 0) + 1
+                    self._opt_active = None
+                    self._opt_age = 0
+                    return list(self.base.act())
                 if self.opt_mode in ("goal_term", "goal_term_override"):
                     done, why = o.terminated(
-                        s_now, unc=unc_a, eps=self.term_eps,
+                        s_now, unc=unc_a, eps=self._eps_eff(),
                         tau_U=(tau if self.opt_mode == "goal_term_override" else None),
                         stall=self.stall_tol)
                     if done:
@@ -233,6 +252,16 @@ class OAKProposer:
                 self.option_steps += 1
                 return [int(a)]
         return pick
+
+    def _eps_eff(self):
+        """目标达成阈值 —— **必须与状态空间尺度匹配**。
+
+        原实现固定 term_eps=0.05 (给"距离"用的量级), 但状态是**准确率向量**,
+        单步变化就有 0.1~0.5 -> ‖s−g‖ < 0.05 几乎不可能 -> β_o 永不触发
+        -> `goal_term` 与 `goal` 给出**逐位相同**的结果 (实测: term={}).
+        """
+        sc = getattr(self, "_state_scale", 0.0)
+        return max(0.05, 0.25 * sc) if sc > 0 else 0.05
 
     def _goal_action(self, opt):
         """π_o(s_t) —— **按当前状态重算**动作, 而不是回放固定序列。
@@ -324,6 +353,8 @@ class OAKProposer:
             "dyn_model": self.dyn_model_kind,
             "use_subgoals": self.use_subgoals,
             "replan_steps": self.replan_steps,
+            "state_scale": float(getattr(self, "_state_scale", 0.0)),
+            "eps_eff": float(self._eps_eff()),
             "override_count": self.override_count,
             "term_reasons": dict(self.term_reasons),
             "option_starts": self.option_starts, "untrusted_picks": self.untrusted_picks,
