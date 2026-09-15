@@ -48,10 +48,16 @@ class QLearner:
     """表格 Q-learning (跨 regime 保留 Q 表 —— 这是"记忆"基线)。"""
 
     def __init__(self, n_states, n_act=N_ACT, lr=0.2, gamma=0.95,
-                 eps=0.25, seed=0):
-        self.Q = np.zeros((n_states, n_act))
+                 eps=0.15, seed=0, q_init=1.0):
+        # ★ **乐观初始化** —— 稀疏奖励下这是必需的, 不是调参技巧。
+        #   若 Q 全为 0, `argmax` 恒返回动作 0, agent 会**一直做同一个动作**
+        #   (实测: 在 KeyDoor 上一直 left, 卡在 pos 0), 只有 ε-随机步才动,
+        #   于是几乎永远到不了目标 -> 600 回合成功率仍为 0.00。
+        #   初值取正 (q_init=+1) 使每个 (s,a) 都先被尝一次, 由更新把它拉回真值。
+        self.Q = np.full((n_states, n_act), float(q_init))
         self.n_states, self.n_act = n_states, n_act
         self.lr, self.gamma, self.eps = lr, gamma, eps
+        self.q_init = float(q_init)
         self.rng = np.random.RandomState(seed)
 
     def act(self, s):

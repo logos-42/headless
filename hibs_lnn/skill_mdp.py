@@ -54,16 +54,22 @@ class KeyDoorMDP:
         self.n_pos = int(n_pos)
         self.regime = (int(key_pos), int(door_pos), int(goal_pos))
         self.horizon = int(horizon)
-        self.n_states = self.n_pos * 2
+        # ★ state 必须包含 door_open! 它影响转移(开门后目标才可达)。
+        #   早先编码 pos*2+has_key **漏掉了 door_open** -> 同一 (pos,has_key)
+        #   在门开/门关时无法区分 -> 任务退化成 POMDP -> Q-learning 学不会
+        #   (实测: 400 回合成功率仍为 0.0)。
+        #   现在: pos*4 + has_key*2 + door_open  -> n_pos*4 个状态
+        self.n_states = self.n_pos * 4
         self.t = 0
         self.pos, self.has_key, self.door_open = 0, 0, 0
 
     # ── 状态编码 ────────────────────────────────────────────────────
     def state(self):
-        return self.pos * 2 + self.has_key
+        return self.pos * 4 + self.has_key * 2 + self.door_open
 
     def decode(self, s):
-        return int(s) // 2, int(s) % 2
+        s = int(s)
+        return s // 4, (s // 2) % 2, s % 2     # pos, has_key, door_open
 
     def vec(self):
         """给知识层用的连续表示: one-hot(pos) ⊕ has_key ⊕ door_open。"""
