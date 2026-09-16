@@ -78,6 +78,10 @@ class OAKProposer:
         self.override_count = 0
         self.term_reasons = {}
         self.replan_steps = 0
+        self.gate_blocked = 0        # _goal_action 因门控全拒返回 None
+        self.no_finite_unc = 0       # _goal_action 因无有限不确定性返回 None
+        self.goal_none = 0           # _goal_action 返回 None 总次数
+        self.start_blocked = 0       # 起 option 时算不出动作 (静默空转) 的次数
         # ★ option 有效期。原实现一旦启动就**永不重选** (实测: 1 个 option
         #   连跑 105 步 = 训练全程的 87%)。那不是 option, 是"锁死"。
         #   正确语义: option 是**有名义长度的技能**, 跑完它的长度就结束,
@@ -240,14 +244,19 @@ class OAKProposer:
                 #   已经执行过了", 于是只排队 actions[1:] —— 结果 option 的语义
                 #   只被用了一半, option_steps 实测只有 1~2 步。
                 self._opt_queue = [int(x) for x in o.actions[1:]]
-                self.option_starts += 1
                 if self.opt_mode == "fixed":
                     self._opt_queue = [int(x) for x in o.actions[1:]]
+                    self.option_starts += 1
                     return [int(o.actions[0])]
                 a = self._goal_action(o)          # 闭环: 立刻按当前状态算
                 if a is None:
+                    # ★ 计数诚实性: 算不出动作的 option **不算启动**。
+                    #   早先实现先 `option_starts += 1` 再判断, 于是"启动了 N 次但 0 步执行"
+                    #   看起来像机制在跑, 实际是 inert -> 一个**静默的空转实验**。
                     self._opt_active = None
+                    self.start_blocked += 1
                     return pick
+                self.option_starts += 1
                 self.replan_steps += 1
                 self.option_steps += 1
                 return [int(a)]
@@ -277,17 +286,27 @@ class OAKProposer:
         g = np.asarray(opt.goal_center, dtype=float)
         d_now = float(np.linalg.norm(np.asarray(s_now, dtype=float) - g))
         best_a, best_gain = None, -np.inf
+        n_gate_rej = 0
+        n_unc_bad = 0
         for a in range(self.n_fine):
             if self.use_gate:
                 ok, _ = self.know.uncertainty.allow(s_now, a, self.know.coverage.n)
                 if not ok:
+                    n_gate_rej += 1
                     continue
             s_next, unc = self.know.predict(s_now, a)
             if not np.isfinite(unc):
+                n_unc_bad += 1
                 continue
             gain = d_now - float(np.linalg.norm(np.asarray(s_next, dtype=float) - g))
             if gain > best_gain:
                 best_a, best_gain = a, gain
+        if best_a is None:
+            self.goal_none += 1
+            if n_gate_rej == self.n_fine:
+                self.gate_blocked += 1
+            elif n_unc_bad > 0:
+                self.no_finite_unc += 1
         return best_a
 
     # ── 奖励 → 参数更新 (+ 知识维护) ────────────────────────────────
@@ -296,6 +315,19 @@ class OAKProposer:
 
     def update(self, pick):
         self.base.update(pick)
+        # ★★ 必须在这里把**实际执行的动作**记进 coverage。
+        #    实测抓到的 bug(第 4 次同型): `InternalKnowledge.observe_action()` 是
+        #    coverage 的**唯一写入点**, 但主回路从来没调过它 -> `coverage.n` 永远全零
+        #    -> `UncertaintyGate.allow()` 对**所有**动作返回 False
+        #    (因为 `0 <= tau_C=1.0`) -> `_goal_action()` 的每一个候选都被 continue 掉
+        #    -> `best_a = None` -> 回落到 base -> 轨迹与 E9 **逐位相同**
+        #    (实测证据: goal/goal_term/override 三档的 alpha 与 e9 完全相同,
+        #     `option_starts > 0` 但 `option_steps == 0`)。
+        if self.know is not None:
+            _pick = pick if isinstance(pick, (list, tuple)) else [pick]
+            for _a in _pick:
+                if int(_a) >= 0:
+                    self.know.observe_action(int(_a))
         # 预测知识: cumulant = 各区间能力本身 (GVF 学"能力会怎么走")
         if self.know is not None and self._prev_state is not None:
             phi = self._prev_state
@@ -372,6 +404,9 @@ class OAKProposer:
             "use_subgoals": self.use_subgoals,
             "replan_steps": self.replan_steps,
             "override_count": self.override_count,
+            "gate_blocked": self.gate_blocked, "no_finite_unc": self.no_finite_unc,
+            "start_blocked": self.start_blocked,
+            "goal_none": self.goal_none,
             "term_reasons": dict(self.term_reasons),
             "untrusted_picks": self.untrusted_picks,
             "coverage_total": int(self.know.coverage.n_total),
