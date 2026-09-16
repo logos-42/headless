@@ -202,3 +202,38 @@ status: current
 3. **排除一个假说后必须继续找真因** —— 容量扫描否定容量假说后停手，错过了真因是 BN
 4. **架构结论不跨模态迁移** —— 应做按模态分派，每模态各自验证
 5. **训练预算是头等变量** —— 10× 步数把 wave 从 0.346 拉到 0.5256（CV 6.7%），在宣布「任务不可学」前先乘预算
+
+## OaK / Options 方向的口径修正（2026-09-16，重要）
+
+**「Options 在 lm4 上显著有害」这个结论已作废** —— 它是**十重复合**的产物，没有一条指向「option 有没有价值」：
+
+| # | 混杂 | 证据 |
+|:--|:--|:--|
+| ① | 实现了论文实测**最差**的那类 option | `discover_subgoals` 用介数中心性找 bottleneck = 论文点名的 `shortest path options based on bottleneck states`；论文 Fig.1 实测其 planning **比 primitive 还慢** |
+| ② | option 形式错 | 正确形式 `o=(π_o, β_o)` **不含目标**（论文脚注 elide 掉 initiation set）；目标属于 subtask，以 **stopping value `z_i(s)`** 承载 |
+| ③ | 缺 subtask 层 | 论文：所有发现方法的差别**只在 GVF 的 `(c, z)`**；本项目 `GVFBank` 与发现**无接线** |
+| ④ | `π_o` 不是学出来的 | 对模型贪心 argmax，无 option 价值函数，无 off-policy 学习(UWT) |
+| ⑤ | **option model 不参与 planning** | option 的价值正是「让 planning 更高效」→ **按构造不可能体现收益** |
+| ⑥ | 度量错 | 论文用 planning look-ahead 操作数；本项目用稳态 any-time acc |
+| ⑦ | 缺 Step 11 utility feedback/删除 | OaK 与 Prototype-AI II 的**唯一区别**就是这套删改反馈；本项目决定「Option 不删」 |
+| ⑧ | 跳过 Step 8 | 论文里 option 是第 10 步，前面应先有「无时间抽象的 one-step model-based agent」 |
+| ⑨ | 时间抽象被掐死 | `max_opt_len=3`；论文里 option 跑 11–17 步 |
+| ⑩ | 基准无结构 | lm4 `A ≡ 0` → 任何类别的 option 都无收益 |
+
+**Ground truth 已建立并复现论文两个方向**（`tests/benchmark_oak_repro.py`）：
+
+```
+只用 primitive              1716 look-ahead ops   (基线)
++ shortest-path option      2145   ratio 1.250  更慢 ✓ 与论文一致
++ reward-respecting option   195   ratio 0.114  快 8.8x ✓ 与论文一致
+w̄ 扫描: 1 -> 195 ; 10/100 -> 2145 (退化成 shortest-path ✓ 论文 §6)
+```
+
+**修复**：诊断文档 `docs/oak_diagnosis_from_papers.md`、结果 `docs/oak_repro_ground_truth.md`；
+代码 `hibs_lnn/gridworld.py`、`hibs_lnn/subtask_options.py`。
+本轮另修掉**四个真 bug**（三个在 ground truth 里暴露，一个在主回路）：
+stopping value 恒等于主任务价值 / planner 只贴现一步致 value iteration 发散 /
+goal 非吸收态致价值爆炸 / **coverage 的唯一写入点 `observe_action()` 主回路从未调用**（致闭环 option 静默空转、轨迹与 E9 逐位相同）。
+
+**下一步按论文顺序，不跳步**：补 subtask 层 → option model 进 planner → off-policy 学 `π_o` → utility feedback → 才回到 lm4/lm5（且须先给它们造出有价值结构的状态空间）。
+
