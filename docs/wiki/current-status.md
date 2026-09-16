@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-09-14
+last_confirmed: 2026-09-16
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,14 @@ status: current
 ---
 
 ## 最近更新
+
+- 2026-09-16：**BM 修正版结算复核 —— 数字逐位复现，结论不变（价值函数仍测不出效应）**
+  - 对活动服务器数据重跑 `tests/analyze_benchmark.py` / `analyze_bm2_full.py`：§1/§2/§3 全部数字**逐位复现**
+    （lm4 `random-matched` 主口径 0.7635 / 0.7542 / 0.7594 与 `results/bm2.log` 逐位相同；日志同时确认候选池 60）
+  - 补全原表遗漏 3 条：LM4 `value` vs `perm` any-time **+4.47 (p=0.012)**、`fixed` vs `perm` replay **+4.74 (p=0.018)**
+    → **所有显著的对比指向的都是「在线调度 > 预先定死的任务流」，没有一条指向价值函数**
+  - 核心两问仍不显著：① `value` vs `random-matched` ② `value` vs `value-nofb`（lm5 逐位相同，λ_fb ≈ 死项）
+  - 详见 `docs/bm_benchmark_results.md` §0/§3
 
 - 2026-09-14：**OaK 正式对照结果 —— Options 显著有害（诚实负面结论，80 臂双 GPU）**
   - **E9 vs E10 唯一变量是时间抽象**：lm4 any_time **−1.6%（t=−5.02, p<0.0001）**、最终 acc **−3.7%**
