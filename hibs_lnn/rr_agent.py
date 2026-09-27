@@ -59,7 +59,8 @@ class RRSkillAgent(SkillAgent):
                  rr_score="rate", rr_pot="learned",
                  rr_calib_min_adv=0.0, rr_retire_rule="internal",
                  rr_calib_min_advq=0.0, rr_forgive_p=0.0,
-                 rr_lr_v=0.2, **kw):
+                 rr_lr_v=0.2, rr_starve_steps=None, rr_unk_p=0.5,
+                 rr_three_state=False, **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -198,6 +199,27 @@ class RRSkillAgent(SkillAgent):
         # ★ "犯错是可以原谅的" = **退休可逆**。被判坏的 option 以 p 的概率被重新检验;
         #   若其统计量恢复(它用的是同一批阈值判据), 下次 `rr_broken` 自然不再点名它。
         self.rr_forgive_p = float(rr_forgive_p)
+        # ══ 三态 epistemic state(好 / 坏 / 未知)══════════════════════════════
+        #  ★ 为什么必须有: 实测发现, `advq == 0` 在两种完全不同的情况下出现 ——
+        #      (a) 证据充分且真的没有显著差异  -> 好
+        #      (b) **奖励流为空, Φ 学不到东西**(harm 故障下整臂全灭时
+        #          `Q_adv ≡ 0.0000` 精确零, 因为账压根没记)  -> **未知**
+        #    把 (b) 读成"不坏", 就是**自欺**。系统的最大缺口不是精度, 是它
+        #    分不清这两种零。所以"未知"必须是一等状态, 不能被 0 顶上。
+        #
+        #  "奖励流为空"的在线判据: 连续多少步没有拿到任何正奖励。
+        #  默认 3×horizon = "连着三个回合一分没拿" -> 势函数不可能在学东西。
+        self.rr_starve_steps = (int(rr_starve_steps) if rr_starve_steps
+                                else 3 * int(getattr(mdp, "horizon", 30)))
+        self.rr_since_rew = 0        # 距上次拿到正奖励的步数
+        self.rr_starve_ever = 0      # 曾经进入"奖励流为空"的次数(诊断)
+        self.rr_unk_p = float(rr_unk_p)   # "未知"状态的探索概率(有限度探索)
+        # ★ 三态开关。默认 **False** = 旧行为逐位不变(向后兼容 + 它本身是
+        #   一条消融轴: "把未知提升为一等状态, 到底改变了什么?")。
+        #   True 时启用三件事: 缓存为空 -> 退回基元层; 未知 -> 有限度探索;
+        #   未知 -> 永不算坏。
+        self.rr_three_state = bool(rr_three_state)
+        self._rr_prev_state = {}     # option -> 上次判定(用来数退休/恢复次数)
 
     # ── 技能库(每个 regime 重建一次 —— 目标随 regime 移动) ──────────
     def _rr_ensure(self):
@@ -299,6 +321,12 @@ class RRSkillAgent(SkillAgent):
                     best, best_g = st, g
             return best
         if rule == "calibrated":
+            # ★ 奖励流为空 -> **退回安全基元策略**。这不是放弃, 是承认"现在
+            #   什么都判不了": Φ 学不到东西, 任何判断都是自欺。等主任务拿到
+            #   奖励、Φ 重新有内容, 再回来判。
+            if self.rr_three_state and self.rr_starved():
+                self.rr_stats["starved_sel"] = self.rr_stats.get("starved_sel", 0) + 1
+                return None
             broken = self.rr_broken()
             live = [st for st in cand if getattr(st, "name", None) not in broken]
             # ★★ **原谅**(`rr_forgive_p`)—— "犯错是可以原谅的"的机制含义:
@@ -314,6 +342,18 @@ class RRSkillAgent(SkillAgent):
                 return dea[int(self.rng.randint(len(dea)))]
             if not live:                      # 全坏了 -> 退回基元层(诚实行为)
                 return None
+            # ★ 三态驱动的选择(leo 契约: "未知应触发有限度探索"):
+            #   未知 -> 以 `rr_unk_p` 的概率**优先挑它** —— 不确定的 option
+            #           得先攒到证据, 才可能从"未知"变成"好/坏"。没有这条,
+            #           它永远停在未知(不被选 -> 没证据 -> 不被选)。
+            #   好   -> 正常 UCB 参与选择。
+            #   坏   -> 只在原谅概率下被重新检验。
+            unk = [st for st in live
+                   if self.rr_epistemic(self.rr_outcome.get(
+                       getattr(st, "name", None), {})) == "unknown"]
+            if unk and self.rr_three_state and self.rng.rand() < self.rr_unk_p:
+                self.rr_stats["unk_probe"] = self.rr_stats.get("unk_probe", 0) + 1
+                return unk[int(self.rng.randint(len(unk)))]
             N = sum(o.get("n_eff", 0.0) for o in self.rr_outcome.values())
             best, best_sc = None, -np.inf      # adv 分数可为负 -> 不能用 -1.0 做初值
             for st in live:
@@ -369,6 +409,9 @@ class RRSkillAgent(SkillAgent):
             #   不是"哪个动作好"。
             self._rr_vstep(s, r, s2, done)
             n += 1
+            # ★ 奖励流监控: "连续多少步一分没拿"。Φ 从奖励流学, 奖励流为空
+            #   时 Φ 恒为初值 —— 此时任何"不坏"的结论都是自欺。
+            self.rr_since_rew = 0 if float(r) > 0 else (self.rr_since_rew + 1)
             self.trans.append((v0, a, self.mdp.vec()))    # (步前, 动作, 步后)
             # ── 结算判据: 全部在**新状态**上评估(正确语义) ──────────
             if active is not None:
@@ -406,6 +449,7 @@ class RRSkillAgent(SkillAgent):
             self._rr_settle(active, o_steps, "horizon_end", o_start, s,
                             r_opt=o_rew, done=True)
         self.episodes += 1
+        self._rr_sync_states()          # 三态判定 + 退休/恢复计数(每回合一次)
         return bool(done and self.mdp._reached()), n
 
     # ── 有效计数(遗忘)──────────────────────────────────────────────
@@ -553,6 +597,63 @@ class RRSkillAgent(SkillAgent):
         v = max(0.0, o.get("advq_sq", 0.0) / n - m * m)
         return float(np.sqrt(v / n))
 
+    # ── 三态 epistemic state ────────────────────────────────────────
+    def rr_starved(self):
+        """奖励流是否为空 —— 势函数不可能在学东西。
+
+        ★ 这是本轮最重要的那个门。实测: harm 故障下整臂全灭时
+        `Q_adv ≡ 0.0000` **精确为零** —— 不是"没有显著差异", 是"根本没记账"
+        (到不了终点 -> 无奖励 -> Φ 恒为 0 -> 证据门 `_rr_has_base` 挡掉一切)。
+        不加这个门, 系统会把"我不知道"读成"没问题" —— **自欺**。
+        """
+        return self.rr_since_rew >= self.rr_starve_steps
+
+    def rr_epistemic(self, o):
+        """**三态判定**: `"good"` / `"bad"` / `"unknown"`。
+
+        与旧 `rr_broken` 的关键区别: **"未知"不是"好"**。
+        旧代码 `advq = 0 -> 不 < 0 -> 不淘汰 -> 当作健康`, 而在奖励流为空时
+        `advq` 恰好是精确的 0 —— 于是"没有证据"被系统性地读成"没问题"。
+
+        判据(与 leo 定的契约一致):
+          未知  —— 奖励流为空 / 势函数未离开初值 / 证据量不足(< min_launches)
+          坏    —— 证据充分, 且**上置信界 < 0**(显著更差)
+          好    —— 证据充分, 且没有显著负向信号
+        """
+        if self.rr_starved():
+            return "unknown"                      # Φ 学不到 -> 无有效预测证据
+        n = o.get("advq_n", 0.0)
+        if n < self.rr_min_launches:
+            return "unknown"                      # 证据不足
+        m = self._rr_advq_of(o)
+        if m + self.rr_ucb_c * self._rr_advq_se(o) < 0.0:
+            return "bad"
+        return "good"
+
+    def rr_epistemic_all(self, names=None):
+        return {k: self.rr_epistemic(o) for k, o in self.rr_outcome.items()
+                if names is None or k in names}
+
+    def _rr_sync_states(self):
+        """把三态判定同步进台账, 并**计数退休/恢复**。
+
+        为什么必须分开记: leo 的契约里 `当前状态` 用于**决策**,
+        `历史状态` 用于**审计** —— 一个 option 被判坏过几次、又恢复过几次,
+        是"持续学习是否真的在发生"的直接证据, 不能被当前状态覆盖掉。
+        """
+        for k, o in self.rr_outcome.items():
+            st = self.rr_epistemic(o)
+            old = self._rr_prev_state.get(k)
+            if old is not None and st != old:
+                if st == "bad":
+                    o["retired_n"] = o.get("retired_n", 0) + 1
+                elif old == "bad":
+                    o["recovered_n"] = o.get("recovered_n", 0) + 1
+            self._rr_prev_state[k] = st
+            o["state"] = st
+        if self.rr_starved():
+            self.rr_starve_ever += 1
+
     def _rr_settle(self, st, steps, reason, s0=None, s1=None,
                    r_opt=0.0, done=False):
         self.rr_stats["terms"][reason] = self.rr_stats["terms"].get(reason, 0) + 1
@@ -640,6 +741,10 @@ class RRSkillAgent(SkillAgent):
             advq_mean = self._rr_advq_of(o)
             bad_q = (o.get("advq_n", 0.0) >= self.rr_min_launches
                      and advq_mean + self.rr_ucb_c * self._rr_advq_se(o) < 0.0)
+            # ★ 三态: "未知"**永远不算坏** —— 证据不足 / 奖励流为空都不处决。
+            #   这是"退休必须保守"的原则: 宁可留着不确定的, 不可错杀。
+            if self.rr_three_state and self.rr_epistemic(o) == "unknown":
+                bad_q = False
             rule = self.rr_retire_rule
             if rule == "none":              # 诊断臂: 只报数, 不淘汰
                 hit = False
@@ -668,17 +773,48 @@ class RRSkillAgent(SkillAgent):
         per = {}
         for k, o in sorted(self.rr_outcome.items()):
             ne = o.get("n_eff", float(o.get("n", 0)))
-            per[k] = {"n": o["n"], "reached": o["reached"],
-                      "n_eff": round(ne, 2),
-                      "rate": round(self._rr_rate(o), 4),
-                      "rate_life": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
-                      "eff": round(self._rr_eff(o), 4),
-                      "adv": round(self._rr_adv(o), 4),
-                      "advq": round(self._rr_advq_of(o), 4),
-                      "mean_steps": round(o["steps"] / o["n"], 2) if o["n"] else 0.0}
+            m = self._rr_advq_of(o)
+            se = self._rr_advq_se(o)
+            per[k] = {
+                # ── 当前判定(用于决策)──────────────────────────────
+                "state": self.rr_epistemic(o),
+                # ── 证据量 ──────────────────────────────────────────
+                "n": o["n"],
+                "n_eff": round(ne, 2),
+                "advq_n": round(o.get("advq_n", 0.0), 2),
+                "no_base": o.get("no_base", 0),   # 有启动但没进比较的次数
+                # ── 近期状态(遗忘加权)─────────────────────────────
+                "rate": round(self._rr_rate(o), 4),
+                "advq": round(m, 4),
+                "advq_se": round(se, 4),
+                "advq_lo": round(m - self.rr_ucb_c * se, 4),   # 下置信界
+                "advq_hi": round(m + self.rr_ucb_c * se, 4),   # 上置信界
+                "eff": round(self._rr_eff(o), 4),
+                "adv": round(self._rr_adv(o), 4),
+                # ── 历史状态(用于审计; 与当前状态分开)────────────
+                "reached": o["reached"],
+                "rate_life": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
+                "retired_n": o.get("retired_n", 0),      # 被判坏过几次
+                "recovered_n": o.get("recovered_n", 0),  # 从坏恢复过几次
+                "mean_steps": round(o["steps"] / o["n"], 2) if o["n"] else 0.0,
+            }
         broke = self.rr_broken()
-        return {"per_option": per, "broken": sorted(broke),
-                "n_broken": len(broke)}
+        states = [v["state"] for v in per.values()]
+        return {
+            "per_option": per, "broken": sorted(broke), "n_broken": len(broke),
+            # ★ 三态汇总 + 自欺门的状态 —— 报告层必须能一眼看出
+            #   "这次是真的没问题" 还是 "这次根本没数据"。
+            "states": {"good": states.count("good"),
+                       "bad": states.count("bad"),
+                       "unknown": states.count("unknown")},
+            "starved": bool(self.rr_starved()),
+            "since_rew": int(self.rr_since_rew),
+            "starve_steps": int(self.rr_starve_steps),
+            "starve_ever": int(self.rr_starve_ever),
+            "sel_starved": self.rr_stats.get("starved_sel", 0),
+            "sel_unk_probe": self.rr_stats.get("unk_probe", 0),
+            "sel_forgiven": self.rr_stats.get("forgiven", 0),
+        }
 
     def _rr_usage(self):
         """各 option 的**使用占比**(校准的直接观测量)。"""
