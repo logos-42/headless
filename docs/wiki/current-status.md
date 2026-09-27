@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-09-16
+last_confirmed: 2026-09-27
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,28 @@ status: current
 ---
 
 ## 最近更新
+
+- 2026-09-27：**GPU 容器故障闭环 + option 三处结构性缺陷（死账／够不着的目标／错的瓶颈统计量）**
+  - **① 容器设备故障已解除。** 运行期对主设备号 195 整段拒绝（`/dev/null/zero/random/ptmx` 放行、仅 nvidia 全 EPERM；
+    自建 major 195 minor 0–255 **全 EPERM** = cgroup eBPF 设备白名单特征）；容器内无 `docker.sock`、有 MKNOD 无 SYS_ADMIN/BPF
+    → **无法自救**。宿主侧 `docker restart`（非重建：保留可写层，`/root`、SSH key 全在）后验证 `torch.cuda.is_available()=True`、
+    `device_count=2`、数据 22M 全在。诊断链两处自我更正：✗「驱动库缺失」查错了路径；✗「没带 `--gpus`」被 PID1 environ 推翻。
+  - **② B 矩阵校准（KeyDoorMDP，全 CPU）：400 回合修好「0 成功率」。** primitive 3 seed × 6 段**全部收敛、成功率 1.0**；
+    而 **`rediscover` 三段永不收敛（T_adapt 打满 400）、另两段成功率仅 0.2/0.25** → 43 个 option 的技能库在三段上直接摧毁学习。
+  - **③ option 三处结构性缺陷（已修，`d1be29d`）**
+    - **(a) 死账**：`Option.visits/success` **从来没有任何地方更新过** → `select()` 的 `rate=success/visits` 恒取默认 0.5
+      → 54~60 个 option 在启动集内**同分**，选择等于抛硬币
+    - **(b) 目标用 k-means 质心**：质心可能不对应任何真实状态 → `π_o` 朝「够不着」的点走
+      （实测 macro 执行成功率仅 **14.4%** = 85.6% 到不了自己的目标）
+    - **(c) 瓶颈检测用介数中心性**：走廊的语义是「去掉就断开」= **割点**，不是「最短路径经过次数」
+      （FM-17 实测：介数最高的格**不是**走廊格）
+  - **修复**：新增 `macro` 模式（option 真正当**多步宏动作**执行到 `β_o`，每步闭环重算 `π_o`，终止时结算成败）
+    + `_snap()`（起点/目标吸附到最近真实状态）+ `_articulation_points()`（Tarjan；无割点时退回「出边最多」）
+    + `term_eps` 改取 `om.init_radius`（**第 5 次「阈值与状态空间尺度不匹配」同型错误**）
+  - **验证**：割点检测单元测试 ✓（链图→{1,2,3}／环图→{}／星图→{0}）；三判据自检全过；
+    效果（单 seed）：macro 成功率 14.4%→**24.2%**、macro 复用 0.83x→**1.29x**、rediscover 复用 1.28x→**1.52x**
+  - **诚实标注**：目前**没有任何模式优于 primitive**（1.34x）的证据；multi-seed 对照待 B 矩阵校准跑完后进行。
+    两条实验线在跑：L2 批（GPU，rounds=300，25 臂 × ~6 分 ≈ 2.5h）、B 矩阵校准（CPU，400 回合 × 3 seed）
 
 - 2026-09-16：**K1v2 有效测量（修好管线后重跑）+ 四房间 Fig.6 首次复现 + 环境/自检三处缺陷修复**
   - **① K1v2：option 执行模式的第一次有效测量。** 修 `observe_action` 接线后重跑 25 臂（3.0 分/臂匀速 → 确在 GPU 上完成）。
