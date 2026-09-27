@@ -53,7 +53,8 @@ class RRSkillAgent(SkillAgent):
     def __init__(self, mdp, mode="rr", seed=0, rr_v_main="exact",
                  rr_z_mode="rr", rr_cumulant="reward", rr_feats=("key", "door"),
                  rr_bonus=1.0, rr_lib="rr", rr_max_duration=None,
-                 stall_patience=4, rr_select_rule="uniform", **kw):
+                 stall_patience=4, rr_select_rule="uniform",
+                 rr_min_launches=6, rr_ucb_c=1.0, rr_calib_min_rate=0.5, **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -85,6 +86,20 @@ class RRSkillAgent(SkillAgent):
             "stall_baseline": [],   # 停滞统计的基线样本
             "rebuilds": 0,
         }
+        # ══ 自我校准闭环(L2 缺的那一格)══════════════════════════════
+        #  这个 dict 是**按 option 归属**的台账。在此之前整个仓库唯一的
+        #  更新点是 skill_agent.py:240(旧 macro 路径)的全局计数器 ——
+        #  `_rr_settle(self, st, steps, reason)` 收下 `st` 然后**完全忽略它**,
+        #  所以库级台账对 rr 路径不存在, "这个 option 从不达成目标" 这个
+        #  事实无处安放(L2 的 57 启动 / 56 expired / 1 reached 就是这样
+        #  被埋掉的: 没有任何东西因为该事实而改变)。
+        #  信号取 **option 自己的达成率**(β_at_feature), 不取主奖励 ——
+        #  KeyDoor 的奖励是稀疏的(只在终点 +1), 拿主奖励做 option 级信号
+        #  会退化成"所有 option 都得 0"。
+        self.rr_outcome = {}        # option 名 -> {"n", "reached", "steps"}
+        self.rr_min_launches = int(rr_min_launches)   # 判"坏了"所需的最少启动数
+        self.rr_ucb_c = float(rr_ucb_c)               # 校准选择的探索常数
+        self.rr_calib_min_rate = float(rr_calib_min_rate)  # 达成率低于此 = 机制坏了
 
     # ── 技能库(每个 regime 重建一次 —— 目标随 regime 移动) ──────────
     def _rr_ensure(self):
@@ -150,21 +165,45 @@ class RRSkillAgent(SkillAgent):
     def _rr_select(self, s):
         """选一个 option。规则由 `rr_select_rule` 决定(所有臂共用)。
 
-        "uniform" —— 在**可启动**(I_o 成立)的 option 里均匀抽。
-                      每个库都有同等曝光, 所以臂间差异只能来自子任务内容。
-        "gain"    —— `argmax`(子任务价值 − V_main), 且增益必须 **> 0**。
-                      这是"哪个子任务现在最值得追"的贪心读法, 本身是一条
-                      消融轴(更强的先验 = 更多 oracle 信息)。
+        "uniform"    —— 在**可启动**(I_o 成立)的 option 里均匀抽。
+                        每个库都有同等曝光, 所以臂间差异只能来自子任务内容。
+        "gain"       —— `argmax`(子任务价值 − V_main), 且增益必须 **> 0**。
+                        这是"哪个子任务现在最值得追"的贪心读法, 本身是一条
+                        消融轴(更强的先验 = 更多 oracle 信息)。
+        "calibrated" —— **自我校准**: 只用**自己的实测达成率**排序,
+                        不用任何假设的价值。UCB1 形式:
+                            score = reached/n + c·sqrt(ln(N+1)/(n+1))
+                        并且**排除被判"坏了"的 option**(见 `rr_broken`)。
+                        这是"犯错 -> 发现 -> 改正"的闭环本身, 与其它两条
+                        规则的关键区别是: 它**不引入任何外部先验**,
+                        "哪个 option 好"完全由 agent 自己的经验决定。
         """
         cand = [st for st in self.rr_lib_obj if initiation_ok(st, s)]
         if not cand:
             return None
-        if self.rr_select_rule == "gain":
+        rule = self.rr_select_rule
+        if rule == "gain":
             best, best_g = None, 0.0
             for st in cand:
                 g = option_gain(st, s, self._rr_v_main_arr)
                 if g > best_g:
                     best, best_g = st, g
+            return best
+        if rule == "calibrated":
+            broken = self.rr_broken()
+            live = [st for st in cand if getattr(st, "name", None) not in broken]
+            if not live:                      # 全坏了 -> 退回基元层(诚实行为)
+                return None
+            N = sum(o["n"] for o in self.rr_outcome.values())
+            best, best_sc = None, -1.0
+            for st in live:
+                o = self.rr_outcome.get(getattr(st, "name", None),
+                                        {"n": 0, "reached": 0})
+                n = o["n"]
+                rate = (o["reached"] / n) if n else 0.0
+                sc = rate + self.rr_ucb_c * float(np.sqrt(np.log(N + 1.0) / (n + 1.0)))
+                if sc > best_sc:
+                    best, best_sc = st, sc
             return best
         return cand[int(self.rng.randint(len(cand)))]
 
@@ -241,6 +280,64 @@ class RRSkillAgent(SkillAgent):
     def _rr_settle(self, st, steps, reason):
         self.rr_stats["terms"][reason] = self.rr_stats["terms"].get(reason, 0) + 1
         self.rr_stats["durations"].append(int(steps))
+        # ★ 归属到**这个 option**(此前 `st` 收下即弃 —— 库级台账不存在)
+        o = self.rr_outcome.setdefault(getattr(st, "name", id(st)),
+                                       {"n": 0, "reached": 0, "steps": 0})
+        o["n"] += 1
+        o["steps"] += int(steps)
+        if reason == "beta_at_feature":
+            o["reached"] += 1
+
+    # ── 自我校准: 检测 + 淘汰 ───────────────────────────────────────
+    def rr_broken(self, names=None):
+        """哪些 option 的**终止机制坏了**(而不是"暂时运气差")。
+
+        判据(事前定义, 只看 option 自己的达成率, 不看主任务表现):
+            启动 >= `rr_min_launches` 次 且 达成率 < `rr_calib_min_rate`
+
+        ## 为什么不是 `reached == 0`
+
+        最初的写法是"从没达成过"(绝对零)。这是错的 —— **连 L2 的真案都
+        抓不到**: L2 是 57 启动 / 1 次 goal_reached, 达成率 0.018, 不是 0。
+        绝对零判据会放过它。
+
+        ## 0.5 这个线的依据(来自实测的两个簇, 不是拍脑袋)
+
+            坏的:  L2 真案 0.018 (56/57 expired)  |  本轮制造器 0.250
+            好的:  rr[key] 1.000 (确定性 MDP + 模型导出的 π_o 应当几乎必成)
+                   rr-zeroV 0.595 (健康但偏早停的臂)
+
+        两个簇之间有一大段空档, 0.5 落在空档里。**确定性 MDP 上模型导出的
+        option 本该接近 1.0**, 明显低于 1.0 就意味着终止机制或 π_o 有问题。
+        """
+        out = set()
+        for k, o in self.rr_outcome.items():
+            if names is not None and k not in names:
+                continue
+            if o["n"] < self.rr_min_launches:
+                continue
+            rate = o["reached"] / o["n"]
+            if rate < self.rr_calib_min_rate:
+                out.add(k)
+        return out
+
+    def rr_calib_stats(self):
+        """校准台账: 每个 option 的启动数 / 达成率 / 平均时长 + 谁被判坏了。"""
+        per = {}
+        for k, o in sorted(self.rr_outcome.items()):
+            per[k] = {"n": o["n"], "reached": o["reached"],
+                      "rate": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
+                      "mean_steps": round(o["steps"] / o["n"], 2) if o["n"] else 0.0}
+        broke = self.rr_broken()
+        return {"per_option": per, "broken": sorted(broke),
+                "n_broken": len(broke)}
+
+    def _rr_usage(self):
+        """各 option 的**使用占比**(校准的直接观测量)。"""
+        tot = sum(o["n"] for o in self.rr_outcome.values())
+        if not tot:
+            return {}
+        return {k: round(o["n"] / tot, 4) for k, o in sorted(self.rr_outcome.items())}
 
     # ── 台账 ────────────────────────────────────────────────────────
     def rr_bookkeeping(self):
