@@ -238,6 +238,10 @@ def main():
     print("事前判据")
     print("=" * 108)
     ok = []
+    # ★ `info` = **不计入通过率**的观察项。用于"判据本身还不成立/已被取代"的条目:
+    #   留在 `ok` 里会让它永远红, 从而淹没真正的回归(退出码失去分辨力)。
+    #   一条判据只有在**它声称验的那件事可以被验**时才有资格当门。
+    info = []
 
     def segs_(sc, nm):
         return out[(sc, nm)][0]
@@ -329,9 +333,19 @@ def main():
                 continue
             hc, tc = dyn_flag("chaos", nm)
             hh, th = dyn_flag("harm", nm)
-            ok.append((f"⑨ [{nm}] A 察觉'不稳定'(chaos) 而不察觉'稳定但错误'(harm)",
-                       (hc > 0) and (hh == 0) and tc > 0 and th > 0,
-                       f"chaos {hc}/{tc}   harm {hh}/{th}"))
+            # ★★ **本条已从"门"降级为"观察项"(INFO)** —— 理由是它**不可满足**:
+            #    本台跑在**确定性** KeyDoorMDP 上, 实测所有 n>=2 的 (s,a) 后继分布
+            #    最大熵**逐位 0.000000** ⇒ H(T|S,A) ≡ 0 ⇒ 转移预测误差 / 不确定性 /
+            #    稳定区域 **在数学上坍缩成同一个量 = 新颖度计数**。
+            #    于是 A 在 chaos 与 harm 上必然给出**同一签名** —— 这不是
+            #    "A 类不行", 是**本环境没有能力分辨**。
+            #    留它在 `ok` 里会让整台永远 3 条红, 退出码失去分辨力
+            #    (真正的回归会被淹没)。
+            #    新定义(T_shift/T_detect/T_recover/FP/FN/AUC)与可辨识环境见
+            #    `tests/benchmark_a_prime.py` + `docs/a_prime_decision.md`。
+            info.append((f"⑨ [{nm}] (已被取代, 见 benchmark_a_prime.py) "
+                         f"本台不可满足: 确定性环境 H(T|S,A)≡0, A 类 ≡ 新颖度",
+                         f"chaos {hc}/{tc}   harm {hh}/{th}"))
 
     # ⑦ 主任务不劣于安全基线 —— **只在 uniform 真正能跑的场景比**
     #    (harm 下 uniform 整体失败 steps_go=nan, 那时比较没有意义;
@@ -359,7 +373,12 @@ def main():
         extra = item[2] if len(item) > 2 else None
         n_pass += int(bool(v))
         print(f"  {'PASS' if v else 'FAIL'}  {nm}" + (f"   [{extra}]" if extra else ""))
-    print(f"\n  {n_pass}/{len(ok)} 通过")
+    for item in info:                       # ★ 不计入通过率, 不影响退出码
+        nm = item[0]
+        extra = item[1] if len(item) > 1 else None
+        print(f"  INFO  {nm}" + (f"   [{extra}]" if extra else ""))
+    print(f"\n  {n_pass}/{len(ok)} 通过" +
+          (f"   (+{len(info)} 条 INFO, 不计入)" if info else ""))
 
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
