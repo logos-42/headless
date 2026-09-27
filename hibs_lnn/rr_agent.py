@@ -54,7 +54,10 @@ class RRSkillAgent(SkillAgent):
                  rr_z_mode="rr", rr_cumulant="reward", rr_feats=("key", "door"),
                  rr_bonus=1.0, rr_lib="rr", rr_max_duration=None,
                  stall_patience=4, rr_select_rule="uniform",
-                 rr_min_launches=6, rr_ucb_c=1.0, rr_calib_min_rate=0.5, **kw):
+                 rr_min_launches=6, rr_ucb_c=1.0, rr_calib_min_rate=0.5,
+                 rr_persist=True, rr_forget_hl=float("inf"),
+                 rr_score="rate", rr_pot="learned",
+                 rr_calib_min_adv=0.0, rr_retire_rule="internal", **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -100,12 +103,77 @@ class RRSkillAgent(SkillAgent):
         self.rr_min_launches = int(rr_min_launches)   # 判"坏了"所需的最少启动数
         self.rr_ucb_c = float(rr_ucb_c)               # 校准选择的探索常数
         self.rr_calib_min_rate = float(rr_calib_min_rate)  # 达成率低于此 = 机制坏了
+        # ══ 持续性的两个旋钮(「持续自我校准」的"持续")══════════════════
+        #  rr_persist     台账是否跨 regime 存活。
+        #                 False -> 每次库重建就清空(只在单 regime 内校准)
+        #                 True  -> 账随 agent 走(校准成为**跨任务**的知识)
+        #  rr_forget_hl   **忘记半衰期**(以启动次数计)。inf = 不忘记 = 终身平均。
+        #
+        #  ★ 为什么持久化必须配遗忘, 否则持久化是**有害**的:
+        #    无遗忘时 n 会跨 regime 累积到几百, 于是
+        #      (a) 老的成功把新 regime 的失败稀释掉 —— 一个在第 2 个 regime
+        #          已经坏掉的 option, 终身达成率仍可能是 0.9, 检测不出来;
+        #      (b) UCB 探索项 c·sqrt(ln N/(n+1)) 被大 n 压死 —— agent 不再
+        #          去重新检验它, 陈旧的判断被永久锁住。
+        #    「持续校准」必须跟踪的是**当前胜任度**, 不是历史平均。
+        #    实现: 有效计数按 decay = 0.5^(1/hl) 指数衰减。
+        #    hl=inf -> decay=1.0 -> n_eff ≡ n, 逐位复现旧行为(向后兼容)。
+        self.rr_persist = bool(rr_persist)
+        self.rr_forget_hl = float(rr_forget_hl)
+        #  rr_score  选择分数用什么信号
+        #     "rate" 达成率(option 自己的成功)         —— 机制内部视角
+        #     "eff"  达成次数 / 消耗步数               —— **把主任务的成本接进来**
+        #            奖励稀疏时主奖励做不了 option 级信号, 但**时间是通用货币**:
+        #            视野有限, 白走的路严格是损失。所以"每步产出多少达成"是
+        #            一个不需要 oracle、又对主任务有意义的信号。
+        self.rr_score = rr_score
+        if rr_score not in ("rate", "eff", "adv"):
+            raise ValueError(f"unknown rr_score: {rr_score}")
+        # ══ 主任务信号(§8 明写的那个缺口, 现在被实测证据逼出来了)══════
+        #  为什么必须有: 只用 **option 自己的判据**(达成率)做校准是**错的**。
+        #  实测: 把一个 option 的上限压到 1 步 -> 它"达不成自己的子目标"
+        #  (达成率 0.2), 但**它执行的那一步仍然是 π_o 的最优步**, 对主任务
+        #  有益。按内部判据把它淘汰 -> 白损失 π_o 的好步 -> 步数反而差
+        #  1.0 步(3 seed 一致)。**校准到错误的信号上, 会淘汰有用的东西。**
+        #
+        #  主任务信号取 **势函数差分 / 步数**:
+        #      progress = Φ(终止状态) − Φ(起始状态),  adv = Σprogress / Σsteps
+        #  这是 SMDP 视角下"这个 option 每消耗一步, 把主任务推进了多少"。
+        #  Φ 取 **agent 自己的 max_a Q[s,a]** —— 在线、不需要 oracle。
+        #  (早期 Q 是乐观常数 -> adv≈0 -> 判定"无信息", 这是诚实的行为;
+        #   它随学习变得有信息。`rr_pot="exact"` 用模型 VI 的 V_main 作对照,
+        #   用来分离"信号质量"与"机制结构"两个因素。)
+        self.rr_pot = rr_pot
+        if rr_pot not in ("learned", "exact"):
+            raise ValueError(f"unknown rr_pot: {rr_pot}")
+        self.rr_calib_min_adv = float(rr_calib_min_adv)
+        #  rr_retire_rule  用哪条判据决定淘汰
+        #    "internal" 只看 option 自己的达成率      (旧行为)
+        #    "adv"      只看主任务推进量
+        #    "both"     两条都判坏才淘汰             (保守)
+        #    "either"   任一条判坏就淘汰             (激进)
+        self.rr_retire_rule = rr_retire_rule
+        if rr_retire_rule not in ("internal", "adv", "both", "either"):
+            raise ValueError(f"unknown rr_retire_rule: {rr_retire_rule}")
+        self.rr_regime_idx = -1        # 已见过的 regime 数(诊断用)
+        self.rr_calib_hist = []        # [{'regime': i, 'broken': [...], 'usage': {...}}]
 
     # ── 技能库(每个 regime 重建一次 —— 目标随 regime 移动) ──────────
     def _rr_ensure(self):
         reg = tuple(self.mdp.regime)
         if self._rr_regime == reg and self.rr_lib_obj is not None:
             return
+        # ── regime 变了: 台账怎么处理 = 「持续」这条轴 ──────────────────
+        if self._rr_regime is not None:            # 不是第一次
+            self.rr_regime_idx += 1
+            self.rr_calib_hist.append({
+                "regime": self.rr_regime_idx,
+                "broken": sorted(self.rr_broken()),
+                "usage": self._rr_usage(),
+            })
+            if not self.rr_persist:
+                # 只在本 regime 内校准 —— 每换一次世界, 经验清零
+                self.rr_outcome = {}
         mdl = KeyDoorTabular(self.mdp, gamma=self.q.gamma)
         self.rr_mdl = mdl
         if self.rr_v_main == "exact":
@@ -194,14 +262,15 @@ class RRSkillAgent(SkillAgent):
             live = [st for st in cand if getattr(st, "name", None) not in broken]
             if not live:                      # 全坏了 -> 退回基元层(诚实行为)
                 return None
-            N = sum(o["n"] for o in self.rr_outcome.values())
-            best, best_sc = None, -1.0
+            N = sum(o.get("n_eff", 0.0) for o in self.rr_outcome.values())
+            best, best_sc = None, -np.inf      # adv 分数可为负 -> 不能用 -1.0 做初值
             for st in live:
-                o = self.rr_outcome.get(getattr(st, "name", None),
-                                        {"n": 0, "reached": 0})
-                n = o["n"]
-                rate = (o["reached"] / n) if n else 0.0
-                sc = rate + self.rr_ucb_c * float(np.sqrt(np.log(N + 1.0) / (n + 1.0)))
+                o = self.rr_outcome.get(getattr(st, "name", None))
+                if o is None:                 # 没试过的 option: 无限乐观, 先试它
+                    return st
+                n = o.get("n_eff", 0.0)
+                sc = self._rr_score_of(o) + self.rr_ucb_c * float(
+                    np.sqrt(np.log(N + 1.0) / (n + 1.0)))
                 if sc > best_sc:
                     best, best_sc = st, sc
             return best
@@ -214,7 +283,7 @@ class RRSkillAgent(SkillAgent):
         self._rr_ensure()
         s = self.mdp.reset()
         done, n = False, 0
-        active, o_steps, prev_s, stuck = None, 0, None, 0
+        active, o_steps, prev_s, stuck, o_start = None, 0, None, 0, None
         while not done and n < self.mdp.horizon:
             v0 = self.mdp.vec()        # ★ **步前**状态 —— 与父类 run_episode 同约定。
             a = None
@@ -222,7 +291,7 @@ class RRSkillAgent(SkillAgent):
                 # 启动
                 if active is None:
                     active = self._rr_select(s)
-                    o_steps, prev_s, stuck = 0, s, 0
+                    o_steps, prev_s, stuck, o_start = 0, s, 0, s
                     if active is not None:
                         self.rr_stats["selections"] += 1
                 # 出动作: **每步按当前状态重算 π_o**(闭环)
@@ -231,12 +300,12 @@ class RRSkillAgent(SkillAgent):
                         a = int(active.policy[s])
                         self.rr_stats["recomputes"] += 1
                     else:
-                        self._rr_settle(active, o_steps, "beta_stop")
-                        active, o_steps = None, 0
+                        self._rr_settle(active, o_steps, "beta_stop", o_start, s)
+                        active, o_steps, o_start = None, 0, None
             if a is None:
                 if active is not None:
-                    self._rr_settle(active, o_steps, "devalued")
-                    active, o_steps = None, 0
+                    self._rr_settle(active, o_steps, "devalued", o_start, s)
+                    active, o_steps, o_start = None, 0, None
                 a = self.q.act(s)
             s2, r, done = self.mdp.step(a)
             self.q.update(s, a, r, s2, done)
@@ -268,25 +337,83 @@ class RRSkillAgent(SkillAgent):
                 else:
                     stuck = 0
                 if reason:
-                    self._rr_settle(active, o_steps, reason)
-                    active, o_steps = None, 0
+                    self._rr_settle(active, o_steps, reason, o_start, s2)
+                    active, o_steps, o_start = None, 0, None
                 prev_s = s2
             s = s2
         if active is not None:                     # 回合结束仍在执行
-            self._rr_settle(active, o_steps, "horizon_end")
+            self._rr_settle(active, o_steps, "horizon_end", o_start, s)
         self.episodes += 1
         return bool(done and self.mdp._reached()), n
 
-    def _rr_settle(self, st, steps, reason):
+    # ── 有效计数(遗忘)──────────────────────────────────────────────
+    def _rr_decay(self):
+        """每次启动后, 旧统计量保留的比例。`hl=inf` -> 1.0(不遗忘)。"""
+        hl = self.rr_forget_hl
+        if hl is None or not np.isfinite(hl) or hl <= 0:
+            return 1.0
+        return float(0.5 ** (1.0 / hl))
+
+    @staticmethod
+    def _rr_rate(o):
+        """当前胜任度 = reached_eff / n_eff。不遗忘时逐位等于终身平均。"""
+        ne = o.get("n_eff", float(o.get("n", 0)))
+        return (o.get("reached_eff", float(o.get("reached", 0))) / ne) if ne > 0 else 0.0
+
+    @staticmethod
+    def _rr_eff(o):
+        """**效率** = 达成次数 / 消耗步数(每步产出多少达成)。
+
+        这是不依赖 oracle 的"主任务成本"信号: 视野有限, 白走的路严格是损失。
+        与 `rate` 的区别: 一个"总能达成但每次都绕远路"的 option,
+        `rate` 高而 `eff` 低 —— 后者才是对主任务真正有意义的量。
+        """
+        return o.get("reached_eff", 0.0) / max(1.0, o.get("steps_eff", 1.0))
+
+    def _rr_score_of(self, o):
+        s = self.rr_score
+        if s == "rate":
+            return self._rr_rate(o)
+        if s == "eff":
+            return self._rr_eff(o)
+        return self._rr_adv(o)
+
+    @staticmethod
+    def _rr_adv(o):
+        """主任务推进量 = Σ势函数差分 / Σ步数(每步把主任务推进多少)。"""
+        return o.get("adv_sum", 0.0) / max(1.0, o.get("adv_steps", 1.0))
+
+    def _rr_pot(self, s):
+        """势函数 Φ(s)。`learned` = agent 自己的 max_a Q[s,a](在线、无 oracle)。"""
+        if s is None:
+            return 0.0
+        if self.rr_pot == "exact":
+            return float(self._rr_v_main_arr[s])
+        return float(np.max(self.q.Q[s]))
+
+    def _rr_settle(self, st, steps, reason, s0=None, s1=None):
         self.rr_stats["terms"][reason] = self.rr_stats["terms"].get(reason, 0) + 1
         self.rr_stats["durations"].append(int(steps))
         # ★ 归属到**这个 option**(此前 `st` 收下即弃 —— 库级台账不存在)
         o = self.rr_outcome.setdefault(getattr(st, "name", id(st)),
-                                       {"n": 0, "reached": 0, "steps": 0})
+                                       {"n": 0, "reached": 0, "steps": 0,
+                                        "n_eff": 0.0, "reached_eff": 0.0,
+                                        "steps_eff": 0.0,
+                                        "adv_sum": 0.0, "adv_steps": 0.0})
+        dec = self._rr_decay()
+        hit = 1.0 if reason == "beta_at_feature" else 0.0
+        # 终身计数(永不衰减, 供报告与判据门限用)
         o["n"] += 1
         o["steps"] += int(steps)
-        if reason == "beta_at_feature":
-            o["reached"] += 1
+        o["reached"] += int(hit)
+        # 有效计数(按 rr_forget_hl 指数遗忘; dec=1.0 时逐位等于终身计数)
+        o["n_eff"] = dec * o["n_eff"] + 1.0
+        o["reached_eff"] = dec * o["reached_eff"] + hit
+        o["steps_eff"] = dec * o["steps_eff"] + int(steps)
+        # ★ 主任务推进量(势函数差分)
+        prog = self._rr_pot(s1) - self._rr_pot(s0)
+        o["adv_sum"] = dec * o["adv_sum"] + prog
+        o["adv_steps"] = dec * o["adv_steps"] + max(1, int(steps))
 
     # ── 自我校准: 检测 + 淘汰 ───────────────────────────────────────
     def rr_broken(self, names=None):
@@ -314,19 +441,38 @@ class RRSkillAgent(SkillAgent):
         for k, o in self.rr_outcome.items():
             if names is not None and k not in names:
                 continue
-            if o["n"] < self.rr_min_launches:
+            if o.get("n_eff", float(o.get("n", 0))) < self.rr_min_launches:
                 continue
-            rate = o["reached"] / o["n"]
-            if rate < self.rr_calib_min_rate:
+            bad_int = self._rr_rate(o) < self.rr_calib_min_rate
+            bad_adv = self._rr_adv(o) < self.rr_calib_min_adv
+            rule = self.rr_retire_rule
+            if rule == "internal":
+                hit = bad_int
+            elif rule == "adv":
+                hit = bad_adv
+            elif rule == "both":
+                hit = bad_int and bad_adv
+            else:
+                hit = bad_int or bad_adv
+            if hit:
                 out.add(k)
         return out
 
     def rr_calib_stats(self):
-        """校准台账: 每个 option 的启动数 / 达成率 / 平均时长 + 谁被判坏了。"""
+        """校准台账: 每个 option 的启动数 / **当前胜任度** / 效率 + 谁被判坏了。
+
+        注意 `rate` 报的是**有效达成率**(按 `rr_forget_hl` 遗忘后的当前胜任度),
+        `rate_life` 才是终身平均 —— 持久化的意义就在这两者的差别上。
+        """
         per = {}
         for k, o in sorted(self.rr_outcome.items()):
+            ne = o.get("n_eff", float(o.get("n", 0)))
             per[k] = {"n": o["n"], "reached": o["reached"],
-                      "rate": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
+                      "n_eff": round(ne, 2),
+                      "rate": round(self._rr_rate(o), 4),
+                      "rate_life": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
+                      "eff": round(self._rr_eff(o), 4),
+                      "adv": round(self._rr_adv(o), 4),
                       "mean_steps": round(o["steps"] / o["n"], 2) if o["n"] else 0.0}
         broke = self.rr_broken()
         return {"per_option": per, "broken": sorted(broke),
