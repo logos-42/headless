@@ -226,8 +226,14 @@ class SkillAgent:
             a = int(active.actions[0]) if active.actions else None
         steps += 1
         # β_o: 目标达成 或 预算耗尽 -> 结算
+        # ★ 主判据 = **区域归属** (in_goal_region): "已进入目标区域"。
+        #   旧判据 `goal_distance(v) < eps` 在离散状态空间里退化 ——
+        #   实测 2737 次执行中 0 次因它触发 (eps=0.754 只接受精确到达,
+        #   而可达的最小距离中位数是 1.000)。距离判据保留为兜底。
         try:
-            reached = active.goal_distance(v) < eps
+            reached = bool(active.in_goal_region(v))
+            if not reached:
+                reached = active.goal_distance(v) < eps
         except Exception:
             reached = False
         if reached or steps >= max(1, int(self.max_len)):

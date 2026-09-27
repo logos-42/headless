@@ -36,7 +36,8 @@ import numpy as np
 class Option:
     """o = (I_o, π_o, β_o)。"""
 
-    def __init__(self, oid, actions, start_center, goal_center, uncs=None):
+    def __init__(self, oid, actions, start_center, goal_center, uncs=None,
+                 regions=None, start_region=None, goal_region=None):
         self.oid = int(oid)
         self.actions = list(actions)        # π_o: 动作序列 (时间抽象的核心)
         self.start_center = np.asarray(start_center, dtype=float)   # I_o 的中心
@@ -46,9 +47,40 @@ class Option:
         self.success = 0
         # β_o 的线性参数: P(terminate | s, o) = sigmoid(w·[s, goal, unc])
         self.w_beta = np.zeros(3 * len(self.goal_center) + 1)
+        # ── ★ 区域归属 (无阈值的终止判据) ────────────────────────────
+        #   旧判据 `‖s − goal_center‖ < eps` 在**离散状态空间**里会退化:
+        #   KeyDoor 的 vec() 是 one-hot(pos) ⊕ has_key ⊕ door_open, 两个不同
+        #   位置的距离是 √2≈1.414、仅一个 bit 不同的是 1.0, 而
+        #   `init_radius = max(0.5, median(NN)·0.75) = 0.754` **只接受精确到达**
+        #   → 实测 β_o 因达成而触发的比例 **0/2737**, 全部靠预算耗尽退出。
+        #   正确判据: "s 是否落在该 option 的目标**区域**里" —— 用 k-means 的
+        #   Voronoi 归属 (argmin ‖s − centers‖) 判定, 无阈值、覆盖全空间。
+        self.regions = None if regions is None else np.asarray(regions, dtype=float)
+        self.start_region = start_region
+        self.goal_region = goal_region
+
+    # ── ★ 区域归属 ──
+    def region_of(self, s):
+        """s 落在哪个区域 (k-means Voronoi 归属)。regions 未设时返回 None。"""
+        if self.regions is None or len(self.regions) == 0:
+            return None
+        d = np.linalg.norm(self.regions - np.asarray(s, dtype=float)[None, :], axis=1)
+        return int(np.argmin(d))
+
+    def in_goal_region(self, s):
+        """β_o 的**主判据**: s 是否已进入目标区域。"""
+        if self.goal_region is None:
+            return False
+        return self.region_of(s) == self.goal_region
 
     # ── I_o: 启动条件 (到起点的距离在半径内) ──
     def initiable(self, s, radius=0.5):
+        # ★ 优先用区域归属 (与 in_goal_region 对称, 无阈值退化问题);
+        #   未设区域时退回距离判据 (保留旧行为)。
+        if self.start_region is not None:
+            r = self.region_of(s)
+            if r is not None and r == self.start_region:
+                return True
         return float(np.linalg.norm(np.asarray(s) - self.start_center)) <= radius
 
     # ── β_o: **学习式终止概率** ──
@@ -184,9 +216,11 @@ class OptionManager:
                     uncs_p = [self.graph[(self._walk(r0, acts[:i]), acts[i])][1]
                               for i in range(len(acts))]
                     # ★ 起点/目标吸附到**真实观测状态** (质心可能够不着)
+                    #   + 带上区域归属 (无阈值的 β_o 判据)
                     self.options.append(Option(
                         oid, acts, self._snap(S, self.regions[r0]),
-                        self._snap(S, self.regions[goal_r]), uncs_p))
+                        self._snap(S, self.regions[goal_r]), uncs_p,
+                        regions=self.regions, start_region=r0, goal_region=goal_r))
                     oid += 1
         # 去重 (同起点同目标保留最短的)
         best = {}
@@ -334,7 +368,9 @@ class OptionManager:
                 #   实测: macro 宏执行的成功率只有 14.4% (质心目标下),
                 #   即 85.6% 的 option 执行**到不了自己的目标**。
                 self.options.append(Option(oid, seq, self._snap(S, self.regions[src]),
-                                           self._snap(S, self.regions[b]), uncs_seq))
+                                           self._snap(S, self.regions[b]), uncs_seq,
+                                           regions=self.regions,
+                                           start_region=src, goal_region=b))
                 oid += 1
                 if oid >= 40:
                     break
