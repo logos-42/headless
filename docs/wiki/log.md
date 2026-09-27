@@ -64,3 +64,23 @@
 6. **两个未做方向(明写)**: (a) 换**稠密基本量**(cumulant) —— 稀疏奖励是根因, 仓库已有 `rl_proposer.py` 的 `(c,z)` GVF 层, 但"哪个稠密量同时满足 ①在线 ②无 oracle ③与主任务相关"**没有答案**, 需单独一轮; (b) **报告层三态(好/坏/未知)** —— 现在 `advq=0` 被读成"不坏", 真相是"不知道", 必须分开报。
 
 代码: `rr_pot`(learned/exact/**gvf**) / `rr_lr_v` / `rr_retire_rule`(加 `advq`/`none`) / `rr_score`(加 `advq`) / **`rr_forgive_p`**; 新方法 `_rr_vstep` / `_rr_vall` / `_rr_advq_se` / `_rr_has_base` / `_rr_oindex`。全部加性, 默认路径逐位不变(`test_self_calib` 7/7、`test_rr_options`、`test_rr_agent`、哨兵全过)。报告 `docs/online_potential_gvf.md`。 |
+
+## 2026-09-27 (晚·续五) 三态 epistemic state(好/坏/未知)+ 校准基线冻结契约
+
+**leo 的主线判断(本轮采纳为纲领)**: 「当前真正的主线已经从'找到一个好势函数'转为'**构造一个不会自欺的持续学习系统**'。GVF 已解决结构问题; `advq = Q_opt − Φ` 已解决比较尺度; 可逆退休已解决死锁。**但失败时稀疏奖励为空, 导致 GVF 得到精确的 0, 而不是'坏'。因此最大的缺口不是精度, 而是 epistemic state: 它必须区分「好、坏、未知」**」。并给出七阶段顺序与近期里程碑。
+
+**本轮交付 = 阶段一(冻结) + 阶段二(三态)**。
+
+**核心诊断**: `advq == 0` 在两种完全不同的情况下出现 —— (a) 证据充分且真无差异 -> 好; (b) **奖励流为空, Φ 学不到东西**(harm 整臂全灭时 `Q_adv ≡ 0.0000` 精确零, `since_rew` 一路涨) -> **未知**。旧代码 `0 -> 不 < 0 -> 不淘汰 -> 当健康` ⇒ **"我不知道"被系统性读成"没问题" = 自欺**。这不是精度问题。
+
+**实现**(`hibs_lnn/rr_agent.py`, 全部加性): ① **自欺门** `rr_starved()` = 连续 `rr_starve_steps`(默认 3×horizon)步无正奖励; ② **三态判定** `rr_epistemic(o)`: 未知(奖励流空/Φ 未离初值/证据 < min_launches) / 坏(上置信界 < 0) / 好(证据充分且无显著负向); ③ **决策层**: 好 -> UCB; 坏 -> 退休但可原谅; **未知 -> 以 `rr_unk_p` 概率优先探索 + 永不算坏**; **全局奖励流为空 -> 退回安全基元策略**; ④ **报告层**: 当前状态(决策)与历史状态(审计)分开, 新增 `retired_n`/`recovered_n`/`advq_lo`/`advq_hi`/`no_base`/`states{good,bad,unknown}`/`starved`; ⑤ **`rr_three_state` 开关**(默认 False = 旧行为逐位不变, 回归 7/7 已验证)⇒ **三态本身是一条消融轴**。
+
+**新验收台 `tests/benchmark_three_state.py`**: 三固定场景(normal / inert / harm, 第 3 段起施加故障)× 三臂(uniform / b2-nostate / b2-3state)× 八指标 × ⑦ 条事前判据。**3 seeds × 300 回合: 11/11 通过**。
+
+**最锋利的一组数**: harm 场景下 **`b2-nostate` 整体死亡**(成功率 **0.000**、`steps_go = nan`、`since_rew` 持续涨)**且永不自救**; **`b2-3state` 检出(延迟 43)-> 判坏 -> 主任务恢复到 0.633/0.633/0.817**。判据② 成功率 **0.000 -> 0.567**。**差别不在报告, 在行为。** 自欺门违约 **0 处**; inert 累计误杀 **0**; 证据 `advq_n` 三场景**单调增长**; 主任务步数不劣于 uniform(normal 11.24→11.22 / inert 11.16→11.17)。
+
+**副产品**: 同 regime 上目标 option 的 `advq`, `uniform`(随机选)**−0.27** vs 校准选择 **≈ +0.005~+0.16** ⇒ 校准确实把无用的 option 挤掉了。**但 `≈0 -> good` 的含义是"不比基线差", 不是"比基线好"** —— 口径必须写清。
+
+**冻结契约 `docs/calib_baseline_freeze.md`**: `FROZEN = {rr_select_rule: calibrated, rr_pot: gvf, rr_retire_rule: advq, rr_score: advq, rr_forget_hl: 20, rr_forgive_p: 0.10}`; `learned` **不再作候选**(初值 artifact), `exact` **只作 oracle 对照**; 未扫项(`rr_lr_v`/`rr_starve_steps`/`rr_unk_p`/`rr_min_launches`/`rr_ucb_c`/切换速度)明确留待阶段三。**改契约必须是一次显式提交并说明理由。**
+
+**未做(明写)**: 阶段三生存参数扫描(默认值一个都没扫过, 只知道能跑通); 阶段四**三类稠密 cumulant**(A 转移/动力学、B 结构进展、C 主任务代理)的**无 oracle 对照**; 阶段五多 GVF 与 `knowledge.py` 的 `InternalKnowledge`/`GVFBank` 合并; 阶段六知识增长的可测定义; 阶段七硬门槛。报告 `docs/three_state_epistemic.md`。 |
