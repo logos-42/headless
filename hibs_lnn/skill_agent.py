@@ -75,9 +75,9 @@ class SkillAgent:
 
     def __init__(self, mdp: KeyDoorMDP, mode="primitive", seed=0,
                  discover_every=25, min_trans=120, opt_prob=0.5,
-                 use_subgoals=1, n_regions=16, max_len=5):
+                 use_subgoals=1, n_regions=16, max_len=5, term_eps=None):
         self.mdp = mdp
-        self.mode = mode                    # primitive / reuse_stale / rediscover
+        self.mode = mode                    # primitive / reuse_stale / rediscover / macro
         self.q = QLearner(mdp.n_states, seed=seed)
         self.rng = np.random.RandomState(seed + 1)
         self.discover_every = int(discover_every)
@@ -86,6 +86,16 @@ class SkillAgent:
         self.use_subgoals = int(use_subgoals)
         self.n_regions = int(n_regions)
         self.max_len = int(max_len)
+        # ★ β_o 的"目标达成"阈值必须与**状态空间尺度**匹配。
+        #   KeyDoor 的 vec() = one-hot(pos) ⊕ has_key ⊕ door_open (n_pos+2 维)。
+        #   **两个不同位置之间的 L2 距离是 √2 ≈ 1.414**, 而到达"某个目标区域"
+        #   的合理判据是"落进该区域", 该区域半径就是 OptionManager 的
+        #   `init_radius`(按区域最近邻距离中位数 * 0.75 自适应推断)。
+        #   固定 eps=0.05 (给"归一化距离"用的量级) 在这里**几乎永不满足**
+        #   -> β_o 只在预算耗尽时触发 -> success 恒 0 -> 技能库从不学习。
+        #   这是本项目第 5 次同型错误("阈值与状态空间尺度不匹配"),
+        #   故此处**默认 None = 运行时取 om.init_radius**, 不再手写常数。
+        self.term_eps = None if term_eps is None else float(term_eps)
 
         self.trans = []                     # 全历史 (跨 regime 累积)
         self.om = None                      # 当前技能库
@@ -133,6 +143,22 @@ class SkillAgent:
             self.om = om
         self.n_discover += 1
 
+    def _select_option(self, v):
+        """选一个可启动的 option(与 _option_action 同源, 抽出复用)。"""
+        if self.om is None or not self.om.options:
+            return None
+        goal_vec = None
+        try:
+            key_pos, door_pos, goal_pos = self.mdp.regime
+            gv = np.zeros_like(v)
+            gv[goal_pos] = 1.0
+            gv[self.mdp.n_pos] = 1.0      # has_key = 1
+            gv[self.mdp.n_pos + 1] = 1.0  # door_open = 1
+            goal_vec = gv
+        except Exception:
+            pass
+        return self.om.select(v, goal=goal_vec, exclude_unc=True)
+
     def _option_action(self, s):
         """按 option 出动作 —— **必须尊重启动集 I_o**。
 
@@ -145,22 +171,14 @@ class SkillAgent:
           正确做法 (用户给的 `Option=(I_o,g_o,π_o,β_o)`):
             用 `OptionManager.select(s, goal=...)` —— 它**会**检查 `initiable(s)`,
             也就是"当前状态是否落在该 option 的启动集里"。这才是 `I_o` 的语义。
+
+        ★★ 本函数是**逐步顾问**语义 (每步问一次, 执行一个 primitive 动作)。
+            它不是时间抽象 —— option 的多步结构完全没用上, 成败也无从统计
+            (`Option.visits/success` 因此永远是 0, `select()` 里
+            `rate = success/visits` 恒取默认 0.5, 技能库**从不学习哪些 option 管用**)。
+            真正的宏执行见 `_macro_step`。
         """
-        if self.om is None or not self.om.options:
-            return None
-        v = self.mdp.vec()
-        # goal = 当前 regime 的最优终态 (只作为"朝哪走"的先验; 不参与选 option)
-        goal_vec = None
-        try:
-            key_pos, door_pos, goal_pos = self.mdp.regime
-            gv = np.zeros_like(v)
-            gv[goal_pos] = 1.0
-            gv[self.mdp.n_pos] = 1.0      # has_key = 1
-            gv[self.mdp.n_pos + 1] = 1.0  # door_open = 1
-            goal_vec = gv
-        except Exception:
-            pass
-        o = self.om.select(v, goal=goal_vec, exclude_unc=True)
+        o = self._select_option(self.mdp.vec())
         if o is None:
             return None          # 没有可启动的技能 -> 交回 Q (这才是正确的退让)
         acts = [int(x) for x in o.actions]
@@ -169,10 +187,56 @@ class SkillAgent:
         # 闭环: 用世界模型算"朝该 option 目标前进最多"的动作; 失败则退回动作序列
         a = None
         if self.om.T is not None:
-            a = self._goal_action(v, o.goal_center)
+            a = self._goal_action(self.mdp.vec(), o.goal_center)
         if a is None:
             a = acts[0]
         return int(a)
+
+    def _macro_step(self, v, active, steps):
+        """把一个 option 当**宏动作**执行。
+
+        返回 `(动作, 新的 active, 新的 steps)`。`active is None` 表示本步先选一个
+        option 再出动作; 每步都重算 `π_o` (闭环), 当 `β_o` 命中
+        (目标达成 / 步数上限) 时结算成败并交回 base policy。
+
+        ## 为什么要这个
+
+        原 `rediscover` 把 option 当**单步动作顾问**: 每步按概率问一次 "现在该做
+        什么动作", option 的 `(I_o, g_o, π_o, β_o)` 里只有 `π_o` 的一步被用到。
+        后果有两个, 都是实测到的:
+
+          1. **成败无从统计** -> `visits/success` 恒 0 -> `select()` 的
+             `rate = success/visits` 恒为默认 0.5 -> 54~60 个 option 在启动集内
+             **同分**, 选择等于抛硬币 -> 全部 6 段都差于 primitive。
+          2. **不是时间抽象** -> 逐步咨询等于给 base policy 注入噪声,
+             没有任何"一段行为被当作一个决策单位"的效果。
+        """
+        # 目标达成阈值: 未显式给定时, 用 OptionManager 自适应推断的
+        # `init_radius`(区域尺度) —— 同一把尺子量启动集与目标区。
+        eps = self.term_eps
+        if eps is None:
+            eps = float(getattr(self.om, "init_radius", 0.75))
+        if active is None:
+            active = self._select_option(v)
+            steps = 0
+            if active is None:
+                return None, None, 0
+        a = self._goal_action(v, active.goal_center) if self.om.T is not None else None
+        if a is None:
+            a = int(active.actions[0]) if active.actions else None
+        steps += 1
+        # β_o: 目标达成 或 预算耗尽 -> 结算
+        try:
+            reached = active.goal_distance(v) < eps
+        except Exception:
+            reached = False
+        if reached or steps >= max(1, int(self.max_len)):
+            active.visits += 1
+            if reached:
+                active.success += 1
+            active = None
+            steps = 0
+        return a, active, steps
 
     def _goal_action(self, v, g):
         """π_o(s) = argmax_a [ ‖g−s‖ − ‖g−T(s,a)‖ ], 每步重算。"""
@@ -193,12 +257,20 @@ class SkillAgent:
         s = self.mdp.reset()
         done = False
         n = 0
+        # ── macro 模式的跨步状态: 当前正在执行的宏动作 ──────────────
+        active, o_steps = None, 0
         while not done and n < self.mdp.horizon:
             v = self.mdp.vec()
             a = None
-            if self.mode != "primitive" and self.rng.rand() < self.opt_prob:
+            if self.mode == "macro":
+                # 宏执行: 选一个 option -> 跑到 β_o 触发 -> 结算成败
+                if self.rng.rand() < self.opt_prob or active is not None:
+                    a, active, o_steps = self._macro_step(v, active, o_steps)
+            elif self.mode != "primitive" and self.rng.rand() < self.opt_prob:
+                # rediscover / reuse_stale: 逐步顾问语义 (保持不变, 作为对照)
                 a = self._option_action(s)
             if a is None:
+                active, o_steps = None, 0     # 交回 base policy 时宏动作结束
                 a = self.q.act(s)
             s2, r, done = self.mdp.step(a)
             self.q.update(s, a, r, s2, done)
@@ -209,6 +281,16 @@ class SkillAgent:
         if self.mode != "primitive":
             self.maybe_discover()
         return bool(done and self.mdp._reached()), n
+
+    def option_bookkeeping(self):
+        """技能库的成败台账(诊断用: 证明 visits/success 真的被回填了)。"""
+        if self.om is None:
+            return {"n_options": 0, "n_used": 0, "total_visits": 0, "total_success": 0}
+        vs = [o.visits for o in self.om.options]
+        ss = [o.success for o in self.om.options]
+        return {"n_options": len(self.om.options),
+                "n_used": int(sum(1 for v_ in vs if v_ > 0)),
+                "total_visits": int(sum(vs)), "total_success": int(sum(ss))}
 
 
 # ── B 矩阵: regime 链 ───────────────────────────────────────────────

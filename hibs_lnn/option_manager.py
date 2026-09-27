@@ -171,6 +171,7 @@ class OptionManager:
         self.tau_U = tau_U
 
         # 4) 找可靠路径 (每步 unc < tau_U 且确实前进了) = options
+        S = np.asarray(states, dtype=float)
         self.options = []
         oid = 0
         for r0 in range(n_regions):
@@ -182,8 +183,10 @@ class OptionManager:
                         continue                      # 没前进, 不是 option
                     uncs_p = [self.graph[(self._walk(r0, acts[:i]), acts[i])][1]
                               for i in range(len(acts))]
+                    # ★ 起点/目标吸附到**真实观测状态** (质心可能够不着)
                     self.options.append(Option(
-                        oid, acts, self.regions[r0], self.regions[goal_r], uncs_p))
+                        oid, acts, self._snap(S, self.regions[r0]),
+                        self._snap(S, self.regions[goal_r]), uncs_p))
                     oid += 1
         # 去重 (同起点同目标保留最短的)
         best = {}
@@ -301,33 +304,23 @@ class OptionManager:
         for r in adj:
             adj[r].sort(key=lambda t: t[2])
 
-        # 3. 介数中心性 (无权重近似: 全部最短路径数) -> 找咽喉
-        n = n_regions
-        bc = np.zeros(n)
-        for src in range(n):
-            # BFS
-            dist = {src: 0}; paths = {src: 1.0}; order = [src]
-            qi = 0
-            while qi < len(order):
-                cur = order[qi]; qi += 1
-                for (nxt, _u, _un) in adj[cur]:
-                    if nxt not in dist:
-                        dist[nxt] = dist[cur] + 1; order.append(nxt)
-                    if dist.get(nxt) == dist[cur] + 1:
-                        paths[nxt] = paths.get(nxt, 0.0) + paths[cur]
-            for t in order:
-                if t != src and dist[t] > 0:
-                    for mid in order:
-                        if mid != src and mid != t and dist.get(mid, 0) > 0 \
-                                and dist[mid] < dist[t]:
-                            bc[mid] += paths.get(mid, 0.0) / max(paths.get(t, 1.0), 1e-9)
-        # 4. 每个高介数区域 = 一个子目标; 用 BFS 找通往它的动作序列
-        order_bc = np.argsort(-bc)
+        # 3. ★ 割点/桥找咽喉 —— **不用介数中心性**
+        #    实测证据 (选项验证技能 FM-17, 四房间 gridworld): 介数最高的格
+        #    **不是**走廊格。介数衡量的是"最短路径经过次数", 而走廊的语义是
+        #    "去掉它图就断开" —— 那是**割点(articulation point)**。
+        #    用错了统计量 -> 子目标选在无关处 -> π_o 朝一个无意义的地点走。
+        aps = self._articulation_points(adj, n_regions)
+        if not aps:
+            # 图无割点 (如完全连通): 退回到"通往最多区域"的节点,
+            # 这比介数中心性更贴近"咽喉"的意图, 且不退化成"选不到子目标"
+            aps = set(np.argsort(-np.array([len(adj[r]) for r in range(n_regions)]))[:2].tolist())
+
+        # 4. 每个割点区域 = 一个子目标; 用 BFS 找通往它的动作序列
+        S = np.asarray(states, dtype=float)
+        order_ap = sorted(aps)
         self.options = []
         oid = 0
-        for b in order_bc:
-            if bc[b] <= 0:
-                continue
+        for b in order_ap:
             for src in range(n_regions):
                 if src == b:
                     continue
@@ -335,8 +328,13 @@ class OptionManager:
                 if seq is None or len(seq) < min_path:
                     continue
                 uncs_seq = [self.graph[(src, seq[0])][1]]
-                self.options.append(Option(oid, seq, self.regions[src],
-                                           self.regions[b], uncs_seq))
+                # ★ 目标/起点必须是**真实观测到的状态**, 不能是 k-means 质心。
+                #   质心是几个状态的软平均, 可能不对应任何真实状态 ->
+                #   以它为目标的 π_o 会朝一个"够不着"的点走。
+                #   实测: macro 宏执行的成功率只有 14.4% (质心目标下),
+                #   即 85.6% 的 option 执行**到不了自己的目标**。
+                self.options.append(Option(oid, seq, self._snap(S, self.regions[src]),
+                                           self._snap(S, self.regions[b]), uncs_seq))
                 oid += 1
                 if oid >= 40:
                     break
@@ -348,6 +346,62 @@ class OptionManager:
             np.fill_diagonal(_D, np.inf)
             self.init_radius = float(max(0.5, np.median(_D.min(axis=1)) * 0.75))
         return self.options
+
+    @staticmethod
+    def _snap(S, center):
+        """把 k-means 质心**吸附到最近的真实观测状态**。
+
+        ★ 为什么必须做: 质心是若干状态的软平均, 可能不对应任何真实状态。
+          以质心为目标 -> π_o 朝一个"够不着"的点走 -> β_o 永不因达成而触发。
+          实测 (KeyDoor macro 宏执行): 成功率仅 14.4%, 即 85.6% 的 option
+          执行到不了自己的目标。
+        """
+        if S is None or len(S) == 0:
+            return np.asarray(center, dtype=float)
+        d = np.linalg.norm(S - np.asarray(center, dtype=float)[None, :], axis=1)
+        return S[int(np.argmin(d))].astype(float)
+
+    @staticmethod
+    def _articulation_points(adj, n):
+        """Tarjan 割点检测 (**无向化**后的区域图)。
+
+        ★ 为什么不用介数中心性: 走廊/咽喉的语义是"去掉它图就断开",
+          那是割点。介数中心性衡量的是"最短路径经过次数", 二者不等价 ——
+          实测 (选项验证技能 FM-17, 四房间 gridworld): 介数最高的格
+          **不是**走廊格。
+        """
+        und = {r: set() for r in range(n)}
+        for r, outs in adj.items():
+            for e in outs:
+                nxt = e[0]
+                und[r].add(nxt)
+                und[nxt].add(r)
+
+        disc, low, parent = {}, {}, {}
+        aps = set()
+        timer = [0]
+
+        def dfs(u):
+            disc[u] = low[u] = timer[0]
+            timer[0] += 1
+            children = 0
+            for v in und.get(u, ()):
+                if v not in disc:
+                    parent[v] = u
+                    children += 1
+                    dfs(v)
+                    low[u] = min(low[u], low[v])
+                    if u not in parent and children > 1:
+                        aps.add(u)                    # 根: 多棵子树才是割点
+                    if u in parent and low[v] >= disc[u]:
+                        aps.add(u)
+                elif v != parent.get(u):
+                    low[u] = min(low[u], disc[v])
+
+        for s in range(n):
+            if s not in disc:
+                dfs(s)
+        return aps
 
     @staticmethod
     def _bfs_action_path(adj, src, dst, max_len):

@@ -58,11 +58,19 @@ def main():
             rows, agent = run_regime_chain(mode=mode, chain=chain, n_pos=a.n_pos,
                                            episodes_per=a.episodes_per,
                                            seed=42 + si)
+            # ★ option 台账: visits/success 是否真的被回填?
+            #   修复前恒 0 -> select() 里 rate=success/visits 永远取默认 0.5
+            #   -> 技能库从不学习哪些 option 管用 (选择等于抛硬币)。
+            bk = agent.option_bookkeeping() if hasattr(agent, "option_bookkeeping") \
+                else {"total_visits": 0, "total_success": 0, "n_used": 0}
+            for r in rows:
+                r["bookkeeping"] = bk
             per_seed.append(rows)
-            print("  [%s seed=%d] T_adapt=%s  最终成功率=%s  n_options=%d"
+            print("  [%s seed=%d] T_adapt=%s  最终成功率=%s  n_options=%d  台账=%d/%d"
                   % (mode, 42 + si, [r["t_adapt"] for r in rows],
                      [round(r["final_succ"], 2) for r in rows],
-                     rows[-1]["n_options"]), flush=True)
+                     rows[-1]["n_options"], bk["total_success"], bk["total_visits"]),
+                  flush=True)
         all_rows[mode] = per_seed
 
     print()
