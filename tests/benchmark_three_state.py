@@ -57,7 +57,33 @@ SCENARIOS = {
                    fault="inert", fault_at=3),
     "harm":   dict(chain=[DEFAULT_REGIMES[i % 3] for i in range(6)],
                    fault="harm", fault_at=3),
+    # ★★ "不稳定" 故障 —— 与 `harm`("稳定但错误")形成对照。
+    #    leo 点名的否证实验就在这里: 如果 A 类只对 `chaos` 有反应、
+    #    对 `harm` 无反应, 那它学到的是**可预测性**, 不是**任务价值**,
+    #    因此只能当辅助/风险通道, 不能单独驱动退休或选择。
+    "chaos":  dict(chain=[DEFAULT_REGIMES[i % 3] for i in range(6)],
+                   fault="chaos", fault_at=3),
 }
+
+
+class _RandPolicy:
+    """`chaos` 故障: **每步随机出动作** —— 动力学不可预测。
+
+    与 `harm`(把 π_o 反向后仍然完全确定)正好构成一对:
+      · `harm`  = 稳定 + 错误   -> 可预测性高, 任务价值负
+      · `chaos` = 不稳定 + 无向 -> 可预测性低, 任务价值也是负
+    两者对比可以把"熟悉度/可预测性"和"任务价值"**分离**开 —— 这是 A 类
+    唯一能证明自己是值信号还是辅助信号的办法。
+    """
+
+    def __init__(self, seed=0):
+        self.rng = np.random.RandomState(seed)
+
+    def __getitem__(self, s):
+        return int(self.rng.randint(2))
+
+    def __len__(self):
+        return 64
 
 # ── 冻结基线(leo 契约): GVF + advq + 遗忘 + 原谅 ──────────────────────
 FROZEN = dict(rr_select_rule="calibrated", rr_pot="gvf", rr_retire_rule="advq",
@@ -67,6 +93,11 @@ ARMS = {
     "uniform":    dict(rr_select_rule="uniform"),
     "b2-nostate": dict(FROZEN, rr_three_state=False),
     "b2-3state":  dict(FROZEN, rr_three_state=True),
+    # ★ 阶段四 A: 三候选稠密动力学证据。其余**全部**沿用冻结契约,
+    #   所以臂间差异只能归因到 cumulant 本身(leo 的归因纪律)。
+    "a1": dict(FROZEN, rr_three_state=True, rr_dyn="A1"),   # 转移不确定性
+    "a2": dict(FROZEN, rr_three_state=True, rr_dyn="A2"),   # 转移预测误差
+    "a3": dict(FROZEN, rr_three_state=True, rr_dyn="A3"),   # 已知稳定区域
 }
 
 
@@ -78,11 +109,17 @@ def apply_fault(ag, kind):
     if kind == "inert":                   # 看着坏: 达不成子目标...
         ag._rr_cap[FAULT_OPT] = 1         # ...但那一步仍是 π_o 的最优步
     elif kind == "harm":                  # 真的坏: 主动朝反方向走
+        #   ★ 这个故障的性质是 **"稳定 + 错误"**: 转移完全确定、极易预测,
+        #     但任务价值是负的。它同时是 A 类的**否证实验**(见判据⑧)。
         p = np.asarray(st.policy).copy()
         p2 = p.copy()
         p2[p == LEFT] = RIGHT
         p2[p == RIGHT] = LEFT
         st.policy = p2
+    elif kind == "chaos":                 # 不稳定: 每步随机动作
+        #   转移**不可预测**, 与 `harm` 的可预测性形成对照。
+        st.policy = _RandPolicy(seed=12345)
+        ag._rr_cap[FAULT_OPT] = 12        # 不让它无限跑
     else:
         raise ValueError(f"unknown fault: {kind}")
     return True
@@ -131,14 +168,19 @@ def run_arm(kw, scen, episodes_per=300, seed=0, thresh=0.8, window=20):
             # ③ 恢复: 目标从坏恢复过几次
             "recovered": o.get("recovered_n", 0),
             "retired": o.get("retired_n", 0),
-            # ④ fallback
-            "fallback": ag.rr_stats.get("starved_sel", 0) / max(1, ag.rr_stats["selections"]),
+            # ④ fallback = 退回基元层的**选择尝试占比**。分母必须是 `sel_attempts`
+            #   (尝试总数), 不能用 `selections`(只在真的选中时 +1) —— 否则
+            #   比值会 > 1(实测 6.827), 指标失去意义。
+            "fallback": ag.rr_stats.get("starved_sel", 0)
+            / max(1, ag.rr_stats.get("sel_attempts", 1)),
             # ⑤ 三态占比
             "states": cs["states"],
             "starved": cs["starved"],
             "since_rew": cs["since_rew"],
             # ⑦ 证据增长
             "evidence": float(sum(v["advq_n"] for v in cs["per_option"].values())),
+            # ★ A 类通道: 转移数 / 基线压力 / 每 option 的证据量与风险标记
+            "dyn": (ag.rr_dyn_stats() if hasattr(ag, "rr_dyn_stats") else None),
             "no_base": o.get("no_base", 0),
             "advq": o.get("advq", 0.0),
             "advq_lo": o.get("advq_lo", 0.0),
@@ -229,7 +271,9 @@ def main():
                    su_t > su_n + 0.2, f"{su_n:.3f} -> {su_t:.3f}"))
 
     # ③ 未知不得触发退休 / 不得增加误杀
-    if "harm" in scen_names:
+    #    ★ 守卫必须有: 臂子集是常规用法(--arms a1,a2,a3), 缺守卫会直接
+    #      KeyError 崩在**评测阶段** —— 数据全跑完了才崩, 最浪费的一种。
+    if "harm" in scen_names and {"b2-nostate", "b2-3state"} <= set(arms):
         print(f"     harm 末段 误杀(非目标 option 被判坏): "
               f"nostate {segs_('harm','b2-nostate')[-1]['false_kill']} / "
               f"3state {segs_('harm','b2-3state')[-1]['false_kill']}")
@@ -260,6 +304,34 @@ def main():
         ev = [x["evidence"] for x in segs_(sc, "b2-3state")]
         ok.append((f"⑥ [{sc}] 证据持续增长 (advq_n 单调)",
                    all(ev[i + 1] >= ev[i] - 1e-9 for i in range(len(ev) - 1))))
+
+    # ★★ ⑨ **反熟悉度否证实验**(leo 点名的最重要一条; 编号接在既有 ⑧ 之后)
+    #    对两个镜像故障各问一个问题:
+    #      chaos(不稳定): A 类**应该**察觉到 -> 证明它测的是"可预测性"
+    #      harm (稳定+错误): A 类**应该**察觉不到 -> 证明它测的**不是**
+    #                        "任务价值", 因此只能当辅助/风险通道
+    #    如果 A 在 harm 上也"察觉到了", 那是更可疑的情况(需另查来源);
+    #    如果 A 在 chaos 上毫无反应, 那它连"可预测性"都没测到 -> 直接淘汰。
+    if "chaos" in scen_names:
+        def dyn_flag(sc, nm):
+            """故障段里 A 类触发风险的 (命中, 总数)。"""
+            hit = tot = 0
+            for x in segs_(sc, nm):
+                dy = x.get("dyn")
+                if not dy or not x["faulted"]:
+                    continue
+                for v in dy["per_option"].values():
+                    tot += 1
+                    hit += int(v["risk"])
+            return hit, tot
+        for nm in ("a1", "a2", "a3"):
+            if nm not in arms:
+                continue
+            hc, tc = dyn_flag("chaos", nm)
+            hh, th = dyn_flag("harm", nm)
+            ok.append((f"⑨ [{nm}] A 察觉'不稳定'(chaos) 而不察觉'稳定但错误'(harm)",
+                       (hc > 0) and (hh == 0) and tc > 0 and th > 0,
+                       f"chaos {hc}/{tc}   harm {hh}/{th}"))
 
     # ⑦ 主任务不劣于安全基线 —— **只在 uniform 真正能跑的场景比**
     #    (harm 下 uniform 整体失败 steps_go=nan, 那时比较没有意义;

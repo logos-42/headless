@@ -29,6 +29,7 @@
 (容差尺度错 / 台账空 / 阈值没到), 到期把损害封顶。
 """
 import numpy as np
+import math
 
 from hibs_lnn.rr_options import (
     KeyDoorTabular, build_bottleneck_library, build_random_goal_library,
@@ -60,7 +61,7 @@ class RRSkillAgent(SkillAgent):
                  rr_calib_min_adv=0.0, rr_retire_rule="internal",
                  rr_calib_min_advq=0.0, rr_forgive_p=0.0,
                  rr_lr_v=0.2, rr_starve_steps=None, rr_unk_p=0.5,
-                 rr_three_state=False, **kw):
+                 rr_three_state=False, rr_dyn="none", rr_dyn_c=1.0, **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -219,6 +220,24 @@ class RRSkillAgent(SkillAgent):
         #   True 时启用三件事: 缓存为空 -> 退回基元层; 未知 -> 有限度探索;
         #   未知 -> 永不算坏。
         self.rr_three_state = bool(rr_three_state)
+        # ── A 类动力学证据(阶段四)─────────────────────────────────
+        #   `rr_cumulant`(上面那个)是 **option 构造期**参数 —— 它是 OaK 的
+        #   `(I_o, g_o, π_o, β_o)` 里的 `g_o`。A 类是**每步的动力学读数**,
+        #   是另一回事, 所以单开一个通道。
+        #
+        #   ★ 方向约定: 三个 cumulant 都**统一成"压力"(越大越差)** ——
+        #     A1 转移不确定性(归一化熵) / A2 转移预测误差(1−p(s2|s,a)) /
+        #     A3 离开已知稳定动力学区域(1−熟悉度)。
+        #     这样它们**只能当风险证据**, 不可能被读成"值"。
+        self.rr_dyn = str(rr_dyn)
+        if self.rr_dyn not in ("none", "A1", "A2", "A3"):
+            raise ValueError(f"unknown rr_dyn: {rr_dyn}")
+        self.rr_dyn_c = float(rr_dyn_c)
+        self._rr_T = {}          # (s,a) -> {s2: n}   在线转移计数(只用真实转移)
+        self._rr_vis = {}        # s -> n             访问次数
+        self._rr_dense = {}      # option -> [n, Σ, Σ²]  动力学证据台账
+        self._rr_dseg = [0.0, 0.0, 0.0]   # 全段基线 [n, Σ, Σ²] —— "显著更差"的参照
+        self._rr_dn = 0          # A 类喂了多少个转移
         self._rr_prev_state = {}     # option -> 上次判定(用来数退休/恢复次数)
 
     # ── 技能库(每个 regime 重建一次 —— 目标随 regime 移动) ──────────
@@ -310,6 +329,9 @@ class RRSkillAgent(SkillAgent):
                         "哪个 option 好"完全由 agent 自己的经验决定。
         """
         cand = [st for st in self.rr_lib_obj if initiation_ok(st, s)]
+        # 选择**尝试**总数 —— fallback 占比的分母必须是它, 不能是
+        # `selections`(那只在真的选中时加一, 比值会 > 1, 实测 6.827)。
+        self.rr_stats["sel_attempts"] = self.rr_stats.get("sel_attempts", 0) + 1
         if not cand:
             return None
         rule = self.rr_select_rule
@@ -408,6 +430,14 @@ class RRSkillAgent(SkillAgent):
             #   这就是 option 绕过 Q 也不影响它的原因 —— 它学的是"走到哪值多少",
             #   不是"哪个动作好"。
             self._rr_vstep(s, r, s2, done)
+            # ★ A 类动力学证据: **先读数(用更新前的表)再更新** —— 这是
+            #   "先预测、再观测"的正确在线语义。**失败时这行照样执行**:
+            #   到不了终点也有真实转移, 这正是 A 类作为候选的全部理由。
+            if self.rr_dyn != "none":
+                _dv = self._rr_dval(s, a, s2)
+                self._rr_dstep(s, a, s2)
+                self._rr_dacc(active.name if active is not None
+                              else "__primitive__", _dv)
             n += 1
             # ★ 奖励流监控: "连续多少步一分没拿"。Φ 从奖励流学, 奖励流为空
             #   时 Φ 恒为初值 —— 此时任何"不坏"的结论都是自欺。
@@ -598,6 +628,117 @@ class RRSkillAgent(SkillAgent):
         return float(np.sqrt(v / n))
 
     # ── 三态 epistemic state ────────────────────────────────────────
+    # ── A 类动力学 cumulant(阶段四)────────────────────────────────
+    def _rr_dval(self, s, a, s2):
+        """A 类 cumulant 的**行前读数**(用更新前的表 —— 先预测再观测)。
+
+        三条共同契约(leo 的四条要求里最硬的两条):
+          · 每一步都能在线获得 —— 只看刚发生的真实转移;
+          · **不用目标坐标、不用真实模型、不用未来标签** —— 只有
+            `(s, a, s2)` 三元组的计数, agent 自己走出来的;
+          · 统一方向 = "压力", 越大越差, ⇒ 天然不可能被读成"值"。
+        """
+        if self.rr_dyn == "none":
+            return 0.0
+        d = self._rr_T.get((int(s), int(a)))
+        n = sum(d.values()) if d else 0
+        if self.rr_dyn == "A1":
+            # 转移不确定性: 观测到的后继分布归一化熵。
+            #   没见过(n<2) -> 最大不确定 1.0。
+            if n < 2:
+                return 1.0
+            p = np.array(list(d.values()), float)
+            p /= p.sum()
+            return float(-(p * np.log(p + 1e-12)).sum()
+                         / np.log(max(2, getattr(self.mdp, "n_states", 32))))
+        if self.rr_dyn == "A2":
+            # 转移预测误差 = "意外度" 1 − p(实际后继 | s,a)。
+            #   ★ 这是**可预测性**, 不是任务价值 —— 一个稳定把你带向
+            #     错误方向的动作照样很容易预测(leo 点名的那条)。
+            if n < 2:
+                return 1.0
+            return float(1.0 - d.get(int(s2), 0) / n)
+        # A3 离开已知稳定动力学区域: 落点的**出发边平均熵**(归一化)。
+        #   ★ 方向必须与 A1/A2 一致 = "压力"(越大越差)。第一版写成了
+        #     `1 - 熵`, 返回的是**熟悉度** —— 与通道约定相反, 于是读数恒
+        #     1.000(确定性 MDP 里熵恒 0)、永不触发。这是"通道方向写反"
+        #     的典型样子: 指标看起来在动, 但基线与判据读的是相反的量。
+        ns = int(s2)
+        if self._rr_vis.get(ns, 0) == 0:
+            return 1.0                                  # 全新状态 -> 最大压力
+        ents = []
+        # 用**观测到的**出边动作, 不硬编码 (0,1) —— 第一版漏掉了 GRAB/OPEN,
+        # 而 KeyDoor 的动作是 LEFT/RIGHT/GRAB/OPEN 四个。
+        acts = {a2 for (ns2, a2) in self._rr_T if ns2 == ns}
+        for a2 in (sorted(acts) if acts else (0, 1)):
+            dd = self._rr_T.get((ns, int(a2)))
+            nn = sum(dd.values()) if dd else 0
+            if nn >= 2:
+                pp = np.array(list(dd.values()), float)
+                pp /= pp.sum()
+                ents.append(float(-(pp * np.log(pp + 1e-12)).sum()))
+        if not ents:
+            return 1.0                                  # 出边一条都没摸过
+        return float(min(1.0, np.mean(ents)
+                         / np.log(max(2, getattr(self.mdp, "n_states", 32)))))
+
+    def _rr_dstep(self, s, a, s2):
+        """把这一步的真实转移记进在线转移表 —— **失败时这行照样执行**。"""
+        k = (int(s), int(a))
+        d = self._rr_T.get(k)
+        if d is None:
+            d = self._rr_T[k] = {}
+        d[int(s2)] = d.get(int(s2), 0) + 1
+        self._rr_vis[int(s2)] = self._rr_vis.get(int(s2), 0) + 1
+        self._rr_dn += 1
+
+    def _rr_dacc(self, name, d):
+        """把读数记到 **具体 option** 的台账 + 全段基线。"""
+        L = self._rr_dense.get(name)
+        if L is None:
+            L = self._rr_dense[name] = [0.0, 0.0, 0.0]
+        L[0] += 1.0
+        L[1] += d
+        L[2] += d * d
+        B = self._rr_dseg
+        B[0] += 1.0
+        B[1] += d
+        B[2] += d * d
+
+    def _rr_dyn_bad(self, name):
+        """A 类风险判据: 该 option 的动力学压力是否**显著高于本段基线**。
+
+        尺度**完全由数据自己的方差给出**(两样本 SE), 不引入手工 ε ——
+        与 leo 在 inert 上要求的"'接近零'必须使用健康段自身的方差定义"同一条。
+        """
+        if self.rr_dyn == "none":
+            return False
+        L = self._rr_dense.get(name)
+        if L is None or L[0] < self.rr_min_launches:
+            return False
+        Bn, Bs, Bs2 = self._rr_dseg
+        if Bn < 20 or Bn <= L[0]:
+            return False
+        m = L[1] / L[0]
+        v = max(0.0, L[2] / L[0] - m * m)
+        bm = Bs / Bn
+        bv = max(0.0, Bs2 / Bn - bm * bm)
+        se = math.sqrt(v / L[0] + bv / Bn)
+        return (m - bm) > self.rr_dyn_c * se
+
+    def rr_dyn_stats(self):
+        """A 类通道的报告: 证据量 / 均值 / 是否触发风险。"""
+        Bn, Bs, Bs2 = self._rr_dseg
+        bm = Bs / Bn if Bn else 0.0
+        per = {}
+        for k in sorted(self._rr_dense):
+            L = self._rr_dense[k]
+            m = L[1] / L[0] if L[0] else 0.0
+            per[k] = {"n": int(L[0]), "mean": round(m, 4),
+                      "risk": bool(self._rr_dyn_bad(k))}
+        return {"kind": self.rr_dyn, "transitions": int(self._rr_dn),
+                "base_mean": round(bm, 4), "base_n": int(Bn), "per_option": per}
+
     def rr_starved(self):
         """奖励流是否为空 —— 势函数不可能在学东西。
 
@@ -627,6 +768,14 @@ class RRSkillAgent(SkillAgent):
             return "unknown"                      # 证据不足
         m = self._rr_advq_of(o)
         if m + self.rr_ucb_c * self._rr_advq_se(o) < 0.0:
+            return "bad"
+        # ★★ **反熟悉度保证**: A 类动力学证据**只能降级(好 -> 坏)**,
+        #    **永远不能升级(未知 -> 好)**。也就是说"可预测"买不到"好" ——
+        #    否则一个稳定把你带向错误方向的 option 会因为好预测而被判好。
+        #    这条不是调出来的, 是设计约束: A 类是**风险通道**, 不是值信号。
+        #    (它到底能不能当值信号, 由"稳定但错误"否证实验来判。)
+        nm = o.get("name")
+        if nm is not None and self._rr_dyn_bad(nm):
             return "bad"
         return "good"
 
@@ -661,10 +810,12 @@ class RRSkillAgent(SkillAgent):
         # ★ 归属到**这个 option**(此前 `st` 收下即弃 —— 库级台账不存在)
         o = self.rr_outcome.setdefault(getattr(st, "name", id(st)),
                                        {"n": 0, "reached": 0, "steps": 0,
+                                        "name": getattr(st, "name", None),
                                         "n_eff": 0.0, "reached_eff": 0.0,
                                         "steps_eff": 0.0,
                                         "adv_sum": 0.0, "adv_steps": 0.0,
-                                        "advq_sum": 0.0, "advq_n": 0.0})
+                                        "advq_sum": 0.0, "advq_n": 0.0,
+                                        "advq_sq": 0.0})
         dec = self._rr_decay()
         hit = 1.0 if reason == "beta_at_feature" else 0.0
         # 终身计数(永不衰减, 供报告与判据门限用)
