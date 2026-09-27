@@ -119,14 +119,24 @@ class Option:
     def terminated(self, s, unc=0.0, eps=0.05, tau_U=None, stall=0.0):
         """自适应终止 β_o(s): 任一条件命中即退出。
 
-            β_o(s) = 1  若  ① 目标达成  ||s - g|| < eps
+            β_o(s) = 1  若  ⓪ 进入**目标区域** in_goal_region(s)   ← 主判据
+                            ① 目标达成  ||s - g|| < eps
                             ② 不确定性过高 U_T > tau_U   (风险升高)
                             ③ 停滞       本轮进展 < stall
             β_o(s) = 0  否则
 
+        ★ ⓪ 是本轮新增的主判据。旧判据仅 ①(距离 < eps), 在**离散或高维**
+          状态空间里会退化 —— 实测 (KeyDoor, `vec()` 为 one-hot ⊕ 2 bit):
+          距离离散化为 {0, 1, 1.732, 2}, 而 eps=0.754 只接受精确到达
+          → 2737 次执行中因「达成」触发 **0 次**, 全部靠预算耗尽退出。
+          区域归属 (k-means Voronoi) 无阈值、覆盖全空间, 故设为主判据;
+          ① 保留为兜底 (regions 未设时行为不变)。
+
         ★ 固定长度执行是 open-loop 的病根: "即使当前情况已经不适合这个 option,
           它可能还在继续执行"。这里让 option **每步都可以退出**。
         """
+        if self.in_goal_region(s):
+            return True, "goal_reached"
         if self.goal_distance(s) < eps:
             return True, "goal_reached"
         if tau_U is not None and np.isfinite(unc) and unc > tau_U:

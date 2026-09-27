@@ -37,14 +37,14 @@ import statistics as st
 import sys
 
 
-def load(root="results"):
+def load(root="results", prefix="oak_k1v2_"):
     arms = {}
-    for d in sorted(glob.glob(os.path.join(root, "oak_k1v2_*"))):
+    for d in sorted(glob.glob(os.path.join(root, prefix + "*"))):
         f = os.path.join(d, "lm4_wave_results.json")
         if not os.path.exists(f):
             continue
         j = json.load(open(f))
-        name = os.path.basename(d)[len("oak_k1v2_"):]
+        name = os.path.basename(d)[len(prefix):]
         mode = "e9" if name.startswith("e9") else name.rsplit("_s", 1)[0]
         seed = name.rsplit("_s", 1)[-1]
         rec: dict = {"arm": name, "mode": mode, "seed": seed}
@@ -141,9 +141,10 @@ def welch(a, b):
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "results"
-    arms = load(root)
+    prefix = sys.argv[2] if len(sys.argv) > 2 else "oak_k1v2_"
+    arms = load(root, prefix)
     if not arms:
-        print("没找到 oak_k1v2_* 的结果(实验还在跑?)")
+        print("没找到 %s* 的结果(实验还在跑?)" % prefix)
         return 1
 
     print("=" * 96)
