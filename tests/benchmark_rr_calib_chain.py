@@ -65,6 +65,50 @@ ARMS = {
                                   rr_pot="exact"),
     "either-hl20":           dict(rr_select_rule="calibrated", rr_forget_hl=20,
                                   rr_retire_rule="either", rr_score="adv"),
+    # ══ ★ 对"在线可用势函数"问题的解: option 的**学习价值**(SMDP)══════
+    #   不需要任何势函数 —— advantage = Q_opt(s,o) − V_base(s),
+    #   两边都从 agent 自己的 Q 表出来, 同一尺度, 同一个初值。
+    "advq-hl20":             dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="advq", rr_score="advq"),
+    "advq-noforget":         dict(rr_select_rule="calibrated",
+                                  rr_forget_hl=float("inf"),
+                                  rr_retire_rule="advq", rr_score="advq"),
+    "advq-nopersist":        dict(rr_select_rule="calibrated", rr_persist=False,
+                                  rr_retire_rule="advq", rr_score="advq"),
+    # 对照: 保留旧势函数差分, 但**只换信号源**(advq 判据 + rate 选择)
+    "advqselect-hl20":       dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="internal", rr_score="advq"),
+    # ══ 诊断: Q_adv 这个信号本身有没有信息量? (只报数, 不淘汰)══════
+    #   若健康段 Q_adv > 0 而故障段 < 0, 信号是好的, 问题只在机制;
+    #   若两边都是同一符号, 信号本身不可用 —— 这是完全不同的结论。
+    "advq-none-hl20":        dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="none", rr_score="advq"),
+    # ══ ★ 原谅: 退休可逆 ══════════════════════════════════════════
+    "advq-forgive":          dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="advq", rr_score="advq",
+                                  rr_forgive_p=0.10),
+    # ══ ★★ 在线可用势函数(GVF)════════════════════════════════════════
+    #   `rr_pot="gvf"`: 中性初始化(全 0)的状态价值表, TD 从**每个转移**学,
+    #   不论那一步是谁出的动作 -> 无 oracle, option 绕过 Q 也不受影响。
+    #   实测 Φ ∈ [0, 0.999] 15 个不同值, advq = +0.0495/+0.0356 —— 符号与
+    #   `exact`(oracle 对照)一致, 而 `learned` 是 −0.275 的初值 artifact。
+    "advqGVF-hl20":          dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="advq", rr_score="advq",
+                                  rr_pot="gvf"),
+    "advqGVF-noforget":      dict(rr_select_rule="calibrated",
+                                  rr_forget_hl=float("inf"),
+                                  rr_retire_rule="advq", rr_score="advq",
+                                  rr_pot="gvf"),
+    "advqGVF-nopersist":     dict(rr_select_rule="calibrated", rr_persist=False,
+                                  rr_retire_rule="advq", rr_score="advq",
+                                  rr_pot="gvf"),
+    "advqGVF-forgive":       dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="advq", rr_score="advq",
+                                  rr_pot="gvf", rr_forgive_p=0.10),
+    # 对照: 只换势函数来源, 判据仍用内部达成率(分离"势函数"与"判据"两个因素)
+    "advqGVFint-hl20":       dict(rr_select_rule="calibrated", rr_forget_hl=20,
+                                  rr_retire_rule="internal", rr_score="advq",
+                                  rr_pot="gvf"),
 }
 
 
@@ -131,6 +175,7 @@ def run_arm(kw, fault="inert", episodes_per=400, seed=0, thresh=0.8, window=20):
             "bad_rate": float(ag._rr_rate(o)) if o else float("nan"),
             "bad_rate_life": (o["reached"] / o["n"]) if o and o["n"] else float("nan"),
             "bad_adv": float(ag._rr_adv(o)) if o else float("nan"),
+            "bad_advq": RRSkillAgent._rr_advq_of(o) if o else float("nan"),
             "detect_launches": broken_at,
         })
     return segs, {"none": n_none, "sel": n_sel}, ag
@@ -161,7 +206,8 @@ def main():
         fb = np.mean([r[1]["none"] / max(1, r[1]["sel"]) for r in runs])
         print(f"\n── {name}  (fallback 占比 {fb:.3f}) " + "─" * max(0, 58 - len(name)))
         print(f"   {'段':>3}{'tc':>4}{'故障':>6}{'T_adapt':>9}{'步数':>8}"
-              f"{'坏占比':>9}{'当前率':>9}{'终身率':>9}{'主任务adv':>11}{'检测延迟':>10}")
+              f"{'坏占比':>9}{'当前率':>9}{'终身率':>9}{'主任务adv':>11}"
+              f"{'Q_adv':>10}{'检测延迟':>10}")
         for si in range(len(CHAIN)):
             g = [r[0][si] for r in runs]
             dl = [x["detect_launches"] for x in g if x["detect_launches"] is not None]
@@ -172,7 +218,8 @@ def main():
                   f"{np.mean([x['usage'] for x in g]):>9.4f}"
                   f"{np.nanmean([x['bad_rate'] for x in g]):>9.3f}"
                   f"{np.nanmean([x['bad_rate_life'] for x in g]):>9.3f}"
-                  f"{np.nanmean([x['bad_adv'] for x in g]):>11.3f}{dls:>10}")
+                  f"{np.nanmean([x['bad_adv'] for x in g]):>11.3f}"
+                  f"{np.nanmean([x['bad_advq'] for x in g]):>10.4f}{dls:>10}")
 
     # ── 事前判据 ────────────────────────────────────────────────────
     print("\n" + "=" * 100)

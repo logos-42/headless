@@ -57,7 +57,9 @@ class RRSkillAgent(SkillAgent):
                  rr_min_launches=6, rr_ucb_c=1.0, rr_calib_min_rate=0.5,
                  rr_persist=True, rr_forget_hl=float("inf"),
                  rr_score="rate", rr_pot="learned",
-                 rr_calib_min_adv=0.0, rr_retire_rule="internal", **kw):
+                 rr_calib_min_adv=0.0, rr_retire_rule="internal",
+                 rr_calib_min_advq=0.0, rr_forgive_p=0.0,
+                 rr_lr_v=0.2, **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -127,7 +129,7 @@ class RRSkillAgent(SkillAgent):
         #            视野有限, 白走的路严格是损失。所以"每步产出多少达成"是
         #            一个不需要 oracle、又对主任务有意义的信号。
         self.rr_score = rr_score
-        if rr_score not in ("rate", "eff", "adv"):
+        if rr_score not in ("rate", "eff", "adv", "advq"):
             raise ValueError(f"unknown rr_score: {rr_score}")
         # ══ 主任务信号(§8 明写的那个缺口, 现在被实测证据逼出来了)══════
         #  为什么必须有: 只用 **option 自己的判据**(达成率)做校准是**错的**。
@@ -144,7 +146,7 @@ class RRSkillAgent(SkillAgent):
         #   它随学习变得有信息。`rr_pot="exact"` 用模型 VI 的 V_main 作对照,
         #   用来分离"信号质量"与"机制结构"两个因素。)
         self.rr_pot = rr_pot
-        if rr_pot not in ("learned", "exact"):
+        if rr_pot not in ("learned", "exact", "gvf"):
             raise ValueError(f"unknown rr_pot: {rr_pot}")
         self.rr_calib_min_adv = float(rr_calib_min_adv)
         #  rr_retire_rule  用哪条判据决定淘汰
@@ -153,10 +155,49 @@ class RRSkillAgent(SkillAgent):
         #    "both"     两条都判坏才淘汰             (保守)
         #    "either"   任一条判坏就淘汰             (激进)
         self.rr_retire_rule = rr_retire_rule
-        if rr_retire_rule not in ("internal", "adv", "both", "either"):
+        if rr_retire_rule not in ("none", "internal", "adv", "advq", "both",
+                                  "either", "all"):
             raise ValueError(f"unknown rr_retire_rule: {rr_retire_rule}")
         self.rr_regime_idx = -1        # 已见过的 regime 数(诊断用)
         self.rr_calib_hist = []        # [{'regime': i, 'broken': [...], 'usage': {...}}]
+        # ══ option 的**学习价值**(SMDP)══════════════════════════════════
+        #  ★ 这是对"在线可用势函数"问题的正确解 —— 不是找一个更好的 Φ,
+        #    而是**取消 Φ 这个中间量**,直接学 option 自己的价值。
+        #
+        #  为什么 Φ 这条路走不通:
+        #    `adv = [Φ(s_end) − Φ(s_start)] / steps` 把两件事混在一起 ——
+        #      (a) option 把我移动了
+        #      (b) agent 在学习, 所以 Φ 自己变了
+        #    而且乐观初始化下 Φ(s_start) = Φ(s_end) = 常数 -> 恒等于 0。
+        #
+        #  正确的量是 **advantage**:
+        #      A(s, o) = Q_opt(s, o) − V_base(s),   V_base(s) = max_a Q[s, a]
+        #  它直接回答"从 s 执行这个 option, 比贪心走基元动作好多少" ——
+        #  这正是"要不要留它"该问的问题。阈值 0 在**同一奖励尺度**上有意义,
+        #  而且两边**从同一个初值出发**(都 q_init), 所以早期 A ≡ 0 =
+        #  "还没有信息"(正确行为, 不是 bug)。
+        #
+        #  SMDP 更新(每次 option 结算时):
+        #      Q_opt[s0, o] += lr · [r_opt + γ^k · V(s1) − Q_opt[s0, o]]
+        #  r_opt = option 执行期间累计的**主任务**奖励, k = 执行步数。
+        #  部分执行(到期/停滞/被中断)按截断处理, 仍是合法 bootstrap。
+        #
+        #  ★ 判别器为什么**从数学里自己掉出来**(不是手设计的阈值):
+        #    inert(上限压到1步, 但那1步是好的): Q_opt ≈ γ·V(s') 且 V(s') ≈ V(s)/γ
+        #                                        => A ≈ 0     -> 不淘汰 ✓
+        #    harm (反转 π_o, 朝反方向走):        Q_opt ≈ γ·V(s_back), V(s_back) ≪ V(s)
+        #                                        => A ≪ 0     -> 淘汰   ✓
+        self.q_opt = None              # (n_states, n_opts) —— 惰性建表
+        self._rr_oidx = {}             # option 名 -> 列号(跨 regime 稳定的身份)
+        self.rr_calib_min_advq = float(rr_calib_min_advq)
+        # ★ GVF 势函数: **中性初始化**(全 0)的状态价值表。
+        #   为什么不能借用 `self.q.Q` 的 max: 那张表是乐观初始化,
+        #   未试过的动作会把 max 顶在初值上 —— 实测 V(s0) 逐位 1.0000。
+        self.rr_V = np.zeros(self.mdp.n_states, dtype=float)
+        self.rr_lr_v = float(rr_lr_v)
+        # ★ "犯错是可以原谅的" = **退休可逆**。被判坏的 option 以 p 的概率被重新检验;
+        #   若其统计量恢复(它用的是同一批阈值判据), 下次 `rr_broken` 自然不再点名它。
+        self.rr_forgive_p = float(rr_forgive_p)
 
     # ── 技能库(每个 regime 重建一次 —— 目标随 regime 移动) ──────────
     def _rr_ensure(self):
@@ -260,6 +301,17 @@ class RRSkillAgent(SkillAgent):
         if rule == "calibrated":
             broken = self.rr_broken()
             live = [st for st in cand if getattr(st, "name", None) not in broken]
+            # ★★ **原谅**(`rr_forgive_p`)—— "犯错是可以原谅的"的机制含义:
+            #   被判坏的 option **不是被处决**, 而是以 p 的概率被**重新检验**。
+            #
+            #   没有这条路就有一个**死锁**: 早期 V 还没学到东西(bootstrap 暂态),
+            #   option 的价值天然偏低 -> 判坏 -> 不再使用 -> 统计量永不更新 ->
+            #   永远坏。实测就是这么崩的: advq 恒 -0.004, fallback 0.999。
+            #   **退休必须可逆, 否则一次误判 = 永久损失。**
+            dea = [st for st in cand if getattr(st, "name", None) in broken]
+            if dea and self.rr_forgive_p > 0 and self.rng.rand() < self.rr_forgive_p:
+                self.rr_stats["forgiven"] = self.rr_stats.get("forgiven", 0) + 1
+                return dea[int(self.rng.randint(len(dea)))]
             if not live:                      # 全坏了 -> 退回基元层(诚实行为)
                 return None
             N = sum(o.get("n_eff", 0.0) for o in self.rr_outcome.values())
@@ -284,6 +336,7 @@ class RRSkillAgent(SkillAgent):
         s = self.mdp.reset()
         done, n = False, 0
         active, o_steps, prev_s, stuck, o_start = None, 0, None, 0, None
+        o_rew = 0.0            # option 执行期间的**主任务**累计奖励(SMDP 更新用)
         while not done and n < self.mdp.horizon:
             v0 = self.mdp.vec()        # ★ **步前**状态 —— 与父类 run_episode 同约定。
             a = None
@@ -291,7 +344,7 @@ class RRSkillAgent(SkillAgent):
                 # 启动
                 if active is None:
                     active = self._rr_select(s)
-                    o_steps, prev_s, stuck, o_start = 0, s, 0, s
+                    o_steps, prev_s, stuck, o_start, o_rew = 0, s, 0, s, 0.0
                     if active is not None:
                         self.rr_stats["selections"] += 1
                 # 出动作: **每步按当前状态重算 π_o**(闭环)
@@ -300,20 +353,27 @@ class RRSkillAgent(SkillAgent):
                         a = int(active.policy[s])
                         self.rr_stats["recomputes"] += 1
                     else:
-                        self._rr_settle(active, o_steps, "beta_stop", o_start, s)
+                        self._rr_settle(active, o_steps, "beta_stop", o_start, s,
+                                        r_opt=o_rew)
                         active, o_steps, o_start = None, 0, None
             if a is None:
                 if active is not None:
-                    self._rr_settle(active, o_steps, "devalued", o_start, s)
+                    self._rr_settle(active, o_steps, "devalued", o_start, s,
+                                    r_opt=o_rew)
                     active, o_steps, o_start = None, 0, None
                 a = self.q.act(s)
             s2, r, done = self.mdp.step(a)
             self.q.update(s, a, r, s2, done)
+            # ★ GVF 势函数: **每个转移都喂**, 不论那一步是 option 出的还是基元出的。
+            #   这就是 option 绕过 Q 也不影响它的原因 —— 它学的是"走到哪值多少",
+            #   不是"哪个动作好"。
+            self._rr_vstep(s, r, s2, done)
             n += 1
             self.trans.append((v0, a, self.mdp.vec()))    # (步前, 动作, 步后)
             # ── 结算判据: 全部在**新状态**上评估(正确语义) ──────────
             if active is not None:
                 o_steps += 1
+                o_rew += float(r)      # 主任务奖励记到**当前这个 option** 头上
                 self.rr_stats["exec_steps"] += 1
                 reason = None
                 # ★ 主判据 = **option 自己的 β_o**(由 stopping value z 导出)。
@@ -337,12 +397,14 @@ class RRSkillAgent(SkillAgent):
                 else:
                     stuck = 0
                 if reason:
-                    self._rr_settle(active, o_steps, reason, o_start, s2)
+                    self._rr_settle(active, o_steps, reason, o_start, s2,
+                                    r_opt=o_rew, done=bool(done))
                     active, o_steps, o_start = None, 0, None
                 prev_s = s2
             s = s2
         if active is not None:                     # 回合结束仍在执行
-            self._rr_settle(active, o_steps, "horizon_end", o_start, s)
+            self._rr_settle(active, o_steps, "horizon_end", o_start, s,
+                            r_opt=o_rew, done=True)
         self.episodes += 1
         return bool(done and self.mdp._reached()), n
 
@@ -376,6 +438,8 @@ class RRSkillAgent(SkillAgent):
             return self._rr_rate(o)
         if s == "eff":
             return self._rr_eff(o)
+        if s == "advq":
+            return self._rr_advq_of(o)
         return self._rr_adv(o)
 
     @staticmethod
@@ -384,14 +448,113 @@ class RRSkillAgent(SkillAgent):
         return o.get("adv_sum", 0.0) / max(1.0, o.get("adv_steps", 1.0))
 
     def _rr_pot(self, s):
-        """势函数 Φ(s)。`learned` = agent 自己的 max_a Q[s,a](在线、无 oracle)。"""
+        """势函数 Φ(s)。**必须是一个独立学习、中性初始化的状态价值预测**(GVF)。
+
+        三个来源, 依次说明为什么只有第三个在线可用:
+
+        `learned` —— `max_a Q[s,a]`, agent 的动作价值表取最大。
+            实测**不可用**: 该表是**乐观初始化**(q_init=+1.0), 只要某个动作
+            还没试过, `max_a` 就还是 1.0。实测 option 的启动状态上
+            `V(s0)` **逐位等于 1.0000**(初值), 而 `γ^k·V(s1) = 0.717` ->
+            advantage ≡ −0.275 —— **量出来的是初值 artifact, 不是 option 好坏**。
+            (32 个状态里只有 14 个有任一 Q 离开初值, 但"最大值"几乎都还在初值上。)
+
+        `exact` —— 模型 VI 的 `V_main`。干净, 但**是 oracle**(用了真转移模型),
+            只能当"信号质量"的对照, 不能当在线方案。
+
+        `gvf`   —— ★ **对"在线可用势函数"的答案**: 一张中性初始化(全 0)的
+            状态价值表, 用 TD(0) 从 agent **自己走的每一步**学, 不管那一步是
+            基元动作还是 option 内部的动作:
+
+                V[s] += lr_v · [r + γ·V[s'] − V[s]]
+
+            为什么这样就成了:
+              · **中性初值** -> 没有"未试过的动作把 max 顶在初值"这个病;
+              · 奖励稀疏(+1 只在终点) -> `V(s)` 自然收敛成 γ^(到目标的步数),
+                这**正是**我们要的"离目标多远"的势函数;
+              · **每个状态都被喂** -> option 绕过 Q 也没关系, 因为喂 V 的是
+                每一步的真实转移, 不是动作选择;
+              · 不用转移模型、不用目标位置的坐标 -> **无 oracle**。
+        """
         if s is None:
             return 0.0
         if self.rr_pot == "exact":
             return float(self._rr_v_main_arr[s])
+        if self.rr_pot == "gvf":
+            return float(self.rr_V[s])
         return float(np.max(self.q.Q[s]))
 
-    def _rr_settle(self, st, steps, reason, s0=None, s1=None):
+    def _rr_vstep(self, s, r, s2, done):
+        """GVF 势函数的一步 TD —— 每个转移都喂, 无论那一步是谁出的动作。"""
+        tgt = float(r) if done else float(r) + float(self.q.gamma) * self.rr_V[s2]
+        self.rr_V[s] += self.rr_lr_v * (tgt - self.rr_V[s])
+
+    def _rr_has_base(self, s):
+        """**势函数在该状态上是否有证据**(离开中性初值)。
+
+        为什么必须有这个门: 在没有任何经验的区域上比较"option 比基线好不好",
+        比出来的是**初值的形状**, 不是经验。这不是调阈值, 是判断的前提条件 ——
+        "要判断这里用 option 划不划算, 前提是在这里有过经验"。
+        """
+        if s is None:
+            return False
+        if self.rr_pot == "gvf":
+            return bool(abs(float(self.rr_V[s])) > 1e-12)
+        return bool(np.any(self.q.Q[s] != self.q.q_init))
+
+    # ── option 的学习价值(SMDP)──────────────────────────────────────
+    def _rr_oindex(self, name):
+        """option 名 -> `q_opt` 的列号。名跨 regime 稳定, 所以身份稳定。"""
+        if name not in self._rr_oidx:
+            self._rr_oidx[name] = len(self._rr_oidx)
+        n_col = len(self._rr_oidx)
+        if self.q_opt is None:
+            # 与基元 Q **同一初值** —— 这样早期 advantage ≡ 0 = "还没有信息",
+            # 而不是"所有 option 都很差"。
+            self.q_opt = np.full((self.mdp.n_states, max(n_col, 1)),
+                                 float(self.q.q_init))
+        elif self.q_opt.shape[1] < n_col:
+            pad = np.full((self.mdp.n_states, n_col - self.q_opt.shape[1]),
+                          float(self.q.q_init))
+            self.q_opt = np.hstack([self.q_opt, pad])
+        return self._rr_oidx[name]
+
+    def _rr_vbase(self, s):
+        """V_base(s) = max_a Q[s, a] —— **只用基元动作**的价值。
+
+        这是 advantage 的比较基线: "不用这个 option, 我靠基元动作能拿到多少"。
+        它必须是**基元专属**的, 不能把 option 的价值混进来, 否则
+        `Q_opt − V` 恒 <= 0(自己不可能超过包含自己的最大值)。
+        """
+        return float(np.max(self.q.Q[s]))
+
+    def _rr_vall(self, s):
+        """V_all(s) = max(基元, option) —— agent **实际行为**(含 option)的价值。
+
+        ★ SMDP 的 bootstrap 必须用它, 不能用 `_rr_vbase`: option 之间是可以
+          串联的(先拿钥匙再开门), 如果 option 从"基元专属"价值 bootstrap,
+          option 链上的价值就传不下去 —— 每次传播只能走一层。
+        """
+        v = float(np.max(self.q.Q[s]))
+        if self.q_opt is not None and self.q_opt.shape[1]:
+            v = max(v, float(np.max(self.q_opt[s])))
+        return v
+
+    @staticmethod
+    def _rr_advq_of(o):
+        """advantage = Q_opt − Φ(s0) 的(遗忘加权)均值。正 = 比基线好。"""
+        return o.get("advq_sum", 0.0) / max(1.0, o.get("advq_n", 1.0))
+
+    @staticmethod
+    def _rr_advq_se(o):
+        """上面那个均值的**标准误**(遗忘加权)。没有它就不能说"显著更差"。"""
+        n = max(1.0, o.get("advq_n", 0.0))
+        m = o.get("advq_sum", 0.0) / n
+        v = max(0.0, o.get("advq_sq", 0.0) / n - m * m)
+        return float(np.sqrt(v / n))
+
+    def _rr_settle(self, st, steps, reason, s0=None, s1=None,
+                   r_opt=0.0, done=False):
         self.rr_stats["terms"][reason] = self.rr_stats["terms"].get(reason, 0) + 1
         self.rr_stats["durations"].append(int(steps))
         # ★ 归属到**这个 option**(此前 `st` 收下即弃 —— 库级台账不存在)
@@ -399,7 +562,8 @@ class RRSkillAgent(SkillAgent):
                                        {"n": 0, "reached": 0, "steps": 0,
                                         "n_eff": 0.0, "reached_eff": 0.0,
                                         "steps_eff": 0.0,
-                                        "adv_sum": 0.0, "adv_steps": 0.0})
+                                        "adv_sum": 0.0, "adv_steps": 0.0,
+                                        "advq_sum": 0.0, "advq_n": 0.0})
         dec = self._rr_decay()
         hit = 1.0 if reason == "beta_at_feature" else 0.0
         # 终身计数(永不衰减, 供报告与判据门限用)
@@ -410,10 +574,32 @@ class RRSkillAgent(SkillAgent):
         o["n_eff"] = dec * o["n_eff"] + 1.0
         o["reached_eff"] = dec * o["reached_eff"] + hit
         o["steps_eff"] = dec * o["steps_eff"] + int(steps)
-        # ★ 主任务推进量(势函数差分)
+        # 势函数差分(旧方案; 保留作对照)
         prog = self._rr_pot(s1) - self._rr_pot(s0)
         o["adv_sum"] = dec * o["adv_sum"] + prog
         o["adv_steps"] = dec * o["adv_steps"] + max(1, int(steps))
+        # ★ SMDP 更新 + advantage 记账(新方案; 在线、无 oracle)
+        if s0 is not None and s1 is not None:
+            name = getattr(st, "name", None)
+            if name is not None:
+                j = self._rr_oindex(name)
+                qo = self.q_opt
+                assert qo is not None          # _rr_oindex 已建表
+                g, k = float(self.q.gamma), max(1, int(steps))
+                # ★ bootstrap 用**势函数** Φ: 它才是"agent 现在认为走到某状态值多少"
+                #   的在线估计。`gvf` 时它是中性初始化独立学的状态价值,
+                #   没有"未试过的动作把 max 顶在初值"这个病。
+                boot = 0.0 if done else (g ** k) * self._rr_pot(s1)
+                tgt = float(r_opt) + boot
+                qo[s0, j] += self.q.lr * (tgt - qo[s0, j])
+                # ★ 只在**势函数对该状态有证据**时记账 —— 否则比的是初值的形状
+                if self._rr_has_base(s0):
+                    advq = float(qo[s0, j]) - self._rr_pot(s0)
+                    o["advq_sum"] = dec * o["advq_sum"] + advq
+                    o["advq_sq"] = dec * o.get("advq_sq", 0.0) + advq * advq
+                    o["advq_n"] = dec * o["advq_n"] + 1.0
+                else:
+                    o["no_base"] = o.get("no_base", 0) + 1
 
     # ── 自我校准: 检测 + 淘汰 ───────────────────────────────────────
     def rr_broken(self, names=None):
@@ -445,15 +631,30 @@ class RRSkillAgent(SkillAgent):
                 continue
             bad_int = self._rr_rate(o) < self.rr_calib_min_rate
             bad_adv = self._rr_adv(o) < self.rr_calib_min_adv
+            # advq 额外要求**基线证据够** + **显著更差**:
+            #   ★ 判据必须是 "上置信界 < 0"(显著更差), 不是 "均值 < 0"。
+            #   实测量到 Q_adv = −0.0002 —— 那是**零的噪声范围之内**,
+            #   严格 `< 0` 会把每一个 option 都判坏(fallback 0.994)。
+            #   证据不足时不许处决 —— 这正是"犯错是可以原谅的"的统计版本,
+            #   而且它不需要任何手工 epsilon: 尺度由数据自己的方差给出。
+            advq_mean = self._rr_advq_of(o)
+            bad_q = (o.get("advq_n", 0.0) >= self.rr_min_launches
+                     and advq_mean + self.rr_ucb_c * self._rr_advq_se(o) < 0.0)
             rule = self.rr_retire_rule
-            if rule == "internal":
+            if rule == "none":              # 诊断臂: 只报数, 不淘汰
+                hit = False
+            elif rule == "internal":
                 hit = bad_int
             elif rule == "adv":
                 hit = bad_adv
+            elif rule == "advq":            # ★ 在线可用: 只需 agent 自己的 Q
+                hit = bad_q
             elif rule == "both":
-                hit = bad_int and bad_adv
+                hit = bad_int and bad_q
+            elif rule == "all":
+                hit = bad_int and bad_adv and bad_q
             else:
-                hit = bad_int or bad_adv
+                hit = bad_int or bad_q
             if hit:
                 out.add(k)
         return out
@@ -473,6 +674,7 @@ class RRSkillAgent(SkillAgent):
                       "rate_life": round(o["reached"] / o["n"], 4) if o["n"] else 0.0,
                       "eff": round(self._rr_eff(o), 4),
                       "adv": round(self._rr_adv(o), 4),
+                      "advq": round(self._rr_advq_of(o), 4),
                       "mean_steps": round(o["steps"] / o["n"], 2) if o["n"] else 0.0}
         broke = self.rr_broken()
         return {"per_option": per, "broken": sorted(broke),
