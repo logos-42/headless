@@ -11,6 +11,26 @@ status: current
 
 ## 最近更新
 
+- 2026-09-27（晚）：**L2 结算（H2 被证实）+ 修复版 B 矩阵结算 + `terminated()` 接入区域判据 + L3 起跑**
+  - **① L2（rounds=300，25 臂，闸门全过）**：`e9 0.7827 / fixed 0.7570 / goal 0.7660 / goal_term 0.7652 / override 0.7677`
+    - **★ O2（闭环）vs O1（开环）Δ=+0.0090 t=+2.19 p=0.0286 显著** —— K1v2 时是 Δ=+0.0029 **p=0.3287 不显著**
+      → **用户假设 H2「样本量不足」被证实**（不是被排除）
+    - 但**所有 option 档仍显著差于 e9**（Δ=−0.0149…−0.0257，全部 p≤0.0001）
+    - option 档排序**符合理论预测**：`override > goal_term ≈ goal > fixed`（开环最差）
+    - `term_reasons` 依旧：`goal` 57 次启动 **56 次 expired、仅 1 次 goal_reached**
+  - **② 修复版 B 矩阵结算**（KeyDoor，隔离副本，3 seed × 400 回合）：
+    复用 `primitive 1.82x / rediscover 1.17x / macro 1.08x`
+    - **修复确有效**：rediscover 复用 **0.98x → 1.17x**，永不收敛段 **10/18 → 6/18**；macro 台账活了（21.3%/7.9%/26.4%）
+    - ★ **对照干净**：修复版 `primitive` 臂与老基线**逐位相同** → 改动只影响 option 臂
+    - **但无任何 option 模式优于 primitive**（1.82x、0 段不收敛、成功率全 1.0）；macro seed43 甚至 6/6 全灭
+  - **③ `terminated()` 接入区域判据（关键）**：上一提交只改了 `SkillAgent._macro_step`，但 **lm4 管线不走那里** ——
+    `oak_proposer.py:187` 直接调用 `o.terminated(...)`。L2 因此仍在用旧距离判据（= 57 次启动仅 1 次 reached 的原因）。
+    本提交把 `in_goal_region` 接入 `terminated()` **主判据**（距离判据保留兜底，未设 regions 时逐字不变）。
+    单元验证逐项通过；真实链路 macro 台账 **50.3%**（修复前 14.4%）
+  - **④ L3 批起跑**（`tests/oak_longv3.sh`，25 臂，GPU0）：与 L2 **逐字相同**，唯一变量 = 区域判据。
+    启动前硬闸门新增两条（缺 `in_goal_region` / `terminated()` 未接线 → **拒绝启动**）
+    - 事前判据：① `goal_reached` 显著 > 1 次 ② 若 Δ 仍显著为负 → **终止判据被排除** ③ 剩余症结只能来自**目标选取/发现方法**
+
 - 2026-09-27：**GPU 容器故障闭环 + option 三处结构性缺陷（死账／够不着的目标／错的瓶颈统计量）**
   - **① 容器设备故障已解除。** 运行期对主设备号 195 整段拒绝（`/dev/null/zero/random/ptmx` 放行、仅 nvidia 全 EPERM；
     自建 major 195 minor 0–255 **全 EPERM** = cgroup eBPF 设备白名单特征）；容器内无 `docker.sock`、有 MKNOD 无 SYS_ADMIN/BPF
