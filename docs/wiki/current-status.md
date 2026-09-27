@@ -11,6 +11,24 @@ status: current
 
 ## 最近更新
 
+- 2026-09-16：**K1v2 有效测量（修好管线后重跑）+ 四房间 Fig.6 首次复现 + 环境/自检三处缺陷修复**
+  - **① K1v2：option 执行模式的第一次有效测量。** 修 `observe_action` 接线后重跑 25 臂（3.0 分/臂匀速 → 确在 GPU 上完成）。
+    闭环档这次真的执行：`goal` 的 `starts` **1→21**、`steps` **0→84**、`replan=84`（旧版是 1 次启动跑满 87% 的锁死）
+  - **四个 option 档全部显著差于无 option**（Δ=−0.0072…−0.0111，p=0.0003…0.0055），
+    且 **O2 闭环 vs O1 开环 Δ=+0.0029 p=0.3287 不显著 → 排除「问题是开环执行」**
+  - **机制在 `term_reasons` 里**：`goal` 21 次启动 **20 次 `expired`**、`steps/starts ≈ 4 = max_opt_len`、
+    5 seed 合计 `goal_reached` 只 1 次 → **option 从未到达过目标**，因为目标是瓶颈中心性给的任意远端状态
+  - **② 四房间复现不了的真因找到了**：旧 `FOUR_ROOM` 行长 12/13/14 且含**空格** → `.ljust` 静默补墙 +
+    空格变**幽灵地板**。新增 `validate_layout()` 构造期硬报错 → 立刻又抓到 **`TWO_ROOM` 同样行长不齐**
+    → **已「复现成功」的两房间结果也建在被静默改过的几何上**
+  - **③ `check_two_room` 自身有 bug**：hall 候选没排除灰色格 → 「绕开灰色区到达 hall」**构造上不可能为真**
+    → 该自检从写出来就永远报 ✗。修掉后测出旧两房间**三条性质一条都没满足**（col 1 是通的，自由竖井绕过整个灰色区）
+  - **④ 修复并重验**：两房间重跑 primitive 1400 / shortest 1750 (1.250) / reward-respecting 875 (0.625) —— 方向不变；
+    **四房间随机动力学首次跑通** 48872 / 53710 (1.099) / 26200 (0.536) → **Fig.1 与 Fig.6 两个方向都成立**
+  - **⑤ GPU 再次掉线（当前阻塞）**：根因 `head -c 16 /dev/nvidiactl → Operation not permitted` =
+    **容器设备 cgroup 拒绝访问**，只能由宿主侧重启容器修复
+  - 详见 `docs/oak_repro_ground_truth.md`（七处 bug 台账化）
+
 - 2026-09-16：**BM 修正版结算复核 —— 数字逐位复现，结论不变（价值函数仍测不出效应）**
   - 对活动服务器数据重跑 `tests/analyze_benchmark.py` / `analyze_bm2_full.py`：§1/§2/§3 全部数字**逐位复现**
     （lm4 `random-matched` 主口径 0.7635 / 0.7542 / 0.7594 与 `results/bm2.log` 逐位相同；日志同时确认候选池 60）
@@ -220,20 +238,51 @@ status: current
 | ⑨ | 时间抽象被掐死 | `max_opt_len=3`；论文里 option 跑 11–17 步 |
 | ⑩ | 基准无结构 | lm4 `A ≡ 0` → 任何类别的 option 都无收益 |
 
-**Ground truth 已建立并复现论文两个方向**（`tests/benchmark_oak_repro.py`）：
+**Ground truth 已建立,且 Fig.1（确定性两房间）与 Fig.6（随机四房间）两个方向都复现**（`tests/benchmark_oak_repro.py`）：
 
 ```
-只用 primitive              1716 look-ahead ops   (基线)
-+ shortest-path option      2145   ratio 1.250  更慢 ✓ 与论文一致
-+ reward-respecting option   195   ratio 0.114  快 8.8x ✓ 与论文一致
-w̄ 扫描: 1 -> 195 ; 10/100 -> 2145 (退化成 shortest-path ✓ 论文 §6)
+两房间(确定性, Fig.1):    primitive 1400 / shortest-path 1750 (1.250, 更慢 ✓)
+                          reward-respecting  875 (0.625, 更快 1.6x ✓)
+四房间(随机, Fig.6):      primitive 48872 / shortest-path 53710 (1.099, 更慢 ✓)
+                          reward-respecting 26200 (0.536, 更快 1.87x ✓)
+w̄ 扫描: 1 -> 195 ; 10/100 -> 2145 (退化成 shortest-path ✓ 论文 §6；需在新布局上重扫)
 ```
 
-**修复**：诊断文档 `docs/oak_diagnosis_from_papers.md`、结果 `docs/oak_repro_ground_truth.md`；
+★ **注意**：两房间的旧数字（1716 / 2145 / **195**,8.8×）是在一个**被 `.ljust` 静默改过的几何**上得到的
+—— 旧布局第 3、4 行是 8 字符而其余是 9,而且该几何实际**一条论文性质都不满足**。
+重设布局后方向不变但效果量降到 1.6×。**旧数字已作废,以本表为准。**
+
+**修复**：诊断文档 `docs/oak_diagnosis_from_papers.md`、结果 `docs/oak_repro_ground_truth.md`（七处 bug 台账化）；
 代码 `hibs_lnn/gridworld.py`、`hibs_lnn/subtask_options.py`。
-本轮另修掉**四个真 bug**（三个在 ground truth 里暴露，一个在主回路）：
-stopping value 恒等于主任务价值 / planner 只贴现一步致 value iteration 发散 /
-goal 非吸收态致价值爆炸 / **coverage 的唯一写入点 `observe_action()` 主回路从未调用**（致闭环 option 静默空转、轨迹与 E9 逐位相同）。
+本轮修掉**七个真 bug**：三个在 ground truth 暴露（stopping value 恒等于主任务价值 /
+planner 只贴现一步致 value iteration 发散 / goal 非吸收态致价值爆炸）、
+一个在主回路（**coverage 的唯一写入点 `observe_action()` 主回路从未调用** → 闭环 option 静默空转、轨迹与 E9 逐位相同）、
+三个在环境与自检（`FOUR_ROOM` 行长不齐+含空格 → 静默补墙+幽灵地板 / `TWO_ROOM` 同样行长不齐 /
+**`check_two_room` 的 hall 候选未排除灰色格 → 该自检构造上永不可能通过**）。
+
+### K1v2：修好管线后的**第一次有效测量**（2026-09-16）
+
+修掉 `observe_action` 接线后重跑 25 臂（`tests/oak_k1v2.sh`，3.0 分/臂匀速 → 确在 GPU 上完成）。
+**闭环档这次真的执行**：`goal` 的 `option_starts` **1→21**、`option_steps` **0→84**、`replan_steps=84`
+（旧版是「1 次启动跑满 87% 全程」的锁死形态）。
+
+```
+e9(无 option)        0.7581 ± 0.0047
+fixed                0.7470   Δ=−0.0111  p=0.0003  显著更差
+goal                 0.7499   Δ=−0.0082  p=0.0036  显著更差
+goal_term            0.7498   Δ=−0.0083  p=0.0033  显著更差
+goal_term_override   0.7509   Δ=−0.0072  p=0.0055  显著更差
+
+★ O2(闭环) vs O1(开环):  Δ=+0.0029  p=0.3287  不显著
+```
+
+**两个实质结论**：
+① **排除了「问题是开环执行」** —— 闭环与开环无差别,所以病灶不在执行模式。
+② **机制藏在 `term_reasons` 里**：`goal` 21 次启动中 **20 次 `expired`**、`steps/starts ≈ 4 = max_opt_len`、
+5 个 seed 合计 `goal_reached` 只发生 1 次 → **option 从未到达过它的目标**。
+因为目标是瓶颈中心性给出的任意远端状态,而非 reward-respecting subtask,它只是花光预算奔向一个到不了的地方 —— 纯机会成本。
+（分析器 `tests/analyze_k1v2.py` **先过机制闸门再谈对照**;闸门已用旧 K1 的真实计数做夹具验证,
+能准确拒掉 `starts==1`（锁死）与 `start_blocked>0`（空转）两种形态。）
 
 **下一步按论文顺序，不跳步**：补 subtask 层 → option model 进 planner → off-policy 学 `π_o` → utility feedback → 才回到 lm4/lm5（且须先给它们造出有价值结构的状态空间）。
 
