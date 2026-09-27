@@ -11,6 +11,23 @@ status: current
 
 ## 最近更新
 
+- 2026-09-27（晚·续）：**OaK 第一步落地 —— SubTask → Option 层实现 + 三方向消融**
+  - **驱动层换回论文的 SubTask**（此前从瓶颈/介数/最短路反推 = 论文点名的最差类别）
+  - 新增 `hibs_lnn/rr_options.py` + `hibs_lnn/rr_agent.py`（**子类**，primitive 路径逐字委托 ⇒ 对照逐位干净）
+  - **机制存活**：`β_o` 非空（`|β|=33`）、闭环（`recomputes == exec_steps == 210`）、
+    终止台账 `{beta_at_feature: 43}` 且 **`expired: 0`**（对照 L2 的 56/57 expired）、lock-in 0.16
+  - **规划指标**：`rr-exact` 四 regime 全 ≤ primitive（0.333~0.667）；
+    **`bottleneck` 1.250 逐位命中论文的 2145/1716 = 1.25**
+  - ⚠ **T_adapt 在 KeyDoor 上饱和**（所有 option 臂贴窗口下限 20，连瓶颈臂也是）——
+    真因是 **KeyDoor 没有代价区**（论文负向需要「最短路穿过代价区」+「存在绕行」两个前提）。
+    ⇒ **T_adapt 不能作主指标，此前以它为头条的 option 结论受此污染**；改用 steps-to-goal
+  - ⚠ **价值函数假设得到反向证据**：`rr-zeroV`（z 不用 V_main）9.0 步 **优于** `rr-exact` 9.4 步 ——
+    `V_main` 让 `β_o` 提前触发，把控制权过早交还给尚未训练好的 base policy
+  - **剂量响应 + 内部哨兵逐位通过**（`opt_prob=0` ≡ primitive）；ΔS 随剂量单调
+  - **三个方向在论文 gridworld**：两房间 ①✓1.250 ②✓0.625 ③✗；四房间 ①✓1.099 ②✓0.536 **③✓0.828**
+    ⇒ **“目标选得好”只在结构足够复杂的环境里成立**，两房间这个台子分不开
+  - 报告 `docs/rr_subtask_ablation.md`；本轮抓到 4 个新真 bug（含 `trans` 记录用步后状态 —— 哨兵判据的回报）
+
 - 2026-09-27（晚）：**L2 结算（H2 被证实）+ 修复版 B 矩阵结算 + `terminated()` 接入区域判据 + L3 起跑**
   - **① L2（rounds=300，25 臂，闸门全过）**：`e9 0.7827 / fixed 0.7570 / goal 0.7660 / goal_term 0.7652 / override 0.7677`
     - **★ O2（闭环）vs O1（开环）Δ=+0.0090 t=+2.19 p=0.0286 显著** —— K1v2 时是 Δ=+0.0029 **p=0.3287 不显著**
