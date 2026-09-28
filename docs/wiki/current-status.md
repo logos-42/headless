@@ -11,6 +11,19 @@ status: current
 
 ## 最近更新
 
+- 2026-09-28（16:05）：**门控 cron 第六次唤醒（`UNREACHABLE → DONE2` 链路抖动恢复）—— 逐位复现 + 报告新增 §2.1 逐 seed 原始指标**
+  - 服务器 bm 数据自 **2026-09-14T08:19 UTC** 起零变化（09-15 后无任何 `bm*` 文件写入）；
+    `tests/analyze_benchmark.py` / `analyze_bm2_full.py`（本地与服务器 `/tmp` 副本 md5 一致）对活动数据重跑，
+    §1/§2/§3 全部数字**逐位复现**（lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047；
+    lm5 `value` 0.2565±0.0928 / `random-matched` 0.2839±0.0157；lm5 `value` vs `value-nofb` 三 seed 矩阵逐位相同）
+  - **新增 §2.1**：lm5 七臂 × 3 seed 的 `matrix` 末行 / `any_time_acc` / `worst_case_forget` 原始值 →
+    方差来源定位到 `value` 的 **seed 1 因果系**（`causal` 0.0115 / `causal_do` 0.011，另两 seed 0.354/0.344 与 0.513/0.481），
+    而 `random-matched` 三 seed 稳定（`causal` 0.356–0.362 / `causal_do` 0.420–0.548）
+  - ⇒ **读法精确化**：lm5 `Delta=−0.0274` 应读作「**尾部风险大**」，不是「价值函数整体更差」；`n=3` 无法区分二者。
+    核心两问仍全部不显著：(1) `value` vs `random-matched`（lm4 +0.0013 / lm5 −0.0274，**两 benchmark 符号相反**）
+    (2) `value` vs `value-nofb`（lm5 三 seed 逐位相同 ⇒ 反馈项 `lambda_fb` 在 lm5 等价死项）
+  - 详见 `docs/bm_benchmark_results.md` §0 / §2.1 / §5
+
 - 2026-09-28（晚）：**门控 cron 第五次唤醒 —— 只读复核逐位复现；修正上一轮「报告丢失」误报（真根因：本机未接交付平台）**
   - 门控 diff 又是 `UNREACHABLE → DONE2` = **6100 端口链路抖动恢复**，不是新的完成事件；服务器 bm 数据仍零变化
   - `tests/analyze_benchmark.py` / `analyze_bm2_full.py`（本地与服务器 `/tmp` 副本 md5 一致 `2f09581d…` / `a98c9cca…`）
