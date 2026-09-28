@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-09-27
+last_confirmed: 2026-09-28
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,15 @@ status: current
 ---
 
 ## 最近更新
+
+- 2026-09-28：**BM 修正版结算复核（第三次）—— 服务器数据未变，数字逐位复现，结论不变**
+  - 门控 cron 由 `UNREACHABLE → DONE2` 唤醒；对活动数据重跑 `tests/analyze_benchmark.py` / `analyze_bm2_full.py`，
+    §1/§2/§3 全部数字**逐位复现**（lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047；
+    lm5 `value` 0.2565±0.0928 / `random-matched` 0.2839±0.0157）
+  - `results/bm2_*` / `bm5b_*` / `bm_bins_*` 最新文件时间戳仍为 **2026-09-14T08:19 UTC**，09-15 后无 bm 相关写入
+  - 两个核心问题仍全部不显著：① `value` vs `random-matched`（lm4 +0.0013 / lm5 −0.0274）
+    ② `value` vs `value-nofb`（lm5 三 seed 矩阵逐位相同 ⇒ λ_fb 等价死项）
+  - 详见 `docs/bm_benchmark_results.md` §0
 
 - 2026-09-27（晚·续七）：**A′ 可辨识 benchmark —— A 类从「不可辨识」到「可辨识」，但 FP 未达标**
   - **目标改写（按 leo）**：不是「给 KeyDoor 加噪声让 A 类通过」，而是

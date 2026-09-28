@@ -53,6 +53,13 @@ scp 到服务器**对活动数据重跑**, §1/§2/§3 全部数字**逐位复�
 `bm2.log` 同时确认 `[proposer] 候选池 60 个区间`)。服务器 `results/` 自 09-14 08:19 UTC 后未再变化 →
 **本报告与当前服务器状态一致**。本次只补登了原表遗漏的 3 条 Welch 行 (见 §3), 无数字修订。
 
+**复核 (2026-09-28, cron 门控 `BENCHMARK_STATE=DONE2` 唤醒)**: 第三次把仓库内的
+`tests/analyze_benchmark.py` / `tests/analyze_bm2_full.py` 送服务器对活动数据重跑 —— §1/§2/§3
+全部数字**逐位复现** (lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047;
+lm5 `value` 0.2565±0.0928 / `random-matched` 0.2839±0.0157; lm5 `value` vs `value-nofb` 三 seed
+遗忘矩阵逐位相同)。`results/bm2_*` / `bm5b_*` / `bm_bins_*` 内**最新文件时间戳仍为 2026-09-14T08:19 UTC**,
+09-15 之后无任何 bm 相关文件写入 (`results/BM2_DONE` 仍在) → **结论与 09-14 / 09-16 一致, 无数字修订。**
+
 ---
 
 ## 1. LM4 — 任务流 + 调度臂 (3 seed, 修正版)
