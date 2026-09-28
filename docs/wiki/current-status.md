@@ -54,6 +54,29 @@ status: current
     ② `value` vs `value-nofb`（lm5 三 seed 矩阵逐位相同 ⇒ λ_fb 等价死项）
   - 详见 `docs/bm_benchmark_results.md` §0
 
+- 2026-09-27（晚·续八）：**L3 批裁定（GPU 跑的）—— 机制通了，主指标分不开**
+  - 这是 **GPU 上的批**（`tests/oak_longv3.sh`，25 臂 × 5 seed，GPU0，rounds=300）。
+    **A′ 是纯 CPU 的 KeyDoor 小 MDP，12h GPU 窗口一次都没用**
+  - 五档：`e9` 无 option / `fixed` 开环 / `goal` 闭环 / `goal_term` +β_o / `goal_term_override` +抢占
+  - 主结果（replay acc）：`e9 0.8056` > `goal_term 0.7996` > `goal_term_override 0.7900`
+    > `goal 0.7789` > `fixed 0.7531`；五档 `std < mean/2` 全过
+  - 机制闸门 ✅：`goal_reached` 从 L2 的 ~1 → **95**（`override 6 / expired 35`）
+  - **★ 但三个闭环档的 `|Δ|` 全部小于本批分辨极限**
+    （`goal_term` |Δ|=0.0060 需 73 seed / `goal_term_override` 0.0156 需 15 / `goal` 0.0267 需 6）
+    ⇒ **本批没有能力回答「闭环 option 是优是劣」**，不是「回答是没有差异」
+  - **唯一可信结论**：`fixed`（开环）`|Δ|=0.0525` > MDE `0.0453` ⇒ **显著更差**
+  - **★ 三处统计纪律（第一次显式写下）**：① `n=5 ⇒ df=4`，临界 **2.776 不是 1.96**
+    （按 1.96 会把 `goal` t=−2.58 误判为显著，实际 p=0.0615 不显著）；
+    ② 配对比较必须用 **配对差的 std**（`goal_term_override` 0.0091 → 0.0278，差 2~5 倍），
+    用臂自身 std 算 MDE 会严重低估所需样本量；③ 判据应是 **MDE 而非 p**，
+    `|Δ| < MDE` 时必须输出 **inconclusive**，不能输出「未通过」
+  - **判据 ③ 设计缺陷**：写的是「Δ 显著为负 ⇒ 终止判据被排除」，正确形式是
+    「**Δ 相对 O2 收窄 ⇒ 处理变量起效**」。数据支持后者（`−0.0267 → −0.0060`，收窄 0.0207）。
+    排除「终止判据是症结」靠的是 **`goal_reached` 机制读数**，不是主指标显著性
+  - **纠正了我自己的误判**：「遗忘」列与 `1−acc` **不是**恒等式（两者之和落在 0.9212~0.9763，
+    `corr(replay_acc, 遗忘) = −0.76`）；`naive` 档跨 seed 极差 **0.5150** ⇒ 本裁定只用 `replay_acc`
+  - 报告 `docs/l3_verdict.md`
+
 - 2026-09-27（晚·续七）：**A′ 可辨识 benchmark —— A 类从「不可辨识」到「可辨识」，但 FP 未达标**
   - **目标改写（按 leo）**：不是「给 KeyDoor 加噪声让 A 类通过」，而是
     「构造一个使 novelty 与 dynamics change 可辨识的最小 benchmark」。
