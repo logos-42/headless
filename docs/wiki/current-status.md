@@ -11,6 +11,16 @@ status: current
 
 ## 最近更新
 
+- 2026-09-28（晚）：**门控 cron 第五次唤醒 —— 只读复核逐位复现；修正上一轮「报告丢失」误报（真根因：本机未接交付平台）**
+  - 门控 diff 又是 `UNREACHABLE → DONE2` = **6100 端口链路抖动恢复**，不是新的完成事件；服务器 bm 数据仍零变化
+  - `tests/analyze_benchmark.py` / `analyze_bm2_full.py`（本地与服务器 `/tmp` 副本 md5 一致 `2f09581d…` / `a98c9cca…`）
+    对活动数据重跑 → 全部数字**逐位复现**（lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047；
+    lm5 `value` 0.2565±0.0928 / `random-matched` 0.2839±0.0157；lm5 `value` vs `value-nofb` 矩阵逐位相同）
+  - ⚠ **修正**：报告**没有丢** —— 每次输出都落盘 `~/.hermes/cron/output/bff2174e8bef/<时间戳>.md`（12:10 那份 11,833 B 在盘上）。
+    交付失败的**真根因**是 `~/.hermes/channel_directory.json` 的 `platforms = {}` ⇒ **本机没有任何交付平台**，
+    `deliver="all"` 对任何作业都不可能成功；作业字段实为 `deliver="all"` / `origin=null`（不是 `delivery=null`）
+  - 详见 `docs/bm_benchmark_results.md` §0
+
 - 2026-09-28（下午）：**门控 cron 第四次唤醒 —— 只读复核，数字逐位复现；顺带查出「cron 报告从未送达」**
   - 门控 diff 是 `UNREACHABLE → DONE2` = **6100 端口链路抖动**，不是新的完成事件；
     服务器 bm 数据自 **2026-09-14T08:07 UTC** 起零变化（09-15 后无任何 `bm*` 文件写入）
@@ -458,9 +468,10 @@ status: current
 
 ## 已知的执行缺口（必须默认开启，不能只在单次 run 里用）
 
-- **cron 交付通道（2026-09-28 查出）**：`lm4-lm5-benchmark-done-gate`（`bff2174e8bef`）的 `delivery` 为 `null`
-  → 所有非静默输出记为 `delivery_outcome=failed`（6/6，0 次送达）。**报告只落在 `docs/wiki` + git**；
-  修好之前，不要假设 leo 看过任何本作业的报告
+- **cron 交付通道（2026-09-28 查出；当晚修正根因）**：`lm4-lm5-benchmark-done-gate`（`bff2174e8bef`）字段为 `deliver="all"` / `origin=null`，
+  本机 `platforms = {}`（未接任何交付平台）⇒ 非静默输出必然 `delivery_outcome=failed`（7/7，0 次送达）。
+  但**报告不丢**：输出落盘 + `docs/wiki` + git 都在（路径见上一条「最近更新」）。
+  修法 = 接一个交付平台，或把该作业 `deliver` 改成 `local`（与其余三个作业一致）。
 - **学习效率曲线**：`--trace-every` 在 105 个 result tag 中仅 1 个开启过 → 后续所有实验**默认开启**
 - **类不平衡指标**：任何类不平衡任务必须**同时**报原始准确率 + 平衡准确率
 - **push 后必须更新本 wiki**（log.md 追加 + 本文件同步 + `wiki_check.py` / `wiki_lint.py --strict=v2` / `raw_manifest_check.py` 全绿）
