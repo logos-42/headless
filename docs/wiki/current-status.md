@@ -11,6 +11,17 @@ status: current
 
 ## 最近更新
 
+- 2026-09-28（下午）：**门控 cron 第四次唤醒 —— 只读复核，数字逐位复现；顺带查出「cron 报告从未送达」**
+  - 门控 diff 是 `UNREACHABLE → DONE2` = **6100 端口链路抖动**，不是新的完成事件；
+    服务器 bm 数据自 **2026-09-14T08:07 UTC** 起零变化（09-15 后无任何 `bm*` 文件写入）
+  - 用与 12:10 提交**同一份**（md5 一致）`tests/analyze_benchmark.py` / `analyze_bm2_full.py`
+    对活动数据重跑：全部数字**逐位复现**（lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047；
+    lm5 `value` 0.2565±0.0928 / `random-matched` 0.2839±0.0157；lm5 `value` vs `value-nofb` 逐位相同）
+  - ⚠ **运维缺口（新）**：cron 作业 `bff2174e8bef`（`lm4-lm5-benchmark-done-gate`）在
+    `~/.hermes/cron/executions.db` 里 **622 次 suppressed / 6 次 `delivery_outcome=failed` / 0 次送达**；
+    今天两次非静默输出（12:10 的 DONE2 报告 11.8 KB、13:43 的 UNREACHABLE 说明 6.4 KB）实录 `failed`，
+    作业 `delivery` 字段为 `null` ⇒ **历次 DONE2 报告很可能从未真正送到 leo，只留在 `docs/wiki` + git**
+  - 详见 `docs/bm_benchmark_results.md` §0
 - 2026-09-28：**BM 修正版结算复核（第三次）—— 服务器数据未变，数字逐位复现，结论不变**
   - 门控 cron 由 `UNREACHABLE → DONE2` 唤醒；对活动数据重跑 `tests/analyze_benchmark.py` / `analyze_bm2_full.py`，
     §1/§2/§3 全部数字**逐位复现**（lm4 `value` 0.7603±0.0088 / `random-matched` 0.7590±0.0047；
@@ -447,6 +458,9 @@ status: current
 
 ## 已知的执行缺口（必须默认开启，不能只在单次 run 里用）
 
+- **cron 交付通道（2026-09-28 查出）**：`lm4-lm5-benchmark-done-gate`（`bff2174e8bef`）的 `delivery` 为 `null`
+  → 所有非静默输出记为 `delivery_outcome=failed`（6/6，0 次送达）。**报告只落在 `docs/wiki` + git**；
+  修好之前，不要假设 leo 看过任何本作业的报告
 - **学习效率曲线**：`--trace-every` 在 105 个 result tag 中仅 1 个开启过 → 后续所有实验**默认开启**
 - **类不平衡指标**：任何类不平衡任务必须**同时**报原始准确率 + 平衡准确率
 - **push 后必须更新本 wiki**（log.md 追加 + 本文件同步 + `wiki_check.py` / `wiki_lint.py --strict=v2` / `raw_manifest_check.py` 全绿）
