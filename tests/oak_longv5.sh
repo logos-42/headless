@@ -4,21 +4,28 @@
 # 规格: docs/l5_variance_replication_spec.md(**在任何数据产生之前写下**)
 #
 # ## 待复现的发现
-#   L4(n=29, `--stream revisit`)发现三个闭环 option 档的跨 seed 方差约为基线
-#   `e9` 的 1/3~1/4(sd 0.0258 → 0.0124/0.0135/0.0150), F p ≤ 0.005,
-#   自助法方差比 95% CI 全部排除 1。
+#   L4(n=29)发现三个闭环 option 档的跨 seed 方差约为基线 `e9` 的 1/3~1/4
+#   (sd 0.0258 → 0.0124/0.0135/0.0150), F p ≤ 0.005, 自助法方差比 95% CI 全部排除 1。
 #   **那是事后发现的(本来在找均值差异)⇒ 属假说生成, 不是确证。必须独立复现。**
 #
-# ## 本批**只改一个变量**
-#   `--stream revisit` → **`--stream nonstationary`**
-#   其余(数据/特征/模型/rounds/domains/option 参数/oak 参数)逐字不变。
+# ## ★ 处理变量 = **代码修复, 不是 flag**
+#   首版设计把独立设置选成 `--stream nonstationary`, 启动后按"处理变量必须回读确认"
+#   去日志里找 `[stream]` 行 —— **它不存在**。核实发现:
+#   `run_lm4_wave.py:666` 的 `if proposer == "bins":` 里装着整段流调度, 而
+#   实际域由主循环 `dd = domains[step] if step<len(domains) else domains[-1]`
+#   决定 ⇒ **oak 路径下 `--stream` 是死参数**, 实际流 = "前 6 轮各域一次,
+#   之后 294 轮全在最后一个域"(实测域5 占 295/300)。
+#   见 `docs/lm4_stream_bug.md`。
 #
-#   为什么不是 `perm`: 读 `run_lm4_wave.py:685` 确认 `perm` 只生成 6 个域的
-#   **一个置换然后重复 50 次** —— 那是高度平衡、低方差的调度, 会让复现更难而非更独立。
+#   修复后, 主循环按 `dom_seq[step]` 取域 ⇒ 同一个 `--stream revisit`
+#   **才第一次真正产生"每轮随机抽域"的持续学习流**。
+#   所以本批的配置串与 L4 **逐字相同**(flag 一个不变), 处理变量是**代码修复**;
+#   闸门必须同时证明"配置相同"与"修复在位"两件事。
 #
 # ## 规模
-#   4 臂(e9 / goal / goal_term / goal_term_override) × 18 个新 seed(28…45)
-#   = 72 run。按 L4 实测 10.6 min/run ≈ **12.7h**。
+#   4 臂(e9 / goal / goal_term / goal_term_override) × 18 个新 seed(28…41, 43…46)
+#   = 72 run。按 L4 实测 ≈ 10.6 min/run ⇒ 约 **12.7h**。
+#   (注: 流变成真正的持续学习后, 每轮的数据加载/训练量可能变化, 耗时需实测校正)
 #
 #   n=18 的功效: 若真实方差比=4, `z = log(4)/sqrt(4/17) = 2.86 > 2.80` ⇒ 功效≈0.81。
 #   若真实方差比只有 2, 功效仅≈0.37 —— **事前承认**, 届时交付**方差比的置信区间**。
@@ -36,23 +43,35 @@ LOG=results/oak_longv5.log
 : > "$LOG"
 say(){ echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-say "========== L5 批启动 (方差效应的独立复现, 设置改为 nonstationary) =========="
+say "========== L5 批启动 (方差复现; 处理变量 = 流修复, flag 与 L4 相同) =========="
 
 # ── 启动前硬闸门 ────────────────────────────────────────────────
-# ★ 本批的处理变量 = `--stream`。所以必须**证明**除了它之外一切与 L4 逐字相同。
-#   做法: 把 L4 的配置串里唯一的 `--stream revisit` 改成 `--stream nonstationary`,
-#   要求结果与 L5 的配置串**完全相等**。这比"两边一致"更强 —— 它断言的是
-#   "**恰好只有这一项不同**"。
-EXPECT=$(grep -A3 '^L4="' tests/oak_longv4.sh | head -4 \
-         | sed 's/^L4=/CFG=/; s/--stream revisit/--stream nonstationary/')
+# ★ 本批的处理变量 = **代码修复, 不是 flag**。
+#   修 `run_lm4_wave.py` 之前, `--stream` 对 `--proposer oak` 是死参数,
+#   实际流 = "前 n_domains 轮各域一次 + 其余全在最后一个域"(实测 295/300)。
+#   修复后同一个 `--stream revisit` 才真正产生"每轮随机抽域"的流。
+#   所以闸门必须同时证明**两件事**:
+#     ① 配置串与 L4 **逐字相同**(flag 一个没变)
+#     ② 修复在位(主循环按 `dom_seq[step]` 取域)
+EXPECT=$(grep -A3 '^L4="' tests/oak_longv4.sh | head -4 | sed 's/^L4=/CFG=/')
 GOT=$(grep -A3 '^L5="' tests/oak_longv5.sh | head -4 | sed 's/^L5=/CFG=/')
 if [ "$EXPECT" != "$GOT" ]; then
-  say "✗ 致命: 本批配置 ≠ (L4 配置 且 仅 stream 改为 nonstationary) —— 只改一个变量的纪律被破坏"
-  echo "--- 期望(由 L4 推出) ---" >>"$LOG"; echo "$EXPECT" >>"$LOG"
-  echo "--- 实际(L5) ---" >>"$LOG";        echo "$GOT" >>"$LOG"
+  say "✗ 致命: L5 配置串与 L4 不一致 —— 处理变量应当是**代码修复**, flag 必须一个不变"
+  echo "--- L4 ---" >>"$LOG"; echo "$EXPECT" >>"$LOG"
+  echo "--- L5 ---" >>"$LOG"; echo "$GOT" >>"$LOG"
   exit 1
 fi
-say "✓ 闸门: L5 配置 == (L4 配置 仅 stream→nonstationary), 逐字相等"
+say "✓ 闸门①: L5 配置串与 L4 逐字相同(处理变量是代码修复, 不是 flag)"
+
+if ! grep -q 'dd = dom_seq\[step\]' tests/run_lm4_wave.py; then
+  say "✗ 致命: 流修复不在位(主循环未按 dom_seq[step] 取域) —— 本批会退化成 L4 的重复, 拒绝启动"
+  exit 1
+fi
+if ! grep -q 'STREAM_HIST' tests/run_lm4_wave.py; then
+  say "✗ 致命: 缺 stream 直方图回读闸门 —— 无法证明流生效, 拒绝启动"
+  exit 1
+fi
+say "✓ 闸门②: 流修复在位 + 直方图回读闸门在位"
 
 # L4 的处理变量(β_o 区域判据)必须在位, 否则本批不是 L4 的复现
 if ! grep -q "def in_goal_region" hibs_lnn/option_manager.py \
@@ -84,11 +103,11 @@ if [ -z "$FREE" ] || [ "$FREE" -lt 8000 ]; then
 fi
 say "✓ GPU$GPU 空闲显存 ${FREE}MiB"
 
-# ── 配置: L4 逐字相同, 只把 stream 改为 nonstationary ───────────
+# ── 配置: L4 **逐字相同**(flag 一个不变) ────────────────────────
 L5="--backbone mlp --norm fixed --cl-method replay --head linear \
 --epochs-per-domain 100 --joint-steps 0 --wfr-bands 13 --lshell \
 --pool cat --agg-path --domains 6 --fine-bins 18 --rounds 300 \
---proposer-k 3 --stream nonstationary --device cuda"
+--proposer-k 3 --stream revisit --device cuda"
 
 # 新 seed: 28…41 + 43…46 = 18 个。
 # **刻意跳过 42**(L3 用过), 也与 L4 的 2…27 无交集。

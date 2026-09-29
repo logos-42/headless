@@ -663,6 +663,59 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         print("[oak] OAKProposer: n_fine=%d options=%s gate=%s algo=%s refresh=%d"
               % (oakprop.n_fine, oak_options, oak_gate, rl_algo, oak_refresh), flush=True)
 
+    # ★★ 任务流调度 —— **对所有 proposer 生效**。
+    #   原先整段写在下面的 `if proposer == "bins":` 里 ⇒ `--proposer oak` 时
+    #   `--stream` 是**死参数**,实际域由主循环的
+    #   `dd = domains[step] if step < len(domains) else domains[-1]` 决定
+    #   = 前 n_domains 轮各域一次、之后全在最后一个域(实测 295/300)。
+    #   见 `docs/lm4_stream_bug.md`。
+    def _align_dom(seq):
+        seq = [int(x) for x in seq]
+        if len(seq) < n_rounds:
+            _rr = int(np.ceil(n_rounds / max(1, len(seq))))
+            seq = (seq * _rr)[:n_rounds]
+        return seq[:n_rounds]
+
+    if stream == "fixed":
+        dom_seq = list(range(n_domains))
+    elif stream == "perm":
+        dom_seq = list(rng_sched.permutation(n_domains))
+    elif stream == "revisit":
+        dom_seq = list(rng_sched.randint(0, n_domains, size=n_rounds))
+    elif stream == "nonstationary":
+        # 权重按正弦漂移: 不同轮次由不同域主导
+        dom_seq = []
+        for _r2 in range(n_rounds):
+            w = 1.0 + 0.9 * np.sin(2 * np.pi * _r2 / max(2, n_rounds // 2)
+                                  + rng_sched.uniform(0, 2 * np.pi))
+            w = np.clip(w, 0.05, None)
+            w = w * np.ones(n_domains) * (1.0 + 0.5 * rng_sched.rand(n_domains))
+            dom_seq.append(int(rng_sched.choice(n_domains, p=w / w.sum())))
+    else:
+        dom_seq = list(range(n_domains))
+    dom_seq = _align_dom(dom_seq)
+
+    # ── ★ 回读闸门: **只有直方图能证明流生效** ────────────────────────
+    #   `--stream` 的取值本身**不算证据** —— `:1052` 那个 `"stream": stream`
+    #   只是把标志值记进 JSON。本轮的 bug 恰恰是"标志被记进 JSON"
+    #   被误当成"生效"。所以这里把**实际域分布**打出来并写进 JSON。
+    from collections import Counter as _Ctr
+    _hist = _Ctr(dom_seq)
+    _share = max(_hist.values()) / max(1, len(dom_seq))
+    _max_ok = 1.5 / max(1, n_domains)          # 均匀流 ≈ 1/n; 超 1.5× 视为退化
+    _ent = -sum((c / len(dom_seq)) * np.log(c / len(dom_seq))
+                for c in _hist.values() if c > 0)
+    STREAM_HIST = {int(k): int(v) for k, v in sorted(_hist.items())}
+    print("[stream] %s | 直方图 %s | 最大域占比 %.3f (阈值 %.3f) | 熵 %.3f | 前20步 %s"
+          % (stream, STREAM_HIST, _share, _max_ok, _ent, dom_seq[:20]), flush=True)
+    if _share > _max_ok:
+        print("[stream] ⚠⚠ 退化流: 最大域占比 %.3f > %.3f —— 这不是持续的任务流"
+              % (_share, _max_ok), flush=True)
+    if n_domains and len(domains) != n_domains:
+        print("[stream] ⚠ 域的 ID 空间 (%d) 与实际存在的域数 (%d) 不一致 —— "
+              "`dom_seq` 的取值按 ID 解释, 主循环里会被当作索引, 需人工确认"
+              % (n_domains, len(domains)), flush=True)
+
     if proposer == "bins":
         # ★ 显式 schedule 优先: 用于执行规划器给出的序列 (真实环境验证)
         # ★ 不能用 args: run_experiment 是独立函数, args 只存在于 main。
@@ -672,38 +725,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         _explicit = ([int(x) for x in schedule_str.split(",") if x.strip() != ""]
                      if schedule_str else [])
         if _explicit:
-            dom_seq = _explicit
+            dom_seq = _align_dom(_explicit)
             print("[schedule] 显式序列 -> %s" % dom_seq, flush=True)
-            if len(dom_seq) < n_rounds:
-                _r = int(np.ceil(n_rounds / max(1, len(dom_seq))))
-                dom_seq = (dom_seq * _r)[:n_rounds]
-            dom_seq = [int(x) for x in dom_seq[:n_rounds]]
-            schedule = [bins_of.get(d, []) for d in dom_seq]
-        # 由 stream 决定粗域序列, 每轮用该域的全部细区间
-        elif stream == "fixed":
-            dom_seq = list(range(n_domains))
-        elif stream == "perm":
-            dom_seq = list(rng_sched.permutation(n_domains))
-        elif stream == "revisit":
-            dom_seq = list(rng_sched.randint(0, n_domains, size=n_rounds))
-        elif stream == "nonstationary":
-            # 权重按正弦漂移: 不同轮次由不同域主导
-            dom_seq = []
-            for r in range(n_rounds):
-                w = 1.0 + 0.9 * np.sin(2 * np.pi * r / max(2, n_rounds // 2)
-                                      + rng_sched.uniform(0, 2 * np.pi))
-                w = np.clip(w, 0.05, None)
-                w = w * np.ones(n_domains) * (1.0 + 0.5 * rng_sched.rand(n_domains))
-                dom_seq.append(int(rng_sched.choice(n_domains, p=w / w.sum())))
-        else:
-            dom_seq = list(range(n_domains))
-        # 长度对齐到 n_rounds: fixed/perm 天然只有 n_domains 项, 轮数更多时循环续接
-        if len(dom_seq) < n_rounds:
-            _rep = int(np.ceil(n_rounds / max(1, len(dom_seq))))
-            dom_seq = (dom_seq * _rep)[:n_rounds]
-        dom_seq = [int(x) for x in dom_seq[:n_rounds]]
         schedule = [bins_of.get(d, []) for d in dom_seq]
-        print("[stream] %s -> 粗域序列 %s" % (stream, dom_seq), flush=True)
     elif proposer != "fixed" and proposer != "oak":
         # ★ oak 自己包了 RLProposer, 不需要 RegimeProposer。
         #   早先漏了这个排除, oak 臂会白白多建一个 value proposer
@@ -818,7 +842,15 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 _apply_shift(step)
             elif shift_every and step > shift_at and (step - shift_at) % shift_every == 0:
                 _apply_shift(step)
-        dd = domains[step] if step < len(domains) else domains[-1]
+        # ★ 任务流由 `dom_seq` 决定(**对所有 proposer 生效**)。修复前这里是
+        #   `domains[step] if step < len(domains) else domains[-1]`, 而 `dom_seq`
+        #   只在 `--proposer bins` 下被计算 ⇒ oak 路径下 `--stream` 完全无效,
+        #   实际流 = 前 n_domains 轮各域一次、之后全在最后一个域。
+        #   见 `docs/lm4_stream_bug.md`。回退分支保留以防 `dom_seq` 未定义。
+        if dom_seq is not None and step < len(dom_seq):
+            dd = dom_seq[step]
+        else:
+            dd = domains[step] if step < len(domains) else domains[-1]
         if oakprop is not None:
             pick = oakprop.act()                    # ← 动作 (含 option / 门控)
         elif rlprop is not None:
@@ -1050,6 +1082,9 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         "mean_forget_all": float(np.nanmean(_best - _fin)) if _M.size else float('nan'),
         "n_rounds": int(n_rounds),
         "stream": stream,
+        # ★ 实际域直方图 —— **只有它能证明流生效**。`"stream"` 只是标志值,
+        #   修复前 oak 路径下该标志为 `revisit` 而实际流是"6 域各 1 轮 + 294 轮单域"。
+        "stream_hist": STREAM_HIST,
         "proposer": proposer,
         "n_shifts": n_shifts,
     }
