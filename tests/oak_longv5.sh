@@ -39,11 +39,16 @@ set -u
 cd /work/liuyuanjie/headless
 PY=/work/liuyuanjie/envs/vllm-cu128/bin/python
 GPU=${GPU:-0}
-LOG=results/oak_longv5.log
+# ★ 多队列支持: `TAG` 区分并发队列(各自的日志 / DONE / pidfile),
+#   `SEEDS_OVERRIDE` 指定本队列的 seed 子集(**两条队列的集合必须不相交**)。
+TAG=${TAG:-}
+LOG=results/oak_longv5${TAG:+.${TAG}}.log
+PIDF=results/oakL5${TAG:+.${TAG}}.pid
+DONE=results/OAKL5${TAG:+_${TAG}}_DONE
 : > "$LOG"
 say(){ echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-say "========== L5 批启动 (方差复现; 处理变量 = 流修复, flag 与 L4 相同) =========="
+say "========== L5 批启动 (方差复现; 处理变量 = 流修复, flag 与 L4 相同) | TAG=${TAG:-A} =========="
 
 # ── 启动前硬闸门 ────────────────────────────────────────────────
 # ★ 本批的处理变量 = **代码修复, 不是 flag**。
@@ -96,12 +101,30 @@ N_EXIST=$(ls -d results/oakL4_* 2>/dev/null | wc -l)
 say "✓ L4 已有臂数 = $N_EXIST (期望 96)"
 
 # ── 显存门槛(启动时刻) ────────────────────────────────────────
+# ★ 规则修订(2026-09-29, 用户批准): **同卡允许多队列**, 约束是
+#     ① 每个队列的显存预算 ≤ 4 GiB
+#     ② 所有队列的预算之和 ≤ 空闲显存的 60%
+#   实测单 run 峰值 1404 MiB ⇒ 本脚本把每队列预算定为 2048 MiB
+#   (1404 × 1.46 的安全余量, 同时满足 ≤4 GiB)。
+NQ=${NQ:-1}                       # 本卡上并发队列数(由调用方声明)
+BUDGET_MIB=${BUDGET_MIB:-2048}    # 每队列显存预算(实测 1404 MiB)
 FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $GPU 2>/dev/null | head -1)
-if [ -z "$FREE" ] || [ "$FREE" -lt 8000 ]; then
-  say "✗ 致命: GPU$GPU 空闲显存 ${FREE:-?}MiB < 8000MiB, 拒绝启动"
+if [ -z "$FREE" ]; then
+  say "✗ 致命: 读不到 GPU$GPU 空闲显存"
   exit 1
 fi
-say "✓ GPU$GPU 空闲显存 ${FREE}MiB"
+NEED=$(( NQ * BUDGET_MIB ))
+CAP=$(( FREE * 60 / 100 ))
+say "显存核算: GPU$GPU 空闲 ${FREE}MiB | 队列数 $NQ × 预算 ${BUDGET_MIB}MiB = ${NEED}MiB | 上限 60% = ${CAP}MiB"
+if [ "$BUDGET_MIB" -gt 4096 ]; then
+  say "✗ 致命: 每队列预算 ${BUDGET_MIB}MiB > 4096MiB, 违反规则①"
+  exit 1
+fi
+if [ "$NEED" -gt "$CAP" ]; then
+  say "✗ 致命: 队列预算合计 ${NEED}MiB > 空闲 60% (${CAP}MiB), 违反规则②, 拒绝启动"
+  exit 1
+fi
+say "✓ 显存闸门通过(规则① 每队列 ≤4096MiB; 规则② 合计 ≤60% 空闲)"
 
 # ── 配置: L4 **逐字相同**(flag 一个不变) ────────────────────────
 L5="--backbone mlp --norm fixed --cl-method replay --head linear \
@@ -109,12 +132,28 @@ L5="--backbone mlp --norm fixed --cl-method replay --head linear \
 --pool cat --agg-path --domains 6 --fine-bins 18 --rounds 300 \
 --proposer-k 3 --stream revisit --device cuda"
 
-# 新 seed: 28…41 + 43…46 = 18 个。
-# **刻意跳过 42**(L3 用过), 也与 L4 的 2…27 无交集。
-SEEDS="28 29 30 31 32 33 34 35 36 37 38 39 40 41 43 44 45 46"
+# 新 seed: 28…41 + 43…46 = 18 个(**刻意跳过 42**, L3 用过)。
+# 单队列跑全部 18 个;多队列时用 `SEEDS_OVERRIDE` 各取不相交的一半。
+SEEDS_ALL="28 29 30 31 32 33 34 35 36 37 38 39 40 41 43 44 45 46"
+SEEDS=${SEEDS_OVERRIDE:-$SEEDS_ALL}
 
-say "L5 起跑 (GPU$GPU): 18 个新 seed × 4 臂 = 72 run, rounds=300, stream=nonstationary"
-say "新 seed: $SEEDS"
+# ── ★ 队列间 seed 不相交闸门(自动, 防两条队列撞同一个 seed) ──────
+MYSEEDF=results/oakL5.seeds.${TAG:-A}
+echo "$SEEDS" | tr ' ' '\n' | grep -v '^$' | sort -u > "$MYSEEDF"
+for f in results/oakL5.seeds.*; do
+  [ "$f" = "$MYSEEDF" ] && continue
+  [ -f "$f" ] || continue
+  OV=$(comm -12 <(echo "$SEEDS" | tr ' ' '\n' | sort -u) <(sort -u "$f") | tr '\n' ' ')
+  if [ -n "${OV// /}" ]; then
+    say "✗ 致命: 本队列(${TAG:-A})与 $f 的 seed 相交: $OV —— 拒绝启动"
+    exit 1
+  fi
+  say "✓ seed 闸门: 与 $f 不相交"
+done
+say "本队列(${TAG:-A}) seed 数 = $(echo "$SEEDS" | wc -w)"
+
+say "L5 起跑 (GPU$GPU, TAG=${TAG:-A}): $(echo "$SEEDS" | wc -w) 个 seed × 4 臂, rounds=300, stream=revisit"
+say "seed: $SEEDS"
 (
   for S in $SEEDS; do
     # ★ 运行期巡检: 启动时的显存闸门管不住全程(L4 实测: 开跑 21GB → 结束 1.4GB)
@@ -138,11 +177,11 @@ say "新 seed: $SEEDS"
       say "L5 $M seed=$S rc=$?"
     done
   done
-  touch results/OAKL5_DONE
-  say "L5 全部 72 run 完成"
+  touch "$DONE"
+  say "L5 (TAG=${TAG:-A}) 全部 $(echo "$SEEDS" | wc -w) 个 seed × 4 臂 = $(( $(echo "$SEEDS" | wc -w) * 4 )) run 完成"
 ) >>"$LOG" 2>&1 &
 
-echo $! > results/oakL5.pid
+echo $! > "$PIDF"
 disown
 sleep 8
-say "L5 已起跑 pid=$(cat results/oakL5.pid) (72 run x ~10.6min ≈ 12.7h)"
+say "L5 (TAG=${TAG:-A}) 已起跑 pid=$(cat "$PIDF")"
