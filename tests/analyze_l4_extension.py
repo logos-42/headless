@@ -89,6 +89,35 @@ def t_p_two_tailed(t, df):
     return _betai(df / 2.0, 0.5, df / (df + t * t))
 
 
+def f_p_two_tailed(F, df1, df2):
+    """双尾 F 检验 p(F | df1, df2)。F<=0 或 df<1 时返回 1."""
+    if F <= 0 or df1 < 1 or df2 < 1:
+        return 1.0
+    p = _betai(df1 / 2.0, df2 / 2.0, df1 * F / (df1 * F + df2))
+    return min(1.0, 2.0 * min(p, 1.0 - p))
+
+
+def bootstrap_var_ratio(a, b, B=20000, seed=0):
+    """var(b)/var(a) 的自助法 95% 分位区间。a, b 独立重采样。
+
+    `a` = 基线臂样本, `b` = 处理臂样本 ⇒ 比值 R = var(基线)/var(处理)。
+    R > 1 表示**处理臂方差更小**。
+    """
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    out = []
+    for _ in range(B):
+        ra = [a[rng.randrange(len(a))] for _ in range(len(a))]
+        rb = [b[rng.randrange(len(b))] for _ in range(len(b))]
+        va, vb = st.pvariance(ra), st.pvariance(rb)
+        if va > 0:
+            out.append(vb / va)
+    out.sort()
+    if not out:
+        return float("nan"), float("nan")
+    return out[int(0.025 * len(out))], out[int(0.975 * len(out))]
+
+
 # 临界值表(双尾 0.05) —— 只用它反推"还需多少 seed"
 _TC = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
        8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086,
@@ -216,8 +245,16 @@ def verdict(delta, sd_pair, sd_a, sd_b, n, pre_specified="paired"):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prefix", default="results/oakL3_*,results/oakL4_*,results/oakL5_*",
+                    help="逗号分隔的结果目录 glob")
+    ap.add_argument("--bootstrap", type=int, default=20000)
+    ap.add_argument("--json-out", default=None)
+    args = ap.parse_args()
+
     selftest()
-    arms = load(["results/oakL3_*", "results/oakL4_*"])
+    arms = load([p for p in args.prefix.split(",") if p])
     if "e9" not in arms:
         sys.exit("✗ 找不到 e9 臂")
     base = arms["e9"]
@@ -256,6 +293,80 @@ def main():
     if mismatch:
         print(f"\n⚠ 配对与非配对结论**不一致**的臂: {mismatch}")
         print("  按纪律: 明写不一致, 不挑有利口径。两口径都在上表。")
+
+    # ── ★ 方差口径:H2 / H2b / H3(判定规则事前写在 docs/l5_variance_replication_spec.md)──
+    print(f"\n{'=' * 96}")
+    print("★ 方差口径 —— H2: 闭环档的跨 seed 方差是否低于基线")
+    print(f"{'=' * 96}")
+    VAR_ARMS = ["goal_term", "goal_term_override"]
+    print(f"{'臂':<20}{'n':>4}{'sd':>9}{'var':>12}{'R=var(e9)/var(臂)':>19}"
+          f"{'F p(双尾)':>11}   自助法 95% CI (B={args.bootstrap})")
+    var_res = {}
+    for k in ["goal_term", "goal_term_override", "goal", "fixed"]:
+        if k not in arms:
+            continue
+        av = [x["acc"] for x in arms[k].values()]
+        bv = [x["acc"] for x in base.values()][:len(av)]
+        if len(av) < 3 or len(bv) < 3:
+            continue
+        va, vb = st.pvariance(av), st.pvariance(bv)
+        R = vb / va if va > 0 else float("nan")
+        p = f_p_two_tailed(R, len(bv) - 1, len(av) - 1)
+        if len(av) < 8:
+            # 方差比在 n<8 时不可用(自助法区间会宽到 [0.01, 24.8] 这种程度, 无信息)
+            var_res[k] = dict(n=len(av), sd=st.pstdev(av), var=va, R=R, p=p,
+                              ci=(float("nan"), float("nan")), usable=False)
+            print(f"{k:<20}{len(av):>4}{st.pstdev(av):>9.4f}{va:>12.6f}{R:>19.3f}"
+                  f"{p:>11.5f}   ★ n<8, 方差比不可用")
+            continue
+        lo, hi = bootstrap_var_ratio(av, bv, B=args.bootstrap)
+        var_res[k] = dict(n=len(av), sd=st.pstdev(av), var=va, R=R, p=p,
+                          ci=(lo, hi), usable=True)
+        print(f"{k:<20}{len(av):>4}{st.pstdev(av):>9.4f}{va:>12.6f}{R:>19.3f}"
+              f"{p:>11.5f}   [{lo:.2f}, {hi:.2f}]")
+
+    if var_res:
+        # H3 天花板检查 —— **先过这一条才解释 H2**
+        # ★ 作用域: **只对 H2 的比较臂集**(e9 + VAR_ARMS)求均值极差。
+        #   `goal` 是 H2b 的机制对照、`fixed` 是已判定档且 n=5, 二者都不在 H2 的比较里;
+        #   把它们算进来会让"均值极差"反映**别的东西**(goal 确实有害 / fixed 样本不足),
+        #   而不是"被比较的臂是否可比"。见 spec §3 的 2026-09-29 修订记录。
+        h3_arms = ["e9"] + [k for k in VAR_ARMS if k in arms]
+        means = {k: st.mean([x["acc"] for x in arms[k].values()]) for k in h3_arms}
+        spread = max(means.values()) - min(means.values())
+        margin = 1.0 - max(means.values())
+        h3 = (spread < 0.02) and (margin > 0.10)
+        print(f"\n  H3 天花板检查 [作用域: {', '.join(h3_arms)}]")
+        for k, m in sorted(means.items(), key=lambda x: -x[1]):
+            print(f"      {k:<20}{m:.4f}")
+        print(f"    均值极差 {spread:.4f} (需 <0.02) | "
+              f"距上限 {margin:.4f} (需 >0.10) ⇒ {'PASS' if h3 else '★ FAIL'}")
+        if not h3:
+            print("     ⇒ H3 不过: 方差差异可能是饱和伪影, **H2 判为无效**(无论 p 多小)")
+
+        # H2 判定(事前规则)
+        ok = [k for k in VAR_ARMS if k in var_res and var_res[k].get("usable")
+              and var_res[k]["p"] < 0.05 and var_res[k]["ci"][0] > 1.0]
+        hit = [k for k in VAR_ARMS if k in var_res and var_res[k].get("usable")]
+        if h3 and len(ok) == len(hit) and hit:
+            v2 = "★ **复现**"
+        elif h3 and ok:
+            v2, = [f"部分复现({','.join(ok)} 通过, 其余未过)"]
+        else:
+            v2 = "**未复现**" if h3 else "无效(H3 未过)"
+        print(f"  H2 判定: {v2}")
+        print(f"     规则: F p<0.05 且 自助法 CI 下界>1, 两臂都要满足")
+
+        # H2b 机制
+        if "goal" in var_res:
+            g = var_res["goal"]
+            print(f"  H2b 机制(`goal` 无 β_o): R={g['R']:.3f}, p={g['p']:.5f}, "
+                  f"CI=[{g['ci'][0]:.2f}, {g['ci'][1]:.2f}] ⇒ "
+                  f"{'方差降低来自 option 层本身' if g['p'] < 0.05 and g['ci'][0] > 1 else 'β_o 是必要条件'}")
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(var_res, indent=2, default=str,
+                                                     ensure_ascii=False))
+            print(f"  方差结果已写: {args.json_out}")
 
     eff = [k for k, v in arms.items()
            for x in v.values() if x["efficiency_populated"]]
