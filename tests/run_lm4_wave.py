@@ -532,7 +532,7 @@ def build_consistency(fine, y_log, X, bands, use_lshell, min_n=30):
 
 def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                    epochs_per_domain=300, batch=32, lr=1e-3, replay=False,
-                   replay_ratio=0.3, seed=42, n_domains=6, n_feat=None,
+                   replay_ratio=0.3, replay_src="old", seed=42, n_domains=6, n_feat=None,
                    pool="cat", agg_path=False, shuffle_domains=False,
                    cl_method="naive", pln_d=64, inner_k=2, inner_lr=0.1,
                    outer_lr=None, meta_every=1, reptile_lr=0.0,
@@ -894,6 +894,17 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         model.train()
         it = 0
         cur = []
+        # ★ 判别性对照臂 `replay-src=self`:
+        #   与 `replay` **同样多的额外样本、同样 1 次优化步**, 但**全部来自当前域**
+        #   (而不是旧域)。用来把"复习旧数据"与"单纯多花算力/更强正则"分开。
+        #   见 docs/lmeff_verdict.md §3。
+        _self_buf = None
+        if replay and replay_src == "self":
+            _idx = train_by_dom[dd]
+            _rs = np.random.RandomState(seed + 100000 + step)
+            _sel = _rs.choice(_idx, size=min(2000, len(_idx)), replace=False)
+            _self_buf = (torch.from_numpy(X[_sel]).to(device),
+                         torch.from_numpy(y_dom[_sel]).to(device))
         while it < steps_this:
             for xb, yb in dl:
                 if it >= steps_this:
@@ -976,17 +987,26 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
                 # ===== 单循环 (naive / replay): 原行为, 不变 =====
                 loss = F.cross_entropy(model(xb), yb)
                 # Replay: 按域均衡混入旧域样本
+                #   ★ 这是**域均衡的随机复习**(每个见过的域等量、域内随机抽样本),
+                #     不是"针对即将被遗忘的域"。所以"随机复习 vs 针对性复习"这个
+                #     对照**本来就已在臂内**, 真正未解决的混淆只有"额外算力"。
                 if replay and replay_by_dom:
                     k = max(1, int(batch * replay_ratio))
-                    seen_doms = list(replay_by_dom)
-                    per = max(1, k // len(seen_doms))
-                    rxs, rys = [], []
-                    for sd in seen_doms:
-                        bx, by = replay_by_dom[sd]
-                        m = min(per, len(bx))
-                        sel = torch.randint(0, len(bx), (m,), device=device)
-                        rxs.append(bx[sel]); rys.append(by[sel])
-                    rx, ry = torch.cat(rxs), torch.cat(rys)
+                    if replay_src == "self" and _self_buf is not None:
+                        # ★ 同样 k 个样本、同样 1 步, 但**全部来自当前域**
+                        bx, by = _self_buf
+                        sel = torch.randint(0, len(bx), (k,), device=device)
+                        rx, ry = bx[sel], by[sel]
+                    else:
+                        seen_doms = list(replay_by_dom)
+                        per = max(1, k // len(seen_doms))
+                        rxs, rys = [], []
+                        for sd in seen_doms:
+                            bx, by = replay_by_dom[sd]
+                            m = min(per, len(bx))
+                            sel = torch.randint(0, len(bx), (m,), device=device)
+                            rxs.append(bx[sel]); rys.append(by[sel])
+                        rx, ry = torch.cat(rxs), torch.cat(rys)
                     loss = loss + F.cross_entropy(model(rx), ry)
                 opt.zero_grad(); loss.backward(); opt.step()
                 it += 1
@@ -1484,9 +1504,15 @@ def main():
         runs = []
     elif args.cl_method in ("oml", "oml2"):
         # 双循环方法: 单次运行, 默认带回放 (lm4 聚合所有有利于 CL 的机制)
-        runs = [(args.cl_method, True)]
+        runs = [(args.cl_method, True, "old")]
     else:
-        runs = [("naive", False), ("replay", True)]
+        # ★ 三臂: naive / replay(复习**旧**域) / replay-self(同样额外算力但
+        #   样本全部来自**当前**域)。第三个臂是判别性对照 ——
+        #   若 `replay-self ≈ replay` ⇒ 效果只是"多花算力/更强正则", 与抗遗忘无关;
+        #   若 `replay >> replay-self` ⇒ 旧域数据本身在起作用。
+        #   见 docs/lmeff_verdict.md §3。
+        runs = [("naive", False, "old"), ("replay", True, "old"),
+                ("replay-self", True, "self")]
 
     # ── 候选区间池 (价值函数的"可选结构") ──
     # 用物理描述子 [log_dens, logL, |maglat|] 定义, 划分到 --fine-bins 个细区间。
@@ -1533,13 +1559,14 @@ def main():
         except Exception as e:
             print("!! --freq-profile 读取失败:", e, flush=True)
 
-    for key, replay in runs:
+    for key, replay, _rsrc in runs:
         print(f"\n=== {key} ===", flush=True)
         M, doms, curves, cross, prop_rows, extra = run_experiment(X, y_dom, device, d_model=args.d_model,
                                  d_state=args.d_state, n_layers=args.n_layers,
                                  epochs_per_domain=args.epochs_per_domain,
                                  batch=args.batch, lr=args.lr, replay=replay,
                                  replay_ratio=args.replay_ratio,
+                                 replay_src=_rsrc,
                                  seed=args.seed, n_domains=args.domains,
                                  n_feat=d_feat, pool=args.pool,
                                  agg_path=args.agg_path,
@@ -1674,11 +1701,15 @@ def main():
              f"- 每域训练步: {args.epochs_per_domain}",
              f"- replay_ratio: {args.replay_ratio}, seed: {args.seed}", "",
              "| 方法 | 最终平均 acc | 平均遗忘 |", "|:--|--:|--:|"]
-    for k in ("naive", "replay"):
+    # ★ 只用**本次实际跑过的臂**(不能用 `results` 的全部非下划线键 ——
+    #   `results["joint"]` 是 joint 天花板基线, 只有 final_mean_acc/per_domain,
+    #   取它的 `mean_forget` 会 KeyError)。
+    _arm_keys = [k for k, _rp, _rc in runs if k in results]
+    for k in _arm_keys:
         if k in results:
             lines.append(f"| {k} | {results[k]['final_mean_acc']:.4f} | {results[k]['mean_forget']:.4f} |")
     lines += ["", "## 遗忘矩阵 (行=训练阶段, 列=域)", ""]
-    for k in ("naive", "replay"):
+    for k in _arm_keys:
         if k not in results:
             continue
         M = results[k]["acc_matrix"]
