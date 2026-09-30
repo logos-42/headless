@@ -61,7 +61,9 @@ class RRSkillAgent(SkillAgent):
                  rr_calib_min_adv=0.0, rr_retire_rule="internal",
                  rr_calib_min_advq=0.0, rr_forgive_p=0.0,
                  rr_lr_v=0.2, rr_starve_steps=None, rr_unk_p=0.5,
-                 rr_three_state=False, rr_dyn="none", rr_dyn_c=1.0, **kw):
+                 rr_three_state=False, rr_dyn="none", rr_dyn_c=1.0,
+                 rr_evidence=False, rr_ev_n_min=10, rr_ev_z_bad=2.0,
+                 rr_ev_stale_hl=200, **kw):
         super().__init__(mdp, mode=mode, seed=seed, **kw)
         self.rr_v_main = rr_v_main
         self.rr_z_mode = rr_z_mode
@@ -220,6 +222,25 @@ class RRSkillAgent(SkillAgent):
         #   True 时启用三件事: 缓存为空 -> 退回基元层; 未知 -> 有限度探索;
         #   未知 -> 永不算坏。
         self.rr_three_state = bool(rr_three_state)
+        # ── 阶段五: 证据库(evidence bank) ──────────────────────────────
+        # ★ 默认关闭 ⇒ 旧行为**逐位不变**(与 rr_three_state 同一条纪律)。
+        # ★ 语义: 证据**只降级(好->坏), 不升级** —— 与 A 类的反熟悉度约束同一条。
+        #   理由: 预测误差低只说明"我预测得准", 不说明"这件事有价值";
+        #   而**新颖度会拉高误差** ⇒ 允许升级就等于允许新颖度伪造"好"。
+        self.rr_evidence = bool(rr_evidence)
+        self.rr_ev_n_min = int(rr_ev_n_min)
+        self.rr_ev_z_bad = float(rr_ev_z_bad)
+        self.rr_ev_stale_hl = int(rr_ev_stale_hl)
+        self.rr_bank = None
+        self.rr_ev_step = 0
+        self.rr_ev_last = None          # 最近一次的 support() 引用清单
+        self.rr_ev_bad_n = 0            # 证据库投了几次 bad(诊断用)
+        if self.rr_evidence:
+            from hibs_lnn.evidence_bank import EvidenceBank
+            self.rr_bank = EvidenceBank(
+                dim=len(self.mdp.vec()), seed=seed,
+                n_min=self.rr_ev_n_min, stale_hl=self.rr_ev_stale_hl,
+                z_bad=self.rr_ev_z_bad)
         # ── A 类动力学证据(阶段四)─────────────────────────────────
         #   `rr_cumulant`(上面那个)是 **option 构造期**参数 —— 它是 OaK 的
         #   `(I_o, g_o, π_o, β_o)` 里的 `g_o`。A 类是**每步的动力学读数**,
@@ -444,6 +465,24 @@ class RRSkillAgent(SkillAgent):
             # ★ 奖励流监控: "连续多少步一分没拿"。Φ 从奖励流学, 奖励流为空
             #   时 Φ 恒为初值 —— 此时任何"不坏"的结论都是自欺。
             self.rr_since_rew = 0 if float(r) > 0 else (self.rr_since_rew + 1)
+            # ── 阶段五: 喂证据库 ────────────────────────────────────────
+            # ★ `phi=v0, phi_next=self.mdp.vec()` —— **不能两个都传 `self.mdp.vec()`**。
+            #   `self.mdp` 在 `step()` 里已经前进, 两个都传当前 vec 会让 `v_next == v`,
+            #   TD 的 `gamma*v_next` 项与 `v` 抵消 ⇒ 学的是"瞬时误差"不是值。
+            #   (`hibs_lnn/oak_proposer.py:338` 的 `observe_gvf(phi, cums, phi)` 正是
+            #    这个形态; 本模块刻意避开, 见 docs/stage5_evidence_bank_spec.md §0。)
+            # 四个 cumulant = 这一步**四个不同的可观测事实**:
+            #   prediction → "有 option 正在执行"   reward → 即时奖励
+            #   transition → "状态没变(自环)"        regime → "本回合结束"
+            if self.rr_bank is not None:
+                _cums = (1.0 if active is not None else 0.0,
+                         float(r),
+                         1.0 if s2 == s else 0.0,
+                         1.0 if done else 0.0)
+                self.rr_ev_step += 1
+                self.rr_bank.observe(v0, _cums, self.mdp.vec(),
+                                     step=self.rr_ev_step,
+                                     regime=self.rr_regime_idx)
             self.trans.append((v0, a, self.mdp.vec()))    # (步前, 动作, 步后)
             # ── 结算判据: 全部在**新状态**上评估(正确语义) ──────────
             if active is not None:
@@ -795,7 +834,58 @@ class RRSkillAgent(SkillAgent):
         nm = o.get("name")
         if nm is not None and self._rr_dyn_bad(nm):
             return "bad"
+        # ── 阶段五: 证据库(★ **只降级, 不升级**)──────────────────────
+        #   与 A 类同一条不对称约束: 证据可以投 `bad`, 但**永远不能**把状态升成
+        #   `good`。理由: 预测误差低只说明"我预测得准", 不说明"这件事有价值";
+        #   而**新颖度会拉高误差** ⇒ 允许升级就等于允许新颖度伪造"好"。
+        #   ⇒ 证据缺席不改变判定, 证据示警才降级。
+        if self.rr_bank is not None:
+            self.rr_ev_last = self.rr_bank.support(step=self.rr_ev_step,
+                                                   regime=self.rr_regime_idx)
+            if self.rr_ev_last.get("verdict") == "bad":
+                self.rr_ev_bad_n += 1
+                return "bad"
         return "good"
+
+    def rr_ev_support(self):
+        """★ 最近一次证据判定背后的**引用清单** —— 哪条支持 bad / 哪条缺席。
+
+        这是"证据可追溯"的直接接口: 调用方拿到的不是分数, 是**来源**。
+        """
+        if self.rr_bank is None:
+            return {"enabled": False}
+        s = self.rr_bank.support(step=self.rr_ev_step, regime=self.rr_regime_idx)
+        s["enabled"] = True
+        s["n_bad_ever"] = int(self.rr_ev_bad_n)
+        return s
+
+    def rr_complementarity(self, label="reward"):
+        """★ 这组 GVF 到底有没有产生**互补证据**。
+
+        `label`: 用哪个 cumulant 的二值化当"变化/未变化"标签。
+        默认 `"reward"` ⇒ 问的是「这组证据在**奖励到达**这件事上互不互补」。
+
+        ⚠ 口径限制(必须写明): 标签本身就是四个 cumulant 之一,
+        所以对 `reward` 那条 GVF 天然有利。读 `complementarity` 时要同时看
+        `auc_i`(**单条**的 AUC)与 `corr_err`(冗余度), 不能只看差值。
+
+        **允许结论是"冗余"** —— 那就照实报冗余。
+        """
+        if self.rr_bank is None:
+            return {"enabled": False}
+        from hibs_lnn.evidence_bank import complementarity
+        h = self.rr_bank.z_history()
+        if label not in h["cumulant"]:
+            return {"enabled": True, "error": f"unknown label {label}",
+                    "labels": list(h["cumulant"])}
+        lab = (h["cumulant"][label] > 0).astype(int)
+        if lab.min() == lab.max():
+            return {"enabled": True, "error": "标签全为同一值, 无法算 AUC",
+                    "label": label, "n": int(lab.size)}
+        r = complementarity(h["z"], lab, z_bad=self.rr_ev_z_bad)
+        r.update({"enabled": True, "label": label, "n": int(lab.size),
+                  "pos_rate": float(lab.mean())})
+        return r
 
     def rr_epistemic_all(self, names=None):
         return {k: self.rr_epistemic(o) for k, o in self.rr_outcome.items()
@@ -977,6 +1067,8 @@ class RRSkillAgent(SkillAgent):
                        "bad": states.count("bad"),
                        "unknown": states.count("unknown")},
             "starved": bool(self.rr_starved()),
+            # ★ 阶段五: 证据库 —— 报的是**引用清单**不是分数
+            "evidence": (self.rr_ev_support() if self.rr_evidence else {"enabled": False}),
             "since_rew": int(self.rr_since_rew),
             "starve_steps": int(self.rr_starve_steps),
             "starve_ever": int(self.rr_starve_ever),
