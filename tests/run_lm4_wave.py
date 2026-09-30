@@ -814,7 +814,12 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     cross = []               # 每个域学完后, 在**外部分布**(如 2016 年)上的准确率
     replay_by_dom = {}       # dd -> (X_dev, y_dev): 每域回放缓冲(预置 device)
 
-    curves = {}        # dd -> [(step, acc)]  学习效率曲线
+    curves = {}        # dd -> [(step, acc)]  学习效率曲线(最后一次访问)
+    # ★ 逐次访问都留 —— 这是"知识复用"指标的唯一来源。
+    #   旧写法 `curves[dd] = cur` 是**覆盖式**, 前几次访问全丢 ⇒
+    #   "重复遇到同一域时是否学得更快"根本无从计算。见
+    #   `docs/learning_efficiency_spec.md` §1 缺陷③。
+    visits = {}        # dd -> [ [(step,acc), ...], ... ]
     prop_rows = []     # 价值函数调度轨迹
     n_fine_all = int(fine.max()) + 1 if fine is not None else 0
     any_time = []          # 每轮的"已见域平均准确率" (在线性能)
@@ -1061,6 +1066,7 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
             cross.append(None)
         if cur:
             curves[dd] = cur
+            visits.setdefault(dd, []).append(list(cur))   # ★ 逐次访问留档(复用指标用)
         seen = [f"D{d}:{row[i]:.3f}" for i, d in enumerate(domains) if i <= step]
         print(f"  [{'replay' if replay else 'naive '}] step{step+1} (域{dd}) → {' '.join(seen)}", flush=True)
         # 存回放样本 (每域固定 2000, 预置 device 避免逐步搬运)
@@ -1087,7 +1093,17 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
         "stream_hist": STREAM_HIST,
         "proposer": proposer,
         "n_shifts": n_shifts,
+        # ★ 逐次访问的学习曲线(复用指标的唯一来源; `curves` 只留最后一次)
+        #   ⚠ 这里必须是**两层**循环: `visits[k]` 是"曲线的列表",
+        #   每条曲线才是 `(step, acc)` 的列表。只写一层会拿整条曲线去解包成 2 个值
+        #   ⇒ `ValueError: too many values to unpack`(冒烟测抓到的)。
+        "visits": {int(k): [[[int(st), float(a)] for st, a in cv] for cv in vlist]
+                   for k, vlist in visits.items()},
+        # ★ 每个域被访问了几次 —— 复用指标的填充闸门(全 1 ⇒ 无法测复用)
+        "n_visits": {int(k): len(c) for k, c in visits.items()},
     }
+    # ★ 原始逐次访问曲线(不序列化, 只给同进程的 efficiency_report 用)
+    extra["_visits_raw"] = visits
     if prop is not None:
         extra["proposer_freq"] = [int(x) for x in prop.freq]
         extra["proposer_stats"] = prop.stats()
@@ -1108,25 +1124,98 @@ def run_experiment(X, y_dom, device, d_model=128, d_state=8, n_layers=2,
     return acc_matrix, domains, curves, cross, prop_rows, extra
 
 
-def efficiency_report(curves, domains, thresholds=(0.5, 0.9)):
-    """学习效率: 每个域达到其最终准确率 50%/90% 需要多少步。
+# ★ 各域数下的**可达上限**(独立于臂的探针天花板)。
+#   来源: docs/lm4_backbone_final_verdict.md「探针上限 3/6/12 域 = 0.9159/0.8065/0.6638」。
+#   用途: 学习效率的**绝对**达标阈值基准。查不到 ⇒ 不算绝对口径,
+#   **绝不退回"用臂自己的 max"**(那会把"没学会"报成"效率高")。
+REACHABLE_MAX_BY_DOMAINS = {3: 0.9159, 6: 0.8065, 12: 0.6638}
 
-    这是"更新产生效率"的直接度量 —— 与"压缩/天花板"无关。
+
+def efficiency_report(curves, domains, thresholds=(0.5, 0.9), reachable_max=None,
+                      K_slope=50, visits=None):
+    """学习效率 / 更新效率 —— **三个口径, 互相独立, 都报**。
+
+      A `steps_to_abs`  绝对达标步数。阈值取**该域的可达上限(外部常数)**,
+                        不是臂自己的峰值。达不到 ⇒ `None`(**绝不回填**)。
+      B `slope_early`   早期斜率 = (acc@K − acc@0)/K —— "每单位更新换来多少精度"
+      C `revisit_gain`  ★ **知识复用**: 第 1 次访问与第 2 次及以后访问的达标步数之差。
+                        `>0` 学得更快 ⇒ 有复用;`≈0` ⇒ 没有复用;`<0` ⇒ 干扰
+
+    旧口径(相对自己的峰值)保留在 `rel_steps`, 但**不作为结论** ——
+    它会把"没学会"报成"效率高"(`docs/learning_efficiency_spec.md` §1 缺陷①)。
+
+    格式与判据见 `docs/learning_efficiency_spec.md` §2/§3。
     """
-    if not curves:
+    vis = visits if visits is not None else ({dd: [c] for dd, c in (curves or {}).items()})
+    if not vis:
         return {}
-    out = {}
-    for dd, cur in curves.items():
-        if not cur:
-            continue
-        final = max(a for _, a in cur)
+    out = {"steps_to_abs": {}, "slope_early": {}, "within_gain": {},
+           "start_level": {}, "retention_gain": {}, "rel_steps": {},
+           "_n_visits": {}, "_none_ratio": None, "_already_ratio": None,
+           "_no_reachable_max": reachable_max is None,
+           "reachable_max": reachable_max, "theta": list(thresholds), "K_slope": int(K_slope)}
+    none_n = tot_n = already_n = 0
+    for dd, vlist in vis.items():
         d = domains[dd] if dd < len(domains) else str(dd)
-        row = {}
-        for th in thresholds:
-            tgt = final * th
-            hit = next((st for st, a in cur if a >= tgt), None)
-            row[f"{int(th*100)}"] = hit
-        out[f"D{d}(终{final:.3f})"] = row
+        key = f"D{d}"
+        per_visit = {}
+        starts = []
+        for k, cur in enumerate(vlist, start=1):
+            if not cur:
+                continue
+            s0 = float(cur[0][1])
+            starts.append(s0)
+            st_abs = {}
+            if reachable_max is not None:
+                for th in thresholds:
+                    tgt = float(reachable_max) * float(th)
+                    tk = str(int(th * 100))
+                    tot_n += 1
+                    if s0 >= tgt:
+                        # ★ **起点已超阈** ⇒ 记 "already", **不是 0/1 步**。
+                        #   把"早就知道"与"1 步学会"混成一个数字, 会让 revisit 流下
+                        #   所有域都被报成"1 步学会", 复用增益机械归零
+                        #   (冒烟测实测: 全部域每次访问都是 1 步、gain 全 0)。
+                        st_abs[tk] = "already"
+                        already_n += 1
+                        continue
+                    hit = next((st for st, a in cur if a >= tgt), None)
+                    st_abs[tk] = hit
+                    if hit is None:
+                        none_n += 1
+            per_visit[str(k)] = {"start": s0, "end": float(cur[-1][1]),
+                                 "abs": st_abs}
+            # B 早期斜率: 以**该次访问的起点**为 0, K 步之后为 K
+            if len(cur) > 1:
+                t0 = cur[0][0]
+                win = [(st, a) for st, a in cur if st - t0 <= K_slope]
+                if len(win) >= 2:
+                    span = win[-1][0] - win[0][0]
+                    if span > 0:
+                        out["slope_early"].setdefault(key, {})[str(k)] = \
+                            float((win[-1][1] - win[0][1]) / span)
+            # 该次访问内涨了多少(永远有定义, 不受阈值影响)
+            out["within_gain"].setdefault(key, {})[str(k)] = float(cur[-1][1] - s0)
+            # 旧相对口径(保留, 但不作结论)
+            fin = max(a for _, a in cur)
+            out["rel_steps"].setdefault(key, {})[str(k)] = {
+                str(int(th * 100)): next((st for st, a in cur if a >= fin * th), None)
+                for th in thresholds}
+        out["steps_to_abs"][key] = per_visit
+        out["_n_visits"][key] = len(vlist)
+        # ★★ **保留增益**: 第 2 次及以后的**起点**比第 1 次高多少。
+        #   在"重遇到就起点已会"的流下, 这才是唯一的可测量 ——
+        #   它同时绕过阈值饱和(上面的 "already")与末态精度饱和。
+        #   `> 0` ⇒ 后面几次起点更高 ⇒ **记住了**; `≈ 0` ⇒ 每次从零开始(遗忘);
+        #   `< 0` ⇒ 反而更低。
+        out["start_level"][key] = {str(i + 1): s for i, s in enumerate(starts)}
+        if len(starts) >= 2:
+            later = float(np.mean(starts[1:]))
+            out["retention_gain"][key] = float(later - starts[0])
+        else:
+            out["retention_gain"][key] = None
+    out["_none_ratio"] = (none_n / tot_n) if tot_n else None
+    out["_already_ratio"] = (already_n / tot_n) if tot_n else None
     return out
 
 
@@ -1216,6 +1305,15 @@ def main():
                     help="跨年/外部分布测试集目录 (如 data/wave2016 做 2015->2016 泛化)")
     ap.add_argument("--trace-every", type=int, default=0,
                     help="每 N 步评一次当前域, 产出学习效率曲线 (0=关闭)")
+    # ★ 学习效率的**绝对**阈值基准。见 docs/learning_efficiency_spec.md §2-A:
+    #   必须用**独立于臂**的可达上限, 不能用臂自己的峰值(那会把"没学会"报成"效率高")。
+    #   缺省按域数查表(数值取自 docs/lm4_backbone_final_verdict.md 的探针上限);
+    #   **查不到就不算 `steps_to_abs`**, 并在结果里标 `_no_reachable_max`,
+    #   绝不退回"用臂自己的 max"。
+    ap.add_argument("--reachable-max", type=float, default=None,
+                    help="该域的可达上限(外部常数); 缺省按域数查表, 查不到则不算绝对达标步数")
+    ap.add_argument("--slope-k", type=int, default=50,
+                    help="早期斜率的窗口步数 (更新效率: Δacc/Δupdate)")
     ap.add_argument("--norm", default="batchnorm", choices=["batchnorm", "fixed", "none"],
                     help="StatMLP 归一化: batchnorm (随域漂移) / fixed (冻结全局 mu/sd) / none")
     ap.add_argument("--head", default="linear", choices=["linear", "pln", "swifttd"],
@@ -1512,7 +1610,16 @@ def main():
         s["cross_external_final"] = (
             [None if (c != c) else float(c) for c in cross[-1]]
             if cross and cross[-1] is not None else None)
-        s["efficiency"] = efficiency_report(curves, doms)
+        # ★ 可达上限: 优先 CLI, 否则按域数查表; 查不到 ⇒ **不算绝对口径**
+        #   (绝不退回"用臂自己的 max" —— 那正是缺陷①)。
+        _rm = args.reachable_max
+        if _rm is None:
+            _rm = REACHABLE_MAX_BY_DOMAINS.get(len(doms))
+        s["efficiency"] = efficiency_report(
+            curves, doms, reachable_max=_rm, K_slope=args.slope_k,
+            visits=(extra or {}).get("_visits_raw"))
+        if extra:
+            extra.pop("_visits_raw", None)        # 不进 JSON(已另存为 "visits")
         # 价值函数调度轨迹 (提议了哪些区间 / 当时的价值 / 累计次数)
         if prop_rows:
             s["proposer_trace"] = prop_rows
@@ -1527,9 +1634,33 @@ def main():
                       + " ".join(f"D{i}:{c:.3f}" for i, c in enumerate(last) if c == c),
                       flush=True)
         if s["efficiency"]:
-            print("  ── 学习效率 (达标步数) ──", flush=True)
-            for k, v in s["efficiency"].items():
-                print(f"     {k}: " + "  ".join(f"{m}%→{st}步" for m, st in v.items()), flush=True)
+            _ef = s["efficiency"]
+            _rm = _ef.get("reachable_max")
+            print(f"  ── 学习效率 (绝对阈值基准 reachable_max={_rm}) ──", flush=True)
+            if _ef.get("_no_reachable_max"):
+                print("     ⚠ 没有独立的可达上限 ⇒ **不算绝对达标步数**(不退回臂自己的 max)",
+                      flush=True)
+            for _d, _pv in _ef.get("steps_to_abs", {}).items():
+                _parts = []
+                for _k, _kv in sorted(_pv.items(), key=lambda x: int(x[0])):
+                    _a = _kv.get("abs", {})
+                    _parts.append(f"{_k}次(起{_kv.get('start', float('nan')):.2f}):"
+                                  + "/".join(f"{t}%→{v}" for t, v in _a.items()))
+                print(f"     {_d} " + "  ".join(_parts), flush=True)
+            _rg = {k: v for k, v in _ef.get("retention_gain", {}).items() if v is not None}
+            if _rg:
+                print("     ★★ 保留增益(第2次起的起点均值 − 第1次起点; 正=记住了):", flush=True)
+                for _d, _v in _rg.items():
+                    _sl = _ef.get("start_level", {}).get(_d, {})
+                    print(f"       {_d}: {_v:+.4f}   起点 " + "→".join(
+                        f"{x:.2f}" for _, x in sorted(_sl.items(), key=lambda y: int(y[0]))),
+                        flush=True)
+            if _ef.get("_already_ratio") is not None:
+                print(f"     起点已超阈(already)占比 {_ef['_already_ratio']:.3f}"
+                      f"  —— 高说明重遇到时会, 该看保留增益而非达标步数", flush=True)
+            if _ef.get("_none_ratio") is not None:
+                print(f"     未达标(None)占比 {_ef['_none_ratio']:.3f}"
+                      f"  —— 过高说明阈值与该域可达上限不匹配", flush=True)
 
     # 对比报告
     feat_desc = (f"MAG 4 维" if args.no_wfr
