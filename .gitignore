@@ -47,3 +47,7 @@ desktop.ini
 *.zip
 *.tar.gz
 *.rar
+paper/*.aux
+paper/*.bbl
+paper/*.out
+paper/*.log

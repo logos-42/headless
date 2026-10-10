@@ -11,6 +11,8 @@ status: current
 
 ## 最近更新
 
+- **2026-10-10 分形持续学习论文初稿** — `paper/`（Fractal Continual Learning: Recursive Structural Growth, Long-Horizon Adaptation, and the Boundary of Structural Advantage）。三层主张: 递归结构塑性可行 / 长期持续学习成立（72,335 轮 3.5× 增益）/ 结构优势边界（小模型 regime 分形无统计优势）。证据在 HUSHFUSION Forge 仓。
+
 - 2026-09-30（续十三）：**判别性对照臂 `replay-self` 落地 + 扩 seed 批起跑**
   - **先查清一件事**：`replay` 的实现（`run_lm4_wave.py:979-990`）**本来就是域均衡随机复习**
     （每个见过的域等量、域内随机抽样本），**不是**「针对即将被遗忘的域」⇒
