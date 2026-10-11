@@ -54,8 +54,11 @@ tags: [paper, continual-learning, fractal, structural-growth]
 - [x] 参考文献（Murray 1926 / Finn 2017 / Li 2017 / Kirkpatrick 2017 / 自仓 ×2）
 - [x] tectonic 编译 + PDF 验证（6 页）
 - [x] README + 本 wiki 页
-- [ ] 中文镜像版（zh mirror, 待 leo 确认是否需要）
-- [ ] 对抗审稿轮次（adversary referee, 待 leo 启动）
+- [x] **第1轮审稿**（NeurIPS+CNS 双审）→ 发现致命实现缺陷（子节点未训练）→ 退稿重写为审计版
+- [x] **第2轮审稿**（双审）→ 大修落实：配平梯度步数（Forge 53e4938）+ 预注册（PREREGISTRATION.md）+ 裁决框（Stands/Falls/Undecidable）+ 钉 SHA（10ba961^）
+- [x] **第3轮终审**（双审）→ 小修×2（NeurIPS: README同步/重跑状态声明/样本上限；CNS: n_max入正文）→ **可发表（审计方法论论文）**
+- [x] **中文镜像** main-zh.tex/pdf（6 页, 含阿西莫夫《第二基地》格言题词）
+- [ ] **决定性重跑**（进行中）：服务器 seed=20261012 配平版；按预注册规则收敛段 ≥2000 轮 + 5000-10000 warm 轮后下结论，结果写入论文
 
 ## 诚实边界
 
