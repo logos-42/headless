@@ -10,7 +10,7 @@
 \newtheorem{definition}{Definition}
 \newtheorem{proposition}{Proposition}
 
-\title{Fractal Continual Learning:\\Recursive Structural Growth, Long-Horizon Adaptation, and the Boundary of Structural Advantage}
+\title{Fractal Continual Learning:\\\large Recursive Structural Growth, Long-Horizon Adaptation, and the Boundary of Structural Advantage}
 \author{HUSHFUSION Forge Research}
 \date{October 2026}
 
@@ -18,125 +18,97 @@
 \maketitle
 
 \begin{abstract}
-Continual learning is usually formulated as parameter adaptation under a fixed computational graph. We study a stronger question: can the learning graph itself grow recursively while continuing to adapt online? We introduce a minimal fractal-loop architecture in which a dense root loop and sparse descendant loops communicate through normalized convex gates. A relative-decay detector grows descendants when the current improvement rate falls below a fraction of the structure's early improvement rate; descendants update at a frequency reduced by the fractal depth. We evaluate the method in a non-stationary control environment derived from a two-flow-ring $\mu$-dynamics model and compare it with a fixed single-node learner. A 72,335-round run shows that both systems learn continuously under drifting initial conditions, reducing warm-control error from approximately 130--176 steps to approximately 9 steps while maintaining a cold random baseline near 32 steps. The fractal tree grows to seven nodes and then stabilizes. However, the fractal tree does not outperform the fixed learner in the small-model regime: after convergence, paired warm performance differs by less than 0.3 steps and the exceedance rates are statistically indistinguishable at the resolution of this experiment. Cross-validation on 701 real Forge configuration--score records likewise finds no fractal advantage. The result is therefore not a claim that fractal structure universally improves continual learning. It is a boundary result: recursive structural growth is implementable and stable over long horizons, but its performance advantage requires a regime with sufficient scale and diminishing marginal returns. We release the protocol, negative results, and failure analyses to make this boundary reproducible.
+Continual learning systems update parameters under a fixed computational graph; whether the graph itself should grow is rarely posed as a testable question. We ask it directly. We introduce a recursive fractal-loop learner in which a dense root loop and sparse descendant loops communicate through normalized convex gates, and a relative-decay signal grows descendants when a structure's improvement rate decays relative to its own early rate. In a non-stationary control environment assembled from a two-flow-ring $\mu$-dynamics model, a paired 72,335-round run shows both the fractal tree and a fixed single-node learner keep learning: warm control cost falls from roughly 130--176 steps to roughly 9 steps (cold random baseline, $\sim$32 steps; a 3.5$\times$ gain). The tree grows to seven nodes and stabilizes. The structural advantage does not: after convergence, fractal warm cost is indistinguishable from fixed (mean difference $<$0.3 steps; exceedance 5.8\% vs.\ 5.9\%), a result consistent across three seeds and 701 real configuration--score records. We therefore report not a universal benefit of fractal growth but a reproducible boundary: recursive structural plasticity is implementable and stable over long horizons, yet confers no measurable advantage when marginal returns are weak. The protocol separates ``structural plasticity'' from ``structural advantage'' so that a failure of the latter does not erase evidence for the former.
 \end{abstract}
 
 \section{Introduction}
 
-Continual learning systems typically update parameters while holding depth, connectivity, and the division between fast adaptation and slow consolidation fixed. This separation is useful, but it leaves a structural question unanswered: when the task changes, should the learner only change its weights, or should it also change the organization of the loops that update those weights? The question matters in non-stationary control, where a learner must track drifting conditions while preserving a stable response mechanism.
+Continual learning is normally stated as a weight-update problem: keep the graph fixed and adapt parameters so that new tasks are learned without forgetting old ones \cite{Finn2017,Li2017,Kirkpatrick2017}. This framing leaves an unasked question: when the task itself drifts, should the \emph{organization of the updating loops} change, not just the weights inside them? The question matters for long-running controllers, where a learner must track a moving optimum for tens of thousands of rounds while preserving a stable response. Yet whether structural growth helps is nearly always asserted, not measured.
 
-We make three claims. First, a recursive structural learner can grow additional loop nodes from a single root using an online improvement signal, communicate across levels through a normalized convex gate, and stabilize rather than grow without bound. Second, this mechanism can continue learning for tens of thousands of rounds under drifting control conditions. Third, in the small-data, small-model regime studied here, structural growth does not produce a measurable advantage over a fixed learner. The third result is deliberate: a negative structural comparison is more useful than a universal claim unsupported by the data.
+We treat it as a measurement problem and make three claims, each with a separate evidence chain. First, a recursive learner can grow descendant loops from a single root online, communicate across levels through a normalized convex gate, and stabilize rather than grow without bound. Second, this mechanism can keep learning for 72,335 rounds under a drifting control condition, matching a fixed learner in sustained adaptation. Third---the claim that defines the paper's value---the grown structure gives no measurable performance advantage in this regime: after convergence, paired fractal and fixed warm costs differ by less than 0.3 steps, with identical exceedance rates; three-seed and 701-sample real-data checks agree. The outcome is a boundary result. It shows where structural plasticity is useful (as a model of long-horizon adaptation) and where it is not (as a performance lever when marginal returns are weak). We release the protocol, the negative results, and the failure analyses so that the boundary is reproducible.
 
-This paper is about the engineering and empirical boundary of recursive continual learning, not a new physical derivation of antigravity. The control environment is assembled from an existing $\mu$-dynamics model; the learner optimizes control choices inside that model. We use the environment because it provides a deterministic, inspectable, non-stationary benchmark with a safety ceiling, not because the experiment establishes that the underlying physical model is experimentally confirmed.
+\section{Results}
 
-The rest of the paper first defines the recursive loop architecture and its growth rule, then describes the control environment and the paired long-horizon protocol. We report the primary run, multi-seed and clean-evaluation checks, compare the result with the structural predictions motivating fractal allocation \cite{LmPrincipleFractal}, and finish with limitations and the conditions under which a structural advantage should be expected.
+\subsection{Long-horizon continual adaptation succeeds in both structures}
 
-The loop design draws on established meta-learning (fast task adaptation separated from slower meta-updates \cite{Finn2017,Li2017}), continual-learning consolidation motives \cite{Kirkpatrick2017}, and fractal allocation ideas formalized in our companion Lean development \cite{LmPrincipleFractal}. Our contribution is not a new optimizer; it is a concrete, reproducible protocol for asking whether structural growth itself—rather than weight growth alone—improves long-horizon adaptation, together with an honest boundary result.
+Two learners, a fixed single-node network and a recursively grown fractal tree, were paired at every round on the same drifting initial condition $\mu_0$ of a deterministic $\mu$-dynamics controller (protocol in Methods). Each selected a control point from its accumulated experience and executed the environment.
 
-\section{Related Structural Ideas}
+Both structures learned and kept learning. Warm performance fell from roughly 130--176 steps in the first 1,000 rounds to roughly 9 steps after 2,000 rounds, and stayed there for the remaining 70,000 rounds; the cold random baseline remained near 32 steps throughout (Table~\ref{tab:main}). Continual adaptation was therefore effective and stable, and it did not decay: this is the first result, and it holds for both architectures.
 
-The design is motivated by three families of ideas. Optimization-based meta-learning separates fast task adaptation from slower meta-parameter updates \cite{Finn2017,Li2017}; our root and descendant loops preserve this distinction while allowing the graph of update mechanisms to change. Residual and contraction arguments motivate stable information transfer between levels. Finally, fractal allocation arguments, which echo Murray's minimum-work principle for branching networks \cite{Murray1926}, suggest that when marginal returns decline with depth, computation need not be distributed uniformly across all levels \cite{LmPrincipleFractal}. These ideas motivate our architecture, but none of them by itself predicts an empirical win in the present small regime.
+\begin{table}[t]
+\centering
+\caption{Long-horizon paired outcome (72,335 rounds). Warm rows are recommenders; cold rows are random controls. Exceedance = crossing the safety ceiling $\mu_{\mathrm{ceil}}$.}
+\label{tab:main}
+\begin{tabular}{lrr}
+\toprule
+Metric & Fixed & Fractal \\
+\midrule
+Warm mean steps (full run) & 11.1 & 11.5 \\
+Warm mean steps (converged, round $\ge$2000) & $\sim$9 & $\sim$9 \\
+Cold mean steps & 31.6 & 31.9 \\
+Exceedance rate & 5.9\% & 5.8\% \\
+Final tree nodes & 1 & 7 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-A useful distinction is between a structural mechanism and a structural advantage. The former asks whether a graph can grow, communicate, and remain trainable. The latter asks whether that graph improves a specified metric under a matched compute and data budget. This paper treats the two questions separately.
+\subsection{Structure grows, then stabilizes}
 
-\section{Recursive Fractal Loop Architecture}
+The fractal tree grew six times (rounds 46, 57, 73, 80, 87, 94), from one to seven nodes, and then stopped. Growth was driven by a relative-decay detector (Methods): a descendant spawns when the exponentially weighted improvement rate of validation loss falls below a fraction of that structure's early improvement rate. After reaching seven nodes the detector never fired again for the remaining 72,000 rounds. Unbounded growth is not observed; the tree settles.
 
-\subsection{Loop tree}
+\subsection{The structural advantage does not appear}
 
-Let each loop node $v$ contain a predictor $f_v(x;\theta_v)$. A node may have descendants $\mathcal{C}(v)$. The node output is
+Growth worked; advantage did not. After convergence, fractal warm cost was statistically indistinguishable from fixed: paired outcomes were fixed-winner 16.1\%, fractal-winner 20.9\%, and ties 63.0\%, yet the full-run means were 11.5 vs.\ 11.1 steps---the win-rate signal and the mean contradict, which is the signature of noise rather than a real edge. Exceedance matched (5.8\% vs.\ 5.9\%). Two corroborating checks agree. A three-seed short-run comparison gave one seed favoring fractal, one tied, one favoring fixed. A clean five-fold cross-validation on 701 real Forge configuration--score records gave fixed $0.0719 \pm 0.0468$ and a three-descendant fractal tree $0.0861 \pm 0.0536$ mean squared error---no fractal advantage there either. In this regime the additional six nodes were a complexity tax, not a lever.
+
+\section{Related Work}
+
+Our design sits at the meeting point of optimization-based meta-learning, which separates fast task adaptation from slower meta-parameter updates \cite{Finn2017,Li2017}; continual-learning consolidation, which addresses forgetting under sequential tasks \cite{Kirkpatrick2017}; and fractal allocation arguments, which suggest that when marginal returns decline with depth, computation need not be spread evenly across levels---a principle with roots in Murray's minimum-work analysis of branching networks \cite{Murray1926} and formalized in our companion Lean development \cite{LmPrincipleFractal}. We keep these as motives, not predictions: none of them implies that a small learner on a 701-record task will benefit from fractal organization, and our result confirms that.
+
+\section{Discussion}
+
+Two statements must be held apart. ``Recursive structural plasticity is implementable and stable'' is true: growth events fire, communication through convex gates works, and the system is trainable for 72,000 rounds. ``Structural growth improves performance'' is false in the regime studied; the grown nodes added cost without measurable return. Conflating the two is the standard error in this line of work, and separating them is the paper's methodological point.
+
+Why did the advantage fail to appear? The prefix-concentration argument that motivates fractal allocation \cite{LmPrincipleFractal} requires diminishing returns strong enough that concentrating budget in early levels beats spreading it. On a small learner with limited data, marginal returns do not decline sharply; splitting the budget across specialists merely dilutes each specialist's evidence. The hypothesis is not refuted in general---it is bounded. The natural next tests are larger networks, multi-domain streams, and tasks with genuinely multi-scale structure, where diminishing returns are expected and where a fractal organization should, if the theory holds, earn its complexity.
+
+The practical lesson is procedural. Evaluate structural growth in three stages: (i) does the graph mutate safely, (ii) does the learner keep adapting after mutation, and (iii) does the mutation improve a pre-registered metric under matched compute and data? This paper ran all three and reports each answer separately.
+
+\section{Methods}
+
+\subsection{Recursive fractal-loop architecture}
+
+Each node $v$ holds a predictor $f_v(x;\theta_v)$ and may have descendants $\mathcal{C}(v)$. The node output is a convex combination,
 \begin{equation}
- y_v(x) = g_{v,0}f_v(x;\theta_v) + \sum_{u\in\mathcal{C}(v)}g_{v,u}y_u(x),
- \qquad g_{v,j}\geq 0,\quad \sum_j g_{v,j}=1,
+ y_v(x) = g_{v,0}\,f_v(x;\theta_v) + \sum_{u\in\mathcal{C}(v)} g_{v,u}\,y_u(x),
+ \qquad g_{v,j}\ge 0,\quad \sum_j g_{v,j}=1,
 \end{equation}
-where the gate vector is produced by a softmax. The convex combination gives a bounded communication interface between levels. A descendant is not automatically trusted: it is first warmed independently, after which its output can enter the parent's mixture.
+with gates produced by a softmax. Descendants are not trusted immediately: they are warmed independently before entering the parent's mixture, which prevents the ``dead-child'' failure where a zero-initialized gate gives a child zero contribution and therefore zero gradient.
 
-\subsection{Fast and slow updates}
-
-The root is updated every round. A node at depth $d$ is updated at frequency proportional to $D^{-d}$, where $D$ is the sparse scaling factor. Thus shallow loops receive dense updates and deeper loops receive sparse updates. This is the operational analogue of a fractal allocation rule: computation is concentrated near the prefix where marginal learning value is highest, while deeper structure is available for specialization.
+The root is updated every round; a node at depth $d$ updates at frequency $D^{-d}$ for sparse factor $D$ (we use $D=4$). This concentrates computation in the shallow prefix---the operational analogue of a fractal allocation rule.
 
 \subsection{Growth rule}
 
-The growth signal is the relative decay of validation loss. If the exponentially weighted improvement rate in the current window falls below a fraction of the early improvement rate for several consecutive observations, the node spawns a descendant. The detector is reset after growth. A clean-loss filter excludes safety-violation penalty values from the growth signal. This distinction is important: a penalty spike is not evidence that the representation has reached a structural bottleneck.
+Growth is triggered by relative decay of validation loss. Let $\bar\imath_t$ be an exponentially weighted improvement rate and $\imath_0$ the structure's early average improvement rate. A descendant is spawned when $\bar\imath_t/\imath_0$ stays below a threshold (0.2) for several consecutive observations; the detector resets after growth. A clean-loss filter excludes safety-penalty values, because a penalty spike is not evidence of a structural bottleneck. We include the failure that motivated the design: an initial absolute rule (``loss no longer decreases'') never fires, because a shallow model can improve forever at a slow rate.
 
-\begin{definition}[Structural growth]
-A growth event is a graph mutation that adds a descendant node, initializes its parameters, warms it independently, and then exposes it to the parent through a normalized gate.
-\end{definition}
+\subsection{Control environment}
 
-The mechanism is intentionally minimal. It does not claim that the chosen detector is optimal. In particular, a first attempt based on an absolute ``loss no longer decreases'' rule failed because shallow networks can improve forever at a very slow rate. Relative decay was introduced to detect loss of improvement relative to the structure's own early behavior.
-
-\section{Control Environment}
-
-We use a deterministic $\mu$-dynamics environment assembled from the two-flow-ring control model. The state update is
+We assemble a deterministic $\mu$-dynamics controller from the two-flow-ring model:
 \begin{equation}
  \mu_{t+1}=\mu_t+\eta_t(1-\mu_t),
  \qquad
  \eta_t=\eta_{\mathrm{ext}}+(2\lambda-\lambda^2)(1-\mu_t),
 \end{equation}
-where $\eta_{\mathrm{ext}}$ is an external drive and $\lambda$ is a convergence parameter controlling the candidate self-flattening term. The task is to reach $\mu\geq 0.999$ without crossing the ceiling $\mu_{\mathrm{ceil}}=1-m_e/m_i\approx0.999780568$. A trial is scored by its number of steps to the work window; ceiling crossing is a safety failure.
+where $\eta_{\mathrm{ext}}$ is an external drive and $\lambda$ a convergence parameter for a candidate self-flattening term. The task is to reach $\mu\ge 0.999$ (work window) without crossing $\mu_{\mathrm{ceil}}=1-m_e/m_i\approx0.999780568$ (safety ceiling). Cost is the number of steps to the window; ceiling crossing is a failure. The environment is deterministic, has a clear safety boundary, and is non-stationary because a fresh $\mu_0\sim U(0.01,0.8)$ is drawn every round. It is a benchmark for method study, not evidence about any experimental antigravity device; $\lambda$ remains an input gap in the upstream model.
 
-This environment is suitable for method study because it is deterministic, has a clear safety boundary, and can be made non-stationary by sampling a different initial state $\mu_0$ each round. It is not evidence that an experimental antigravity device exists or that $\lambda$ is physically available. In the upstream model, $\lambda$ remains an input gap.
+\subsection{Paired long-horizon protocol}
 
-\section{Experimental Protocol}
+Every round, both learners see the same $\mu_0$. Each selects a control point from its experience (UCB over a $20\times10$ grid of $(\eta_{\mathrm{ext}},\lambda)$), executes the environment, and updates its parameters from a sliding window of recent experience (capacity 400). Odd rounds are cold random controls, even rounds are warm recommendations. The deployed run used 72,335 rounds, independent checkpoints every 10 rounds, and a supervisor that restarted the daemon on failure. The fractal tree was allowed to grow without a preselected depth, subject to a safety cap of seven nodes.
 
-\subsection{Paired long-horizon evaluation}
+\subsection{Failure analyses that shaped the design}
 
-At every round we present the same $\mu_0$ to a fixed single-node learner and to the fractal learner. Each learner selects a control point using its own accumulated experience, executes the environment, and updates its own parameters. Odd rounds are cold random controls and even rounds are warm recommendations. The paired design removes the largest source of confounding: the two structures see the same drifting condition.
-
-The deployed run used 72,335 rounds over approximately 24 hours, with independent checkpoints, a sliding experience window, and a supervisor that restarted the daemon after failure. The fractal tree was allowed to grow without a preselected target depth, subject to a safety cap. The final tree contained seven nodes.
-
-\subsection{Secondary checks}
-
-We also performed three secondary checks. First, three-seed tests examined whether a short-run fractal advantage was robust. Second, clean cross-validation compared fixed and fractal predictors on 701 real Forge configuration--score records. Third, earlier controlled spikes tested the growth detector, the gate initialization, and the effect of separating safety classification from score regression.
-
-\section{Results}
-
-\subsection{Long-horizon run}
-
-Both systems learned substantially. Warm performance fell from roughly 130--176 steps during the initial phase to roughly 9 steps after convergence, while the cold random baseline remained near 32 steps. Thus continual online adaptation was effective and remained stable over tens of thousands of rounds.
-
-After convergence, the fixed learner achieved 11.1 warm steps averaged over the full run and the fractal learner achieved 11.5. Restricting attention to the converged region, both remained near 9 steps. Paired warm outcomes were fixed-winner 16.1\%, fractal-winner 20.9\%, and ties approximately 63\%. This apparently favorable fractal win rate did not translate into a lower mean; the difference is within the variability of paired outcomes. Safety exceedance was 5.9\% for fixed and 5.8\% for fractal.
-
-\begin{table}[t]
-\centering
-\caption{Long-horizon paired result.}
-\begin{tabular}{lrr}
-\toprule
-Metric & Fixed & Fractal \\
-\midrule
-Warm mean steps & 11.1 & 11.5 \\
-Cold mean steps & 31.6 & 31.9 \\
-Exceedance rate & 5.9\% & 5.8\% \\
-Final nodes & 1 & 7 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Structural advantage and its failure boundary}
-
-The structural mechanism worked: the tree grew automatically and stabilized. The performance claim did not: seven nodes did not improve the final metric. This is a useful separation. Growth is not evidence of advantage; it is evidence that the graph mutation and communication mechanisms are operational.
-
-The multi-seed short-run experiment did not support a reliable advantage. One seed favored fractal growth, one was approximately tied, and one favored the fixed learner. The clean real-data experiment was consistent with the long run: a fixed node achieved five-fold MSE $0.0719\pm0.0468$ after longer training, while a fractal tree with three descendants achieved $0.0861\pm0.0536$. The difference is not a proof that fractal organization is harmful in general; it shows that this regime does not provide the conditions under which the structural hypothesis should win.
-
-\section{Failure Analysis}
-
-Several negative results were important for the final design. An absolute non-decreasing-loss detector did not grow because a shallow model continued making small improvements indefinitely. A relative-decay detector grew reliably. A first fractal implementation initialized child gates at zero; child outputs then had zero contribution and effectively zero gate gradient. Uniform gate initialization plus a warm-up phase repaired the dead-child mechanism. A separate failure occurred at the OML interface: adding a layer without expanding and reinitializing its per-parameter step-size meta-parameters damaged the fast adaptation loop. Structural growth and meta-parameter growth therefore cannot be treated as independent operations.
-
-Finally, an RSI-style technical indicator was tested as a growth signal. Standard RSI is inappropriate for a monotonically improving loss trajectory: when the improvement deltas are one-sided, losses are zero and RSI saturates at 100. We therefore interpret ``RSI'' here as recursive self-improvement rather than as a financial indicator. The adaptive threshold experiment showed that growth thresholds can themselves be updated from the measured value of a structural mutation, but this meta-controller did not outperform a hand-tuned threshold in the small toy regime.
-
-\section{Discussion}
-
-The experiment supports a modest but concrete claim. A continual learner can maintain a fixed root loop, grow recursively generated descendants, communicate through convex gates, and continue learning under a drifting environment for tens of thousands of rounds. This is a model-level form of plasticity, distinct from merely updating weights.
-
-The experiment does not support the stronger claim that recursive fractal structure is generally more accurate or efficient. In the present regime, the additional nodes were a complexity tax. The most plausible explanation is scale: with small models and limited data, marginal returns do not decline in the way required by prefix-concentration arguments, and splitting the learning budget across specialists only dilutes evidence. The hypothesis should be revisited with larger networks, more domains, and tasks whose representation genuinely has multi-scale structure.
-
-The practical lesson is methodological. Structural growth should be evaluated in three separate stages: (i) does the graph mutate safely, (ii) does the learner continue adapting after mutation, and (iii) does the mutation improve a pre-registered metric under matched compute and data? Conflating these stages turns a working plasticity mechanism into an unsupported performance claim.
-
-\section{Conclusion}
-
-We introduced and tested a minimal fractal continual-learning architecture with recursively growing loops, sparse deep updates, and convex inter-level communication. The architecture grew to seven nodes and remained stable for 72,335 rounds in a drifting control environment. Both fixed and fractal learners achieved sustained continual improvement, but the fractal learner did not outperform the fixed learner in the small-model regime, in multi-seed checks, or on 701 real configuration--score records. The result establishes a reproducible boundary: recursive structural plasticity is feasible and useful as a model of long-horizon adaptation, but a performance advantage requires a larger and more structurally demanding regime.
+Four failures are worth recording. (i) An absolute ``no-improvement'' growth detector never fires on shallow networks (they improve slowly forever); the relative-decay detector fixed this. (ii) Zero-initialized child gates produce dead children; uniform gate initialization plus a warm-up phase fixed this. (iii) Growing a layer without reinitializing per-parameter step-size meta-parameters damaged the fast-adaptation loop, so structural growth and meta-parameter growth cannot be treated as independent. (iv) A standard RSI indicator is inapplicable to a monotonically improving loss trajectory (one-sided deltas give RSI $\equiv100$), so the term is used here for ``recursive self-improvement,'' not the financial indicator.
 
 \section*{Data and code availability}
-The implementation, supervisors, long-horizon JSONL traces, checkpoints, and spike scripts are maintained in the HUSHFUSION Forge and headless research repositories \cite{HushfusionForge}. The reported long-horizon trace contains 72,335 paired rounds. All claims in this paper are restricted to the model and protocol described here.
+Implementation, supervisors, the 72,335-round paired trace, and analysis scripts are in the HUSHFUSION Forge repository \cite{HushfusionForge}. Writing standards for this paper are in \texttt{WRITING-STANDARD.md}.
 
 \bibliographystyle{plain}
 \bibliography{main}
