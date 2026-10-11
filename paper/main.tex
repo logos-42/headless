@@ -62,13 +62,28 @@ The audit complicates this picture. Growth is operational---the detector fires a
 
 The paper's earlier version claimed a boundary result: ``no structural advantage.'' A post-review audit of the main experiment's implementation retracts that claim. Three findings are decisive.
 
-\textbf{Descendants are never trained.} In \texttt{design\_daemon\_fractal.py}, each node's optimizer is constructed over the node's own network and gate parameters only (``opt = Adam(list(self.net.parameters()) + [self.gate])''). Children of a grown node are appended to \texttt{self.children}, but they never join any parent's optimizer parameter list, and the main loop calls \texttt{train\_step} only on the root. A descendant's parameters therefore never receive a gradient step. The only per-child operation is a warm-up counter decrement. The grown ``tree'' is a root network gating fixed, randomly initialized subnets.
+\textbf{Descendants are never trained.} In \texttt{design\_daemon\_fractal.py} (audited version: commit \texttt{10ba961\textasciicircum}; the repository HEAD now contains the repaired code), each node's optimizer is constructed over the node's own network and gate parameters only (``opt = Adam(list(self.net.parameters()) + [self.gate])''). Children of a grown node are appended to \texttt{self.children}, but they never join any parent's optimizer parameter list, and the main loop calls \texttt{train\_step} only on the root. A descendant's parameters therefore never receive a gradient step. The only per-child operation is a warm-up counter decrement. The grown ``tree'' is a root network gating fixed, randomly initialized subnets. The audit line numbers cited here refer to \texttt{10ba961\textasciicircum}; a reader checking out HEAD will see the repaired loop instead, so the audited snapshot is pinned by its commit hash.
 
 \textbf{The advertised sparse schedule never executes.} The code computes \texttt{update\_freq = D**depth} and stores it, but no scheduling decision anywhere consults it. Depth-dependent update frequency is documentation, not behavior.
 
 \textbf{The evaluation is not reproducible as stated.} The 72,335-round trace and its analysis script are not in the repository; the daemon seeds its RNG from wall-clock time (\texttt{int(time.time()) \% 10000}); a rerun does not reproduce the reported numbers. The repository's \texttt{README} acknowledges the trace as ``live data, not committed.''
 
 Consequences. The paired long-run difference (11.5 vs.\ 11.1 warm steps) and the three-seed and 701-record comparisons all compare a trained root against a root gating untrained subnets---a condition that neither confirms nor refutes a fractal advantage. The correct statement is \emph{undecidable from this run}. Long-horizon adaptation and growth detection remain valid; structural advantage requires a repaired implementation and a decisive re-run.
+
+\begin{table}[t]
+\centering
+\caption{What stands, what falls, what is undecidable. This verdict box is the paper's full claim set.}
+\label{tab:verdict}
+\begin{tabular}{p{0.24\textwidth}p{0.24\textwidth}p{0.46\textwidth}}
+\toprule
+\textbf{Stands} & \textbf{Falls (retracted)} & \textbf{Undecidable} \\
+\midrule
+Long-horizon root adaptation: warm 130$\rightarrow$9 steps vs.\ random $\sim$32, held 72,000 rounds & ``No structural advantage'' (boundary result as originally claimed) & Structural advantage of a trained fractal learner, under matched compute \\
+Relative-decay growth detector: 6 events, 1$\rightarrow$7 nodes (cap-stopped) & Sparse $D^{-d}$ update schedule as an executed mechanism & Whether growth would saturate without the 7-node cap \\
+Control environment as a deterministic benchmark & Descendant training as an executed mechanism & Outcome of the repaired, seeded, matched-compute re-run \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{What the audit does not touch}
 
@@ -82,7 +97,9 @@ Our design sits at the meeting point of optimization-based meta-learning, which 
 
 Two statements must be held apart, and the audit sharpens the separation. ``Recursive structural plasticity is implementable and stable'' is now qualified: growth events fire and the graph mutates, but in the audited run the grown components never learned, so we can only say the \emph{detector and mutation} work, not the grown learner. ``Structural growth improves performance'' was the paper's earlier claim, and it is now retracted: the run did not test a trained fractal learner, so its null result is undecidable. Conflating ``the tree grew'' with ``the grown components learned'' is precisely the error this audit corrects; separating the two is the paper's methodological point.
 
-The question of whether the advantage could appear at all remains open. The prefix-concentration argument that motivates fractal allocation \cite{LmPrincipleFractal} requires diminishing returns strong enough that concentrating budget in early levels beats spreading it. On a small learner with limited data, marginal returns may not decline sharply; splitting the budget across specialists may dilute each specialist's evidence. These are hypotheses, not findings: the audited run cannot speak to them because it never trained a fractal learner. The natural next test is to repair the implementation so that descendants actually train, then compare under matched compute and data, with pre-registered equivalence bounds and confidence intervals. Only then is the boundary decidable.
+The question of whether the advantage could appear at all remains open. The prefix-concentration argument that motivates fractal allocation \cite{LmPrincipleFractal} requires diminishing returns strong enough that concentrating budget in early levels beats spreading it. On a small learner with limited data, marginal returns may not decline sharply; splitting the budget across specialists may dilute each specialist's evidence. These are hypotheses, not findings: the audited run cannot speak to them because it never trained a fractal learner.
+
+Two review findings sharpened the decisive test. First, compute must be matched: a fractal tree with seven nodes consumes several times more gradient steps per round than a single node, so a naive re-run would confound structure with compute. The repaired implementation therefore counts total gradient steps per round in the tree and gives the fixed learner the same budget (Forge commit \texttt{53e4938}). Second, the equivalence bound must be pre-registered before the re-run starts, not chosen after: we fix the equivalence interval at $\pm 1$ step (the integer-step resolution of the metric), the converged window at round $\ge 2000$, and a minimum of 5,000 warm rounds, with a paired bootstrap confidence interval as the decision rule (details in \texttt{PREREGISTRATION.md}). A re-run that follows these rules is the only way the boundary becomes decidable rather than another assertion.
 
 The practical lesson is procedural. Evaluate structural growth in three stages: (i) does the graph mutate safely, (ii) does the learner keep adapting after mutation, and (iii) does the mutation improve a pre-registered metric under matched compute and data? This paper ran stages (i) and (ii)---and the audit shows that stage (ii) was only partially satisfied (the graph mutates, but the grown components did not train). Stage (iii) was not reached, because the implementation flaw makes it undecidable. That stage is the correct next experiment.
 
@@ -122,7 +139,7 @@ Every round, both learners see the same $\mu_0$. Each selects a control point fr
 Four failures are worth recording. (i) An absolute ``no-improvement'' growth detector never fires on shallow networks (they improve slowly forever); the relative-decay detector fixed this. (ii) Zero-initialized child gates produce dead children; uniform gate initialization plus a warm-up phase fixed this. (iii) Growing a layer without reinitializing per-parameter step-size meta-parameters damaged the fast-adaptation loop, so structural growth and meta-parameter growth cannot be treated as independent. (iv) A standard RSI indicator is inapplicable to a monotonically improving loss trajectory (one-sided deltas give RSI $\equiv100$), so the term is used here for ``recursive self-improvement,'' not the financial indicator.
 
 \section*{Data and code availability}
-The audited implementation, supervisors, and analysis scripts are in the HUSHFUSION Forge repository \cite{HushfusionForge}; the audit findings in this paper cite the exact code locations (e.g.\ \texttt{design\_daemon\_fractal.py}, lines 132, 155, 341--351). The 72,335-round trace is live data on the server and is not committed; a repaired, seeded, reproducible re-run is the precondition for a decisive structural comparison. Writing standards are in \texttt{WRITING-STANDARD.md}.
+The audited implementation, the repair, and the analysis scripts are in the HUSHFUSION Forge repository \cite{HushfusionForge}. The audited snapshot is commit \texttt{10ba961\textasciicircum} (children untrained); the repaired, matched-compute version is commit \texttt{53e4938}. The 72,335-round trace that motivated the audit is live data on the research server and is not committed; the decisive re-run is pre-registered in \texttt{PREREGISTRATION.md} (equivalence bound $\pm 1$ step, converged window $\ge$2000, $\ge$5000 warm rounds, paired bootstrap CI), launched with seed 20261012 and matched compute. Writing standards are in \texttt{WRITING-STANDARD.md}.
 
 \bibliographystyle{plain}
 \bibliography{main}
