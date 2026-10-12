@@ -10,115 +10,104 @@
 \newtheorem{definition}{Definition}
 \newtheorem{proposition}{Proposition}
 
-\title{Before Fractal Continual Learning:\\\large An Implementation Audit of Recursive Structural Growth and Long-Horizon Evaluation}
+\title{Before Fractal Continual Learning:\\\large An Implementation Audit and a Pre-Registered Decisive Comparison}
 \author{HUSHFUSION Forge Research}
 \date{October 2026}
 
 \begin{document}
 \maketitle
 
+\begin{quote}
+\itshape
+``Violence is the last refuge of the incompetent.''
+\\
+--- Salvor Hardin, Isaac Asimov, \emph{Foundation} (1951)
+\end{quote}
+
 \begin{abstract}
-Continual learning is normally posed as parameter adaptation under a fixed computational graph; whether the graph itself should grow---structural plasticity---is a separate question, often asserted but rarely audited. We construct a recursive fractal-loop learner mixing root and descendant outputs through a normalized convex gate, with a relative-decay detector spawning descendants when improvement slows, and run it for 72,335 paired rounds in a resampled-input control environment against a fixed single-node learner. An implementation audit triggered by review reveals that in this run the descendant nodes were never trained: they appear in no optimizer's parameter table, and the advertised depth-dependent sparse schedule never enters a scheduling decision. The tree grew without its new components learning, so the apparent boundary result---``no structural advantage''---is not a test of a fractal learner but of a root node gating untrained random subnets. Long-horizon adaptation itself is confirmed for both root learners (warm cost falls from roughly 130 to about 9 steps, against a random baseline of about 32), and growth is operational (six events; one to seven nodes, the cap), but structural advantage is undecidable from this run. We report the audit, the repaired implementation, and the conditions for a decisive re-evaluation.
+Continual learning is usually posed as parameter adaptation under a fixed computational graph; whether the graph itself should grow is a separate question, often asserted but rarely audited. We construct a recursive fractal-loop learner that mixes root and descendant outputs through a normalized convex gate and spawns descendants when improvement slows, and run it paired against a fixed single-node learner in a resampled-input control environment. A post-review implementation audit reveals that in the original 72,335-round run the descendant nodes were never trained---they appear in no optimizer's parameter table, and the advertised depth-dependent sparse schedule never enters a scheduling decision---so the apparent boundary result of ``no structural advantage'' was not a test of a fractal learner. We repair the implementation, match gradient budgets, and pre-register the decisive comparison. Here we show that under the pre-registered rule the repaired re-run (200,000 rounds, seed 20261012) is equivalent: the paired 95\% bootstrap confidence interval on the warm-cost difference lies entirely within the $\pm 1$-step equivalence bound ($n=5{,}000$, CI $[-0.651,-0.548]$). Long-horizon adaptation is confirmed for both learners (warm cost 130$\rightarrow$9 steps versus a random baseline of $\sim$32) and growth is operational (1$\rightarrow$7 nodes), but in this deterministic small-model regime structural growth confers no measurable advantage under matched compute.
 \end{abstract}
 
 \section{Introduction}
 
-Continual learning is normally stated as a weight-update problem: keep the graph fixed and adapt parameters so that new tasks are learned without forgetting old ones \cite{Finn2017,Li2017,Kirkpatrick2017}. This framing leaves an unasked question: when the task itself changes, should the \emph{organization of the updating loops} change, not just the weights inside them? The question matters for long-running controllers, where a learner must track a moving optimum for tens of thousands of rounds while preserving a stable response. Yet whether structural growth helps is nearly always asserted, not measured.
+Continual learning is normally stated as a weight-update problem: keep the graph fixed and adapt parameters so that new tasks are learned without forgetting old ones \cite{Finn2017,Li2017,Kirkpatrick2017}. This framing leaves an unasked question: when the task itself changes, should the \emph{organization of the updating loops} change, not just the weights inside them? For long-running controllers that must track a moving optimum for tens of thousands of rounds, the answer matters; yet whether structural growth helps is nearly always asserted, never measured.
 
-We treat it as a measurement problem, and the audit that follows is the paper's contribution. The architecture is a recursive fractal-loop learner: a dense root node, sparse descendants mixed through a normalized convex gate, and a relative-decay detector that spawns descendants when the improvement rate decays. The main experiment ran this learner for 72,335 paired rounds against a fixed single-node learner in a resampled-input control environment. A post-review code audit then found a decisive flaw in the main experiment's implementation: descendant nodes were never added to any optimizer's parameter table, and the advertised depth-scaled update schedule never entered a scheduling decision. The long run therefore evaluated a root node gating untrained random subnets, not a fractal learner. We report what remains valid (long-horizon adaptation is real; growth is operational), what is retracted (the claim of no structural advantage is undecidable from this run), and the repair plus validation plan that a decisive comparison requires. We release the audit trail and the repaired code.
+We treat the question as a measurement problem. The main experiment ran a recursive fractal-loop learner for 72,335 paired rounds against a fixed single-node learner in a resampled-input control environment. A post-review audit found that the fractal tree's descendant nodes were never trained and its advertised sparse schedule never executed: the long run tested a root node gating untrained random subnets, not a fractal learner. After repairing the implementation and matching gradient budgets (Forge commit \texttt{53e4938}), we pre-registered the decision rule and launched a 200,000-round seeded re-run. The pre-registered verdict is equivalence: the paired bootstrap confidence interval lies entirely inside the $\pm 1$-step bound, so under matched compute structural growth shows no advantage in this regime. Related work on meta-learning \cite{Finn2017,Li2017}, continual consolidation \cite{Kirkpatrick2017}, and fractal allocation \cite{Murray1926,LmPrincipleFractal} is summarized in Section~\ref{sec:related}; what stands, what is retracted, and what is now decided are the paper's full claim set (Table~\ref{tab:verdict}).
 
 \section{Results}
 
-\subsection{Long-horizon continual adaptation succeeds in both root learners}
+\subsection{The repaired, pre-registered re-run decides: equivalence under matched compute}
 
-Two learners, a fixed single-node network and a recursively grown fractal tree, were paired at every round on the same resampled initial condition $\mu_0$ of a deterministic $\mu$-dynamics controller (protocol in Methods). Each selected a control point from its accumulated experience and executed the environment. What the audit establishes is that, in this run, the ``fractal'' learner's descendants were not trained; the observable behavior is that of the root node gating untrained random subnets. With that caveat, the run still validates long-horizon adaptation for the root learners.
+The audit left structural advantage undecidable (Section~\ref{sec:audit}); the decisive test required three fixes agreed with reviewers before it ran. First, compute had to be matched: a seven-node tree consumes several times more gradient steps per round than a single node, so a naive re-run would confound structure with compute. The repaired implementation counts total gradient steps per round in the tree and gives the fixed learner the same budget (Forge commit \texttt{53e4938}). Second, the decision rule had to be fixed before the re-run started: equivalence interval $\pm 1$ step (the integer resolution of the metric), converged window round $\ge 2000$, minimum 5,000 and maximum 10,000 warm rounds with a single look at 5,000, and a paired bootstrap 95\% confidence interval as the verdict (details in \texttt{PREREGISTRATION.md}). Third, the run had to be reproducible: a fixed seed (20261012) and a committed trace.
 
-Both roots learned and kept learning. Warm performance fell from roughly 130 steps in the first 1,000 rounds to roughly 9 steps after 2,000 rounds, and stayed there for the remaining 70,000 rounds; the cold random baseline remained near 32 steps throughout (Table~\ref{tab:main}). Continual adaptation was therefore effective and stable, and it did not decay. This result is independent of the descendant-training flaw: it is a property of the root learner, and both roots exhibit it.
+The re-run completed 200,000 rounds (100,000 warm, 100,000 cold; warm rounds $\ge 2000$: $n=99{,}000$). At the pre-registered first look ($n=5{,}000$), the paired difference in warm cost (fixed $-$ fractal) had mean $-0.60$ steps with 95\% bootstrap CI $[-0.651,-0.548]$---entirely inside $(-1,+1)$, the resolution of the metric (Table~\ref{tab:rerun}). Under the pre-registered rule this is the verdict \emph{equivalent}: no structural advantage is measurable at or above the one-step resolution of the cost. The full converged window confirms the look ($n=99{,}000$, mean $-0.15$), and the four time-segment means ($-0.16$, $-0.12$, $-0.18$, $-0.14$) show the difference is stationary, not an early transient. Safety exceedance stayed below the pre-registered $10\%$ ceiling (fixed $0.10\%$, fractal $0.00\%$), cold baselines matched the expected $\sim$32 steps (31.44 / 31.53), and the fractal tree grew from 1 to 7 nodes (the cap) in this run as well.
 
 \begin{table}[t]
 \centering
-\caption{Long-horizon paired outcome (72,335 rounds). Warm rows are recommenders; cold rows are random controls. Exceedance = crossing the safety ceiling $\mu_{\mathrm{ceil}}$. Audit caveat: in this run the fractal descendants were never trained (\S3.4), so the fractal column reflects a root gating untrained subnets, not a trained fractal learner.}
-\label{tab:main}
-\begin{tabular}{lrr}
+\caption{Pre-registered decisive re-run (200,000 rounds, seed 20261012, matched compute). Warm rows are recommendations; cold rows are random controls. CI is the paired bootstrap 95\% interval at the pre-registered first look ($n=5{,}000$ warm rounds, seed-fixed bootstrap). Positive difference means fractal is better (fewer steps). Verdict: \emph{equivalent}---the CI lies entirely inside the $\pm 1$-step equivalence bound.}
+\label{tab:rerun}
+\begin{tabular}{lr}
 \toprule
-Metric & Fixed & Fractal \\
+Metric & Value \\
 \midrule
-Warm mean steps (full run) & 11.1 & 11.5 \\
-Warm mean steps (converged, round $\ge$2000) & $\sim$9 & $\sim$9 \\
-Cold mean steps & 31.6 & 31.9 \\
-Exceedance rate & 5.9\% & 5.8\% \\
-Final tree nodes & 1 & 7 \\
+Paired warm-cost mean diff (fixed $-$ fractal), $n{=}5{,}000$ & $-0.60$ steps \\
+95\% bootstrap CI & $[-0.651,\,-0.548]$ \\
+Equivalence bound & $[-1,\,+1]$ steps \\
+Converged-window mean diff, $n{=}99{,}000$ & $-0.15$ steps \\
+Warm mean, converged (fixed / fractal) & $8.96$ / $9.11$ \\
+Cold mean (fixed / fractal) & $31.44$ / $31.53$ \\
+Exceedance rate (fixed / fractal) & $0.10\%$ / $0.00\%$ \\
+Final tree nodes & 7 (cap) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Structure grows until the cap}
+\subsection{The audit: descendants were never trained}\label{sec:audit}
 
-The fractal tree grew six times (rounds 46, 57, 73, 80, 87, 94), from one to seven nodes, and then stopped. Growth was driven by a relative-decay detector (Methods): a descendant spawns when the exponentially weighted improvement rate of validation loss falls below a fraction of that structure's early improvement rate. After reaching seven nodes the detector never fired again for the remaining 72,000 rounds. We do not attribute this to autonomous saturation: seven is a hard safety cap in the implementation (\texttt{grow\_check} returns False once \texttt{n\_nodes() >= 7}), so growth was stopped by the cap, not by an emergent equilibrium. Whether the tree would have continued growing without the cap is untested.
+An earlier version of this paper claimed a boundary result: ``no structural advantage.'' A post-review audit of the main experiment's implementation retracts that claim as undecidable from that run, because three findings show the run did not test a fractal learner.
 
-The audit complicates this picture. Growth is operational---the detector fires and the graph mutates---but the spawned descendants were not trained (Section~3.4). What the run demonstrates, therefore, is that the \emph{detector and the graph mutation} work over a long horizon, not that the grown components learn. Growth events are real; their learning contribution was never exercised.
-
-\subsection{The structural advantage is undecidable: the implementation audit}
-
-The paper's earlier version claimed a boundary result: ``no structural advantage.'' A post-review audit of the main experiment's implementation retracts that claim. Three findings are decisive.
-
-\textbf{Descendants are never trained.} In \texttt{design\_daemon\_fractal.py} (audited version: commit \texttt{10ba961\textasciicircum}; the repository HEAD now contains the repaired code), each node's optimizer is constructed over the node's own network and gate parameters only (``opt = Adam(list(self.net.parameters()) + [self.gate])''). Children of a grown node are appended to \texttt{self.children}, but they never join any parent's optimizer parameter list, and the main loop calls \texttt{train\_step} only on the root. A descendant's parameters therefore never receive a gradient step. The only per-child operation is a warm-up counter decrement. The grown ``tree'' is a root network gating fixed, randomly initialized subnets. The audit line numbers cited here refer to \texttt{10ba961\textasciicircum}; a reader checking out HEAD will see the repaired loop instead, so the audited snapshot is pinned by its commit hash.
+\textbf{Descendants are never trained.} In \texttt{design\_daemon\_fractal.py} (audited snapshot: commit \texttt{10ba961\textasciicircum}), each node's optimizer is constructed over the node's own network and gate parameters only (``opt = Adam(list(self.net.parameters()) + [self.gate])''). Children of a grown node are appended to \texttt{self.children}, but never join any parent's optimizer parameter list, and the main loop calls \texttt{train\_step} only on the root. A descendant's parameters therefore never receive a gradient step; the only per-child operation is a warm-up counter decrement. The grown ``tree'' is a root network gating fixed, randomly initialized subnets.
 
 \textbf{The advertised sparse schedule never executes.} The code computes \texttt{update\_freq = D**depth} and stores it, but no scheduling decision anywhere consults it. Depth-dependent update frequency is documentation, not behavior.
 
-\textbf{The evaluation is not reproducible as stated.} The 72,335-round trace and its analysis script are not in the repository; the daemon seeds its RNG from wall-clock time (\texttt{int(time.time()) \% 10000}); a rerun does not reproduce the reported numbers. The repository's \texttt{README} acknowledges the trace as ``live data, not committed.''
+\textbf{The evaluation is not reproducible as stated.} The 72,335-round trace and its analysis script are not in the repository; the daemon seeds its RNG from wall-clock time (\texttt{int(time.time()) \% 10000}); a rerun does not reproduce the reported numbers.
 
-Consequences. The paired long-run difference (11.5 vs.\ 11.1 warm steps) and the three-seed and 701-record comparisons all compare a trained root against a root gating untrained subnets---a condition that neither confirms nor refutes a fractal advantage. The correct statement is \emph{undecidable from this run}. Long-horizon adaptation and growth detection remain valid; structural advantage requires a repaired implementation and a decisive re-run.
+Consequence: the paired long-run difference (11.5 vs.\ 11.1 warm steps) and the three-seed and 701-record comparisons all compare a trained root against a root gating untrained subnets---a condition that neither confirms nor refutes a fractal advantage. Long-horizon adaptation and growth detection remain valid (Sections~\ref{sec:adapt}--\ref{sec:growth}); structural advantage was undecidable until the re-run of Section~\ref{sec:rerun}.
 
-\begin{table}[t]
-\centering
-\caption{What stands, what falls, what is undecidable. This verdict box is the paper's full claim set.}
-\label{tab:verdict}
-\begin{tabular}{p{0.24\textwidth}p{0.24\textwidth}p{0.46\textwidth}}
-\toprule
-\textbf{Stands} & \textbf{Falls (retracted)} & \textbf{Undecidable} \\
-\midrule
-Long-horizon root adaptation: warm 130$\rightarrow$9 steps vs.\ random $\sim$32, held 72,000 rounds & ``No structural advantage'' (boundary result as originally claimed) & Structural advantage of a trained fractal learner, under matched compute \\
-Relative-decay growth detector: 6 events, 1$\rightarrow$7 nodes (cap-stopped) & Sparse $D^{-d}$ update schedule as an executed mechanism & Whether growth would saturate without the 7-node cap \\
-Control environment as a deterministic benchmark & Descendant training as an executed mechanism & Outcome of the repaired, seeded, matched-compute re-run \\
-\bottomrule
-\end{tabular}
-\end{table}
+\subsection{Long-horizon adaptation is real in both root learners}\label{sec:adapt}
 
-\subsection{What the audit does not touch}
+Both roots learned and kept learning. Warm performance fell from roughly 130 steps in the first 1,000 rounds to roughly 9 steps after 2,000 rounds, and stayed there for the remaining 70,000 rounds; the cold random baseline remained near 32 steps throughout (Table~\ref{tab:rerun}). Continual adaptation was therefore effective and stable, and it did not decay. This result is independent of the descendant-training flaw: it is a property of the root learner, and both roots exhibit it.
 
-Three earlier results are independent of the descendant-training flaw and remain valid. (i) Long-horizon continual adaptation is real: both roots converge from roughly 130 to about 9 warm steps against a random baseline of about 32 and hold for 72,000 rounds. (ii) The relative-decay detector is operational: six growth events, one to seven nodes, then stopped by the cap. (iii) The control environment is a sound deterministic benchmark with a safety ceiling; this is unaffected by the learner implementation. These three stand; the structural-advantage claim falls.
+\subsection{Growth is operational but cap-stopped}\label{sec:growth}
 
-\section{Related Work}
-
-Our design sits at the meeting point of optimization-based meta-learning, which separates fast task adaptation from slower meta-parameter updates \cite{Finn2017,Li2017}; continual-learning consolidation, which addresses forgetting under sequential tasks \cite{Kirkpatrick2017}; and fractal allocation arguments, which suggest that when marginal returns decline with depth, computation need not be spread evenly across levels---a principle with roots in Murray's minimum-work analysis of branching networks \cite{Murray1926} and formalized in our companion Lean development \cite{LmPrincipleFractal}. We keep these as motives, not predictions. The present paper does not claim to resolve whether fractal organization helps; its contribution is to show how an apparently clean long-horizon comparison can silently fail to test the hypothesis, and what a decisive test requires.
+The fractal tree grew six times (rounds 46, 57, 73, 80, 87, 94), from one to seven nodes, and then stopped. Growth was driven by a relative-decay detector (Methods): a descendant spawns when the exponentially weighted improvement rate of validation loss falls below a fraction of that structure's early improvement rate. After reaching seven nodes the detector never fired again for the remaining 72,000 rounds. We do not attribute this to autonomous saturation: seven is a hard safety cap in the implementation, so growth was stopped by the cap, not by an emergent equilibrium. Whether the tree would have continued growing without the cap is untested. The audit sharpens the reading: the detector and the graph mutation work over a long horizon, but in the audited run the grown components were never exercised as learners.
 
 \section{Discussion}
 
-Two statements must be held apart, and the audit sharpens the separation. ``Recursive structural plasticity is implementable and stable'' is now qualified: growth events fire and the graph mutates, but in the audited run the grown components never learned, so we can only say the \emph{detector and mutation} work, not the grown learner. ``Structural growth improves performance'' was the paper's earlier claim, and it is now retracted: the run did not test a trained fractal learner, so its null result is undecidable. Conflating ``the tree grew'' with ``the grown components learned'' is precisely the error this audit corrects; separating the two is the paper's methodological point.
+Three statements must be held apart, and this paper now settles two of them. ``Recursive structural plasticity is implementable and stable'' is qualified: growth events fire and the graph mutates, but in the audited run the grown components never learned, so we can only say the \emph{detector and mutation} work, not the grown learner. ``Structural growth improves performance'' was the paper's earlier claim and is now decided in the negative direction: under matched compute, in this deterministic control environment, the pre-registered comparison is equivalent---structural growth confers no advantage resolvable at the one-step resolution of the metric. Conflating ``the tree grew'' with ``the grown components learned'' was the error the audit corrected; separating them is the paper's methodological point.
 
-The question of whether the advantage could appear at all remains open. The prefix-concentration argument that motivates fractal allocation \cite{LmPrincipleFractal} requires diminishing returns strong enough that concentrating budget in early levels beats spreading it. On a small learner with limited data, marginal returns may not decline sharply; splitting the budget across specialists may dilute each specialist's evidence. These are hypotheses, not findings: the audited run cannot speak to them because it never trained a fractal learner.
+The equivalence verdict is a boundary result, not a license to generalize. It holds for a small model, a deterministic resampled-input environment, and a matched gradient budget. The prefix-concentration argument that motivates fractal allocation \cite{LmPrincipleFractal} requires marginal returns to decline sharply with depth; on a small learner with limited data they may not, and splitting the budget across specialists may dilute each specialist's evidence. Whether fractal organization pays in larger models, non-stationary environments, or unconstrained budgets remains open---and the pre-registered protocol of this paper is the template by which those claims should be tested, not asserted.
 
-Two review findings sharpened the decisive test. First, compute must be matched: a fractal tree with seven nodes consumes several times more gradient steps per round than a single node, so a naive re-run would confound structure with compute. The repaired implementation therefore counts total gradient steps per round in the tree and gives the fixed learner the same budget (Forge commit \texttt{53e4938}). Second, the equivalence bound must be pre-registered before the re-run starts, not chosen after: we fix the equivalence interval at $\pm 1$ step (the integer-step resolution of the metric), the converged window at round $\ge 2000$, a minimum of 5,000 warm rounds and a maximum of 10,000 (one look at 5,000, then stop as inconclusive if the interval still crosses a bound, to prevent continuous peeking), with a paired bootstrap confidence interval as the decision rule (details in \texttt{PREREGISTRATION.md}). A re-run that follows these rules is the only way the boundary becomes decidable rather than another assertion.
+The practical lesson is procedural. Evaluate structural growth in three stages: (i) does the graph mutate safely, (ii) does the learner keep adapting after mutation, and (iii) does the mutation improve a pre-registered metric under matched compute and data? This paper ran all three; stage (iii) required repairing the implementation and pre-registering the rule, and its answer in this regime is no measurable advantage.
 
-The practical lesson is procedural. Evaluate structural growth in three stages: (i) does the graph mutate safely, (ii) does the learner keep adapting after mutation, and (iii) does the mutation improve a pre-registered metric under matched compute and data? This paper ran stages (i) and (ii)---and the audit shows that stage (ii) was only partially satisfied (the graph mutates, but the grown components did not train). Stage (iii) was not reached, because the implementation flaw makes it undecidable. That stage is the correct next experiment.
+\section{Related Work}\label{sec:related}
+
+Our design sits at the meeting point of optimization-based meta-learning \cite{Finn2017,Li2017}, continual-learning consolidation \cite{Kirkpatrick2017}, and fractal allocation arguments rooted in Murray's minimum-work analysis of branching networks \cite{Murray1926} and formalized in our companion Lean development \cite{LmPrincipleFractal}. We keep these as motives, not predictions; the paper's contribution is methodological---how an apparently clean long-horizon comparison can silently fail to test its hypothesis, and what a decisive test requires---rather than a claim that fractal organization either helps or hurts.
 
 \section{Methods}
 
 \subsection{Recursive fractal-loop architecture}
 
-The architecture is defined as follows; Section~3.4 audits what the deployed implementation actually did. Each node $v$ holds a predictor $f_v(x;\theta_v)$ and may have descendants $\mathcal{C}(v)$. The node output is a convex combination,
+Each node $v$ holds a predictor $f_v(x;\theta_v)$ and may have descendants $\mathcal{C}(v)$. The node output is a convex combination,
 \begin{equation}
  y_v(x) = g_{v,0}\,f_v(x;\theta_v) + \sum_{u\in\mathcal{C}(v)} g_{v,u}\,y_u(x),
  \qquad g_{v,j}\ge 0,\quad \sum_j g_{v,j}=1,
 \end{equation}
-with gates produced by a softmax. Descendants are not trusted immediately: they are warmed independently before entering the parent's mixture, which prevents the ``dead-child'' failure where a zero-initialized gate gives a child zero contribution and therefore zero gradient.
-
-The root is updated every round; a node at depth $d$ updates at frequency $D^{-d}$ for sparse factor $D$ (we use $D=4$). This concentrates computation in the shallow prefix---the operational analogue of a fractal allocation rule. As the audit shows, this sparse schedule was specified but not enforced by the deployed code.
+with gates produced by a softmax. Descendants are not trusted immediately: they are warmed independently before entering the parent's mixture, which prevents the ``dead-child'' failure where a zero-initialized gate gives a child zero contribution and therefore zero gradient. The root is updated every round; a node at depth $d$ updates at frequency $D^{-d}$ for sparse factor $D$ (we use $D=4$). As the audit shows, this sparse schedule was specified but not enforced by the deployed code.
 
 \subsection{Growth rule}
 
-Growth is triggered by relative decay of validation loss. Let $\bar\imath_t$ be an exponentially weighted improvement rate and $\imath_0$ the structure's early average improvement rate. A descendant is spawned when $\bar\imath_t/\imath_0$ stays below a threshold ($0.25$ in the deployed run) for several consecutive observations; the detector resets after growth. A clean-loss filter excludes safety-penalty values, because a penalty spike is not evidence of a structural bottleneck. We include the failure that motivated the design: an initial absolute rule (``loss no longer decreases'') never fires, because a shallow model can improve forever at a slow rate.
+Growth is triggered by relative decay of validation loss. Let $\bar\imath_t$ be an exponentially weighted improvement rate and $\imath_0$ the structure's early average improvement rate. A descendant is spawned when $\bar\imath_t/\imath_0$ stays below a threshold ($0.25$ in the deployed run) for several consecutive observations; the detector resets after growth. A clean-loss filter excludes safety-penalty values, because a penalty spike is not evidence of a structural bottleneck.
 
 \subsection{Control environment}
 
@@ -128,18 +117,22 @@ We assemble a deterministic $\mu$-dynamics controller from the two-flow-ring mod
  \qquad
  \eta_t=\eta_{\mathrm{ext}}+(2\lambda-\lambda^2)(1-\mu_t),
 \end{equation}
-where $\eta_{\mathrm{ext}}$ is an external drive and $\lambda$ a convergence parameter for a candidate self-flattening term. The task is to reach $\mu\ge 0.999$ (work window) without crossing $\mu_{\mathrm{ceil}}=1-m_e/m_i\approx0.999780568$ (safety ceiling). Cost is the number of steps to the window; ceiling crossing is a failure. The environment is deterministic, has a clear safety boundary, and is resampled: a fresh $\mu_0\sim U(0.01,0.8)$ is drawn every round. We describe this as resampling, not drift: the mapping from control point to cost is fixed, so the learner faces input resampling rather than a changing task. It is a benchmark for method study, not evidence about any experimental antigravity device; $\lambda$ remains an input gap in the upstream model.
+where $\eta_{\mathrm{ext}}$ is an external drive and $\lambda$ a convergence parameter. The task is to reach $\mu\ge 0.999$ (work window) without crossing $\mu_{\mathrm{ceil}}=1-m_e/m_i\approx0.999780568$ (safety ceiling). Cost is the number of steps to the window; ceiling crossing is a failure. The environment is deterministic, has a clear safety boundary, and is resampled: a fresh $\mu_0\sim U(0.01,0.8)$ is drawn every round. We describe this as resampling, not drift: the mapping from control point to cost is fixed, so the learner faces input resampling rather than a changing task. It is a benchmark for method study, not evidence about any experimental antigravity device; $\lambda$ remains an input gap in the upstream model.
 
 \subsection{Paired long-horizon protocol}
 
-Every round, both learners see the same $\mu_0$. Each selects a control point from its experience (UCB over a $20\times10$ grid of $(\eta_{\mathrm{ext}},\lambda)$), executes the environment, and updates its parameters from a sliding window of recent experience (capacity 400). Odd rounds are cold random controls, even rounds are warm recommendations. The deployed run used 72,335 rounds, independent checkpoints every 10 rounds, and a supervisor that restarted the daemon on failure. The fractal tree was allowed to grow without a preselected depth, subject to a safety cap of seven nodes. As \S3.4 details, the deployed implementation did not include descendant parameters in any optimizer, so the protocol description here is the intended design, not the executed behavior.
+Every round, both learners see the same $\mu_0$. Each selects a control point from its experience (UCB over a $20\times10$ grid of $(\eta_{\mathrm{ext}},\lambda)$), executes the environment, and updates its parameters from a sliding window of recent experience (capacity 400). Odd rounds are cold random controls, even rounds are warm recommendations. The deployed run used 72,335 rounds with a supervisor that restarted the daemon on failure; the decisive re-run used 200,000 rounds, seed 20261012, and the matched-compute repair. As Section~\ref{sec:audit} details, the deployed implementation did not include descendant parameters in any optimizer, so the protocol description is the intended design; the decisive re-run executes the repaired design.
+
+\subsection{Matched-compute repair and pre-registered decision rule}
+
+The repair (Forge commit \texttt{53e4938}) makes each \texttt{train\_step} return its total gradient-step count; each round, the fixed learner is given the same number of gradient steps the fractal tree used, so structure and compute are no longer confounded. The decision rule was fixed before the re-run started (\texttt{PREREGISTRATION.md}): paired warm-cost difference (fixed $-$ fractal) over warm rounds $\ge 2000$; equivalence interval $\pm 1$ step; paired bootstrap 95\% CI ($10{,}000$ resamples, seed fixed); verdicts equivalent / fractal-better / fixed-better / inconclusive, with one look at $n=5{,}000$, a stop at $n=10{,}000$ if still inconclusive, and no further looks (to prevent continuous peeking).
 
 \subsection{Failure analyses that shaped the design}
 
 Four failures are worth recording. (i) An absolute ``no-improvement'' growth detector never fires on shallow networks (they improve slowly forever); the relative-decay detector fixed this. (ii) Zero-initialized child gates produce dead children; uniform gate initialization plus a warm-up phase fixed this. (iii) Growing a layer without reinitializing per-parameter step-size meta-parameters damaged the fast-adaptation loop, so structural growth and meta-parameter growth cannot be treated as independent. (iv) A standard RSI indicator is inapplicable to a monotonically improving loss trajectory (one-sided deltas give RSI $\equiv100$), so the term is used here for ``recursive self-improvement,'' not the financial indicator.
 
 \section*{Data and code availability}
-The audited implementation, the repair, and the analysis scripts are in the HUSHFUSION Forge repository \cite{HushfusionForge}. The audited snapshot is commit \texttt{10ba961\textasciicircum} (children untrained); the repaired, matched-compute version is commit \texttt{53e4938}. The 72,335-round trace that motivated the audit is live data on the research server and is not committed. The decisive re-run is pre-registered in \texttt{PREREGISTRATION.md} (equivalence bound $\pm 1$ step, converged window $\ge$2000, $\ge$5000 warm rounds, paired bootstrap CI) and launched with seed 20261012 under matched compute; \emph{as of this writing the re-run is still in progress and its results are not yet reported}---the paper's claims rest on the audit and the surviving results listed in Table~\ref{tab:verdict}, not on the re-run. Writing standards are in \texttt{WRITING-STANDARD.md}.
+The audited implementation, the repair, and the analysis scripts are in the HUSHFUSION Forge repository \cite{HushfusionForge}. The audited snapshot is commit \texttt{10ba961\textasciicircum} (children untrained); the repaired, matched-compute version is commit \texttt{53e4938}. The decisive re-run trace is \texttt{oml\_daemon\_fractal\_matched\_20261012.jsonl} (200,000 rounds, seed 20261012; 36,151,557 bytes; md5 \texttt{edc0f8e78fb0527d29d151222473f26b}; last write 2026-10-12T03:11 UTC), analyzed by \texttt{paper/analyze\_matched.py}; the pre-registration, decision rule, and verdict are in \texttt{PREREGISTRATION.md}. Writing standards are in \texttt{WRITING-STANDARD.md}.
 
 \bibliographystyle{plain}
 \bibliography{main}

@@ -11,6 +11,21 @@ status: current
 
 ## 最近更新
 
+- **2026-10-12 分形论文 CNS v2 重写 + 决定性重跑判定落文** — `paper/`（Before Fractal
+  Continual Learning: An Implementation Audit and a Pre-Registered Decisive Comparison）。
+  ① 写作标准升级为 **WRITING-STANDARD.md v2**（官方基准：Nature 150 词摘要/Here-we-show
+  收束、无标题引言 ≤2 段、Results 子标题 ≤60 字符不编号、Discussion 无子标题、Methods
+  后置、NeurIPS 200 词单段摘要/checklist 精神）；② 论文结构按 CNS 骨架重写：格言换为
+  **阿西莫夫《基地》「暴力是无能者最后的手段」**（EN/ZH 双语卷首，出处已验证 1951
+  Salvor Hardin）；③ **决定性重跑 200,000 轮已完成，判定 EQUIVALENT**：预注册首次
+  look (n=5000) 配对差 95% CI (−0.651, −0.548) 完全落在 ±1 步等价界内 → H0 坐实
+  **配平计算量下结构无优势**（原边界结果经审计+修复+预注册重跑后成立）；全收敛段
+  n=99,000 mean −0.152、四段平稳、越界率 0.10%/0.00%、cold 基线 31.44/31.53；
+  ④ 双版 PDF 各 6 页编译通过、无 undefined cite、CI 数字入正文；⑤ 判定脚本
+  `paper/analyze_matched.py` 入库，trace 36MB 留在服务器（md5 已记入论文 Data
+  availability）。**数据在 HUSHFUSION Forge 仓** `scripts/design_daemon_fractal.py`
+  @ 53e4938。
+
 - **2026-10-10 分形持续学习论文初稿** — `paper/`（Fractal Continual Learning: Recursive Structural Growth, Long-Horizon Adaptation, and the Boundary of Structural Advantage）。三层主张: 递归结构塑性可行 / 长期持续学习成立（72,335 轮 3.5× 增益）/ 结构优势边界（小模型 regime 分形无统计优势）。证据在 HUSHFUSION Forge 仓。
 
 - 2026-09-30（续十三）：**判别性对照臂 `replay-self` 落地 + 扩 seed 批起跑**

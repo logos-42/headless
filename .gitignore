@@ -51,3 +51,4 @@ paper/*.aux
 paper/*.bbl
 paper/*.out
 paper/*.log
+paper/*.jsonl

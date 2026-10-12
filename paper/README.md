@@ -8,7 +8,7 @@
 
 一篇**实现审计方法论**论文。原稿声称「分形结构无优势」的边界结果,
 三轮对抗审稿(NeurIPS 级 + CNS 级)后发现主实验代码存在致命实现缺陷,
-论文改写为审计版:
+论文改写为审计版, 并在配平、预注册、可复现的前提下完成了决定性重跑:
 
 1. **审计发现(核心)** — 72,335 轮主实验代码(`design_daemon_fractal.py`,
    被审版本 `10ba961^`)里, 分形树的子节点**从不被训练**:
@@ -23,19 +23,24 @@
    该 run 对分形假设的信息量为零
 4. **修复** — Forge 仓 `53e4938`: 递归子节点训练 + 稀疏调度生效 +
    warmup 持久优化器 + `--seed` 可复现
-5. **决定性重跑(进行中)** — 预注册 `PREREGISTRATION.md` (等价界 ±1 步,
+5. **决定性重跑(已完成)** — 预注册 `PREREGISTRATION.md` (等价界 ±1 步,
    收敛段 ≥2000 轮, n≥5000 warm 轮, paired bootstrap CI), 服务器
-   seed=20261012 配平版, **结果未出, 另行报告**
+   seed=20261012 配平版, 200,000 轮跑完。**判定: EQUIVALENT** —
+   首次 look (n=5000) 配对差 95% CI (−0.651, −0.548) 完全落在 ±1 步等价界内
+   ⟹ H0 成立: **配平计算量下结构无优势**。原「无结构优势」边界结果经审计+修复+
+   预注册重跑后**坐实**。
 
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
-| `main.tex` | 论文正文(英文, article 11pt, 审计版) |
+| `main.tex` | 论文正文(英文, article 11pt, CNS 骨架 + 决定性重跑结果) |
 | `main.bib` | 参考文献(Murray 1926 / Finn 2017 / Li 2017 / Kirkpatrick 2017 / 自仓 ×2) |
 | `main.pdf` | 编译产物(6 页) |
-| `PREREGISTRATION.md` | 决定性重跑预注册(等价界/判定规则/复现信息) |
-| `WRITING-STANDARD.md` | 论文写作标准(AI 顶会 + CNS 级, 审稿判据) |
+| `main-zh.tex/.pdf` | 中文镜像(ctex, 同结构同编号) |
+| `analyze_matched.py` | 决定性重跑判定脚本(预注册规则: paired bootstrap, 首次 look n=5000) |
+| `PREREGISTRATION.md` | 决定性重跑预注册(等价界/判定规则/复现信息/**判定结果**) |
+| `WRITING-STANDARD.md` | 论文写作标准(AI 顶会 + CNS 级 v2, 审稿判据) |
 
 ## 编译
 
@@ -52,17 +57,34 @@ tectonic main.tex        # 单命令多趟编译(含 bibtex)
 | 第1轮 | NeurIPS 级 + CNS 级 | 退稿(2 致命: 子节点未训练 / 不可复现) | 改写审计版 + 修复代码 |
 | 第2轮 | NeurIPS 级 + CNS 级 | 大修(算力不匹配 / 无预注册 / 未钉 SHA) | 配平 53e4938 + 预注册 + 裁决框 |
 | 第3轮 | NeurIPS 级 | 小修(README 同步 / 重跑状态声明 / 预注册样本上限) | 本 README 重写 + 正文声明 |
+| **第4轮(2026-10-12)** | **CNS 标准 v2** | **结构重写 + 重跑结果落文** | 摘要 Here-we-show 收束 / 无标题引言 / 结果前置(重跑判定为首节) / 讨论无子标题 / 方法后置 / 中文镜像同步 / **决定性重跑 EQUIVALENT 判定入正文** |
 
 ## 数据与复现(在 HUSHFUSION Forge 仓)
 
 - 守护进程: `scripts/design_daemon_fractal.py`(修复版 @ 53e4938)
 - 72,335 轮配对趋势(被审计): 服务器 `artifacts/oml_daemon_trend_fractal_*.jsonl`(活数据, 未入 git, 已披露)
-- 决定性重跑: 服务器 `artifacts/oml_daemon_fractal_matched_20261012.jsonl`(seed 20261012, 配平版, 进行中)
+- 决定性重跑: 服务器 `artifacts/oml_daemon_fractal_matched_20261012.jsonl`(seed 20261012, 配平版,
+  200,000 轮, **已完成**; 本地副本 `paper/` 同 md5 `edc0f8e7…`)
+- 判定脚本: `paper/analyze_matched.py`
 - 全部 spike: `scripts/spike_fractal_*.py`, `scripts/spike_ag_*.py`
 - 证据链: `docs/wiki/plan-antigravity-control.md` §2e-2k
+
+## 决定性重跑结果 (2026-10-12)
+
+| 量 | 值 |
+|---|---|
+| 总轮数 | 200,000 (warm 100,000 / cold 100,000) |
+| 收敛段 warm n (round≥2000) | 99,000 |
+| 首次 look n | 5,000 |
+| 配对均值差 (fixed − fractal) | −0.6004 步 |
+| 95% bootstrap CI | (−0.6506, −0.5482) |
+| 等价界 | ±1 步 |
+| **判定** | **EQUIVALENT (H0: 配平计算量下结构无优势)** |
+| 越界率 | fixed 0.10% / fractal 0.00% |
 
 ## 诚实边界(论文已写明)
 
 - 控制环境是确定性模型, 不是实验装置; λ 是上游第二输入缺口
 - 论文贡献是**审计方法论**(看似干净的对比如何静默地违背假设), 不是「分形更优」或「分形无优势」的主张
-- 决定性重跑结果未出; 论文明确区分已有证据 vs 未来证据
+- **决定性重跑已给出等价判定**: 在配平计算量 + 确定性小模型 regime 下, 结构生长在 ±1 步分辨率内无可测优势;
+  更大模型/非平稳环境/不配平预算下的分形收益仍开放
