@@ -11,6 +11,21 @@ status: current
 
 ## 最近更新
 
+- **2026-10-29 门控 cron 第七次唤醒 = `DEAD`（首次）— 服务器上 bm2/bm5b 原始数据已消失，GPU 已不可用**
+  - `/work/liuyuanjie/headless` **不存在 `results/`**；全 `/work` 搜 `lm4_wave_results.json` 与
+    `BM*_DONE` **均为空**；`headless.tgz` 内 `results/` 条目 = 0 ⇒ `bm2_*` / `bm5b_*` / `bm_*`
+    **原始数据已丢**，`docs/bm_benchmark_results.md` 的数字**无法在服务器侧复算**（`results/`
+    被 `.gitignore` 排除，git 内也没有）。
+  - 该 checkout 无 `.git`、目录 mtime 2026-09-30，是 tarball 副本 ⇒ 09-14 数据随原工作目录被回收。
+  - **GPU 挂了**：`nvidia-smi` → `Failed to initialize NVML: Unknown Error`；两块 A100-PCIE-40GB
+    在 `/proc/driver/nvidia` 仍可见（驱动 570.133.07），但 `torch.cuda.is_available() = False,
+    device_count = 0`；`driver_wait.log` 2026-10-23 02:54→05:09 每 5 min 报「GPU 仍不可用」后停止。
+    容器内 `dmesg` 不可读 ⇒ 需主机侧 reboot/NVML 复位，容器内无法修。
+  - 无任何 benchmark 进程 ⇒ `DEAD` 属实，性质是「新环境从未启动 + 旧数据已丢」，不是跑到一半崩。
+  - **未做**：不重启 benchmark、不写新数字。**待决**：① 该门控作业已无信息量，建议 pause；
+    ② 若要重跑，先恢复 GPU 再跑 `tests/bm2_driver.sh`（双卡 ~62 min），结果须落持久目录并
+    tarball 入库/DVC 托管。
+
 - **2026-10-12 分形论文 CNS v2 重写 + 决定性重跑判定落文** — `paper/`（Before Fractal
   Continual Learning: An Implementation Audit and a Pre-Registered Decisive Comparison）。
   ① 写作标准升级为 **WRITING-STANDARD.md v2**（官方基准：Nature 150 词摘要/Here-we-show
