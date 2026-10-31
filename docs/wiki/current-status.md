@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-09-30
+last_confirmed: 2026-10-31
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,22 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-10-31 门控 cron 第八次唤醒 = `DEAD`（第二次）— GPU 已恢复；「数据全丢」被自己推翻，但 raw 层确实没了**
+  - `nvidia-smi` 与 `torch 2.9.1+cu128` 均正常，**2× A100 可用**（10-29 的 NVML 初始化失败已解除）⇒ 重跑的硬件前提恢复。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log`（**无 log 可 tail**）；
+    该 checkout 无 `.git`、mtime 2026-09-30。
+  - **但 `/tmp` 留有 09-28 的定稿产物**：`bm_report.json`（lm4 8 臂 + lm5 7 臂 × 3 seed 的逐 seed
+    `final/forget/any_time/worst/matrix_last/domains/chance` + 自带 Welch t 的 `comparisons`）、
+    `bm_full.txt`、`bm_lm4.txt`、`bm_summary.json` ⇒ **10-29 写的「无法在服务器侧复算」是错的**，
+    逐 seed × 逐域聚合指标可复核。
+  - **真正丢失的是逐过程数据**：每轮完整遗忘矩阵、`curves`/`visits` 时间序列、提议序列（只在已消失的
+    `results/*/lm4_wave_results.json` 里）；`/tmp/bmbak/bm2_random-matched_s{1,7,42}` 三份 json
+    **截断不可解析**（当年 `int64` 序列化 bug），只剩 `lm4_wave_report.md`。
+  - **完成度**：`bm_full.txt` 中 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数 ⇒ 修正版是**跑完的**；
+    本次 `DEAD` = 「环境重建 + `results/` 被回收」，不是跑到一半崩。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决**：① 该门控作业建议 pause（8 次唤醒 0 次新信息）；
+    ② 若重跑，先核对 **GPU1 显存 40404/40960MiB 却无 compute-apps** 的残留占用，结果须落持久目录 + 入库。
 
 - **2026-10-29 门控 cron 第七次唤醒 = `DEAD`（首次）— 服务器上 bm2/bm5b 原始数据已消失，GPU 已不可用**
   - `/work/liuyuanjie/headless` **不存在 `results/`**；全 `/work` 搜 `lm4_wave_results.json` 与
