@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-10-31
+last_confirmed: 2026-11-03
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,22 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-03 门控 cron 第九次唤醒 = `DEAD`（第三次）— 0 新信息；「无 log」= 启动前即死的证据**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log`（**无 log 可 tail**）；
+    checkout 无 `.git`、mtime 2026-09-30；`ps` 无 benchmark 进程。
+  - **新证据**：`tests/bm2_driver.sh` 与 `/tmp/bm2_driver.sh` md5 相同（`6f88c424…`，09-14 07:02），
+    首条命令即 `>> results/bm2.log` —— `results/` 不存在时 bash 层重定向**立即失败**、日志不会被创建
+    ⇒ 「无 log」说明它**启动前就死了**，而不是日志被删。
+  - `/tmp` 定稿产物仍在（`bm_report.json` / `bm_full.txt` / `bm_lm4.txt` / `bm_summary.json` / `bmbak/`）
+    ⇒ 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数，结论不变：
+    ① `value` vs `random-matched` lm4 Δ=+0.0013（t=+0.23）／lm5 Δ=−0.0274（t=−0.50），符号相反且均 ns；
+    ② `value` vs `value-nofb` lm4 Δ=−0.0024（t=−0.41），lm5 三 seed 矩阵**逐位相同**（`λ_fb` 死项）。
+  - **唯一增量（运维）**：GPU 2/2 可用（`torch 2.9.1+cu128`），但 **GPU1 残留显存 40,404 → 28,696 MiB**
+    且 `--query-compute-apps` 为空 ⇒ 宿主侧占用仍在，重跑 stage C 前必须清，否则误报 OOM。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决**：pause 该门控（9 次唤醒 0 新信息）；
+    重跑需 `mkdir -p results` + 持久目录入库 + 启动闸门加「results 存在 / GPU1 空闲」检查。
 
 - **2026-10-31 门控 cron 第八次唤醒 = `DEAD`（第二次）— GPU 已恢复；「数据全丢」被自己推翻，但 raw 层确实没了**
   - `nvidia-smi` 与 `torch 2.9.1+cu128` 均正常，**2× A100 可用**（10-29 的 NVML 初始化失败已解除）⇒ 重跑的硬件前提恢复。
