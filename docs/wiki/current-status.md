@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-03
+last_confirmed: 2026-11-05
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,20 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-05 门控 cron 第十次唤醒 = `DEAD`（第四次）— 唯一实质增量：GPU 再次 NVML 失效**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（10 次唤醒 0 次新信息）。
+  - **回退**：`nvidia-smi` → `Failed to initialize NVML: Unknown Error`；`torch 2.9.1+cu128` → `cuda.is_available()=False, device_count=0`。
+    `/proc/driver/nvidia/gpus/` 仍报两块 **A100-PCIE-40GB**（驱动 570.133.07）⇒ **硬件在、NVML 挂**，与 10-29 同症状；
+    容器内 `dmesg` 不可读 ⇒ 需主机侧复位/reboot。比 11-03 的「2/2 可用 + GPU1 残留 28.7 GiB」更差。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log`（**无 log 可 tail**）；mtime 2026-09-30；benchmark 进程数 = 0。
+  - `/tmp` 定稿产物仍在（`bm_report.json` / `bm_full.txt` / `bm_lm4.txt` / `bm_summary.json` / `bmbak/`）⇒ 修正版当年**跑完了**：
+    lm4 8 臂 + lm5 7 臂 × 3 seed 全部有数（`fixed/perm/revisit/nonstationary/value/value-nofb/random(-matched)`）。
+  - 两个核心问题复核仍 **ns**：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03，`bm_report.json` 口径）／
+    主口径 Δ=+0.0013（t=+0.23），lm5 Δ=−0.0274（t=−0.50）—— 两种口径都 |t|<1.1 且符号相反；
+    ② `value` vs `value-nofb` lm4 Δ=−0.0024（t=−0.41），lm5 Δ 恒 0（`λ_fb` 等价死项）。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第五次提出）**：pause 门控；重跑顺序 = 主机侧复位 NVML →
+    `mkdir -p results` + 持久目录入库 → 启动闸门加「NVML 可用 / results 存在 / GPU1 空闲」三项检查。
 
 - **2026-11-03 门控 cron 第九次唤醒 = `DEAD`（第三次）— 0 新信息；「无 log」= 启动前即死的证据**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件。
