@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-05
+last_confirmed: 2026-11-07
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,22 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-07 门控 cron 第十一次唤醒 = `DEAD`（第五次）— NVML 恢复，但两块卡都带 ~33 GiB 残留；benchmark 仍无新信息**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（11 次唤醒 0 次新信息）。
+  - **NVML 恢复**：`nvidia-smi` 正常（驱动 570.133.07，2× A100-PCIE-40GB），`torch 2.9.1+cu128 → is_available=True, device_count=2`
+    （11-05 的 `Failed to initialize NVML` 已解除）。
+  - **但就「能否重跑」而言更差**：残留显存从 11-03 的「GPU0 干净 2.0 GiB / GPU1 28.7 GiB」变成
+    **GPU0 32.7 / GPU1 33.3 GiB（of 39.5）**，而 `--query-compute-apps` 只有表头、`ps` 无对应进程
+    ⇒ 宿主侧泄漏已扩散到两块卡，lm4（GPU0）与 lm5（GPU1）都会 OOM。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log` ⇒ **无 log 可 tail**；
+    mtime 2026-09-30；benchmark 进程 0；`tests/bm2_driver.sh` md5 仍 `6f88c424…`（启动前即死，非跑到一半崩）。
+  - `/tmp` 定稿产物仍在 ⇒ 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数，两个核心问题复核**结论不变**：
+    ① `value` vs `random-matched`（唯一干净对照）lm4 Δ=+0.0013（t=+0.23）／json 口径 −0.0054（t=−1.03），
+    lm5 Δ=−0.0274（t=−0.50）—— 都 |t|<1.1 且 lm4 两口径符号相反；② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），
+    lm5 Δ 恒 0（`λ_fb` 等价死项）。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第六次提出）**：pause 门控；重跑前置 = 主机侧清**两块卡** →
+    `mkdir -p results` + 持久目录入库 → 启动闸门加「NVML 可用 / results 存在 / 两块卡空闲」。
 
 - **2026-11-05 门控 cron 第十次唤醒 = `DEAD`（第四次）— 唯一实质增量：GPU 再次 NVML 失效**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（10 次唤醒 0 次新信息）。
