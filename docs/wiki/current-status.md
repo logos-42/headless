@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-07
+last_confirmed: 2026-11-09
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,18 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-09 门控 cron 第十二次唤醒 = `DEAD`（第六次）— 0 新信息；数据未变，结论不变**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（12 次唤醒 0 次新信息）。
+  - GPU：`nvidia-smi` 通、`torch 2/2` 可用，但残留 **GPU0 33,098 / GPU1 32,318 MiB（of 40,960）**，
+    `--query-compute-apps` 空、`ps` 无进程 ⇒ 宿主侧泄漏仍在（对比 11-07 的 32.7/33.3 GiB 属噪声级），**不构成可重跑条件**。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log` ⇒ **无 log 可 tail**；
+    mtime 2026-09-30、driver md5 `6f88c424…`、benchmark 进程 0 ⇒ `DEAD` = **从未在该 checkout 启动**。
+  - `/tmp` 定稿产物字节/mtime 未变；重新从 `bm_report.json` 解析 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数。
+  - 两个核心问题复核**结论不变**：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03）／主口径 +0.0013，
+    lm5 Δ=−0.0274（t=−0.50）—— 都 **ns** 且 lm4 两口径符号相反；② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），
+    lm5 Δ 恒 0（`λ_fb` 等价死项）。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第七次提出）**：pause 门控；重跑前置 = 清两块卡 → `mkdir -p results` + 持久入库 → 三项启动闸门。
 
 - **2026-11-07 门控 cron 第十一次唤醒 = `DEAD`（第五次）— NVML 恢复，但两块卡都带 ~33 GiB 残留；benchmark 仍无新信息**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（11 次唤醒 0 次新信息）。
