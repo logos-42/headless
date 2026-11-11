@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-10
+last_confirmed: 2026-11-11
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,20 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-11 门控 cron 第十四次唤醒 = `DEAD`（第八次）— 0 新 benchmark 信息；唯一增量 = GPU1 残留 12.1 → 36.4 GiB（两块卡又都脏）**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（14 次唤醒 0 次新信息）。
+  - GPU：`nvidia-smi` 通，残留 **GPU0 33,702 / GPU1 36,388 MiB（of 40,960）**；GPU1 一夜 +24.3 GiB（GPU0 逐位不变），
+    `--query-compute-apps` 仅表头、`ps` 无活 python（仅 17 个 `<defunct>` 僵尸）⇒ 宿主侧 CUDA context 泄漏，
+    **比 11-10 更差**：lm4（GPU0）与 lm5（GPU1）都会 OOM。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log` ⇒ **无 log 可 tail**；
+    mtime 2026-09-30（无 `.git`）、driver md5 仍 `6f88c424…`、benchmark 进程 0 ⇒ `DEAD` = **从未在该 checkout 启动**。
+  - `/tmp` 定稿产物字节/mtime 逐位未变（`bm_report.json` 57,194 B / `bm_full.txt` 6,434 B / `bm_lm4.txt` / `bm_summary.json`）；
+    重新解算 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数。
+  - 两个核心问题复核**结论不变**：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03）／anytime +0.0043（t=+0.18），
+    lm5 Δ=−0.0274（t=−0.50）／anytime +0.0073（t=+0.35）—— 全部 |t|<2 且 lm4/lm5 符号相反；
+    ② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），lm5 Δ 恒 0（`λ_fb` 等价死项）。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第九次）**：pause 门控；重跑前置 = 清**两块卡** → `mkdir -p results` + 持久入库 → 三项启动闸门。
 
 - **2026-11-10 门控 cron 第十三次唤醒 = `DEAD`（第七次）— 0 新信息；唯一增量 = GPU1 残留从 32.3 → 12.1 GiB（GPU0 仍 33.7 GiB）**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（13 次唤醒 0 次新信息）。
