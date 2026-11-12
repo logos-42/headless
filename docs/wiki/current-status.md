@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-11
+last_confirmed: 2026-11-12
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,21 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-12 门控 cron 第十五次唤醒 = `DEAD`（第九次）— benchmark 仍无新信息；本轮唯一真实增量 = 同容器另一路作业正在训练（textjepa/agent_plan，GPU0 98% 利用率）**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（15 次唤醒 0 次新 benchmark 信息）。
+  - GPU：**GPU0 38,813 MiB / 98% util、GPU1 36,460 MiB / 0%**（of 40,960）。`--query-compute-apps` 十五轮来**首次非空**：
+    pid **58612** 占 5,106 MiB，命令 `envs/deepinfer/bin/python -m textjepa.train_seq2seq … --tag long`，同命令共 **5 个进程**（etime 1–3 min）
+    ⇒ **另一路会话在跑 DeepInfer 训练**。扣掉它后 GPU0 余 **33,707 MiB**，与 11-10/11-11 的 33,702 **逐位一致** ⇒ 仍是**宿主侧泄漏**。
+    结论：**比 11-11 更差** —— 重跑 bm2 会同时 OOM 并抢卡（GPU0 已有真实训练在跑）。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log` ⇒ **无 log 可 tail**；
+    mtime 2026-09-30（无 `.git`）、driver md5 仍 `6f88c424…`、benchmark 进程 0 ⇒ `DEAD` = **从未在该 checkout 启动**。
+  - `/tmp` 定稿产物字节/mtime 逐位未变；重解 8 lm4 臂 + 7 lm5 臂 × 3 seed 全部有数。
+  - 两个核心问题复核**结论不变**：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03）／anytime +0.0043（t=+0.18），
+    lm5 Δ=−0.0274（t=−0.50）／anytime +0.0073（t=+0.35）⇒ 全部 |t|<2 且两 benchmark 符号相反；
+    ② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），lm5 三指标 Δ 恒 0 ⇒ `λ_fb` 等价死项。
+    新补算：lm4 `value` vs `random` final **−0.0129（t=−2.53）**（显著更差）、vs `perm` anytime **+0.0789（t=+4.47）**。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第十次）**：pause 门控；重跑前置新增「DeepInfer 作业结束 / 无他人作业」检查。
 
 - **2026-11-11 门控 cron 第十四次唤醒 = `DEAD`（第八次）— 0 新 benchmark 信息；唯一增量 = GPU1 残留 12.1 → 36.4 GiB（两块卡又都脏）**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（14 次唤醒 0 次新信息）。
