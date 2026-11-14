@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-12
+last_confirmed: 2026-11-14
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,23 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-14 门控 cron 第十六次唤醒 = `DEAD`（第十次）— benchmark 仍无新信息；唯一增量 = NVML **第三次**失效，连 11-12 的他人作业都无法再观测**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（16 次唤醒 0 次新 benchmark 信息）。
+  - GPU：`Failed to initialize NVML: Unknown Error`（10-29 / 11-05 / 11-14 第三次），`/proc/*/fd` 无任何 nvidia 持有者
+    ⇒ 11-12 的「DeepInfer 占 GPU0 98% util」与两卡残留显存**本轮不可复核**；容器内 dmesg 不可读，复位须主机侧。
+    **状态未知 = 不可重跑**。
+  - `/work/liuyuanjie/headless` 仍无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log` ⇒ **无 log 可 tail**；
+    mtime 2026-09-30（无 `.git`）、driver md5 仍 `6f88c424…`、benchmark 进程 0（仅 18 个僵尸）⇒ `DEAD` = **从未在该 checkout 启动**。
+    机制已实测：`results/` 缺失时 `>> results/bm2.log` 在 bash 层 `rc=1`，18 个 run 全被静默跳过。
+  - `/tmp` 聚合件字节/mtime 未变（`bm_report.json` 57,194 B / `bm_full.txt` 6,434 B / `bm_lm4.txt` / `bm_summary.json`）；
+    `/tmp/bmbak/` 仅余 `bm2_random-matched_s1/s42/s7`；本轮独立重算 8 lm4 臂 + 7 lm5 臂 × 3 seed，**与既往逐位一致**。
+  - 两个核心问题复核**结论不变**：① `value` vs `random-matched` lm4 `final` Δ=−0.0054（t=−1.03）／anytime +0.0043（t=+0.18）／worst +0.0940（t=+1.61），
+    lm5 −0.0274（t=−0.50）／+0.0073（t=+0.35）／−0.0034（t=−0.03）⇒ **两 benchmark 符号相反，全部 |t|<2**；
+    ② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），lm5 三指标 Δ 恒 0 ⇒ **`λ_fb` 在 lm5 是等价死项**。
+    |t|>=2 的三条：lm4 `value` vs `random` final **−0.0129（t=−2.53）**、vs `perm` anytime **+0.0789（t=+4.47）**、
+    `random-matched` vs `random` final **−0.0075（t=−6.31）** ⇒ 红利属于「在线调度」，不属于价值函数判别力。
+  - **未做**：不重启、不动 GPU、不写新数字。**待决（第十一次）**：pause 门控；重跑前置 = 主机侧复位 NVML 清两卡 → 确认 DeepInfer 结束 → `mkdir -p results` + 持久入库 → 四项启动闸门。
 
 - **2026-11-12 门控 cron 第十五次唤醒 = `DEAD`（第九次）— benchmark 仍无新信息；本轮唯一真实增量 = 同容器另一路作业正在训练（textjepa/agent_plan，GPU0 98% 利用率）**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（15 次唤醒 0 次新 benchmark 信息）。
