@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-20
+last_confirmed: 2026-11-22
 audience: reader
 stage: draft
 tags: [status]
@@ -10,6 +10,22 @@ status: current
 ---
 
 ## 最近更新
+
+- **2026-11-22 门控 cron 第十九次唤醒 = `DEAD`（第十三次）— benchmark 仍 0 新信息；唯一增量 = NVML **第六次**失效 + 僵尸 24→1（接近清零）**
+  - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（19 次唤醒 0 次新 benchmark 信息）。
+  - 作业要求的 `tail -30 results/bm2_driver.log` **无对象可 tail**：`/work/liuyuanjie/headless` 无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log`；
+    driver md5 仍 `6f88c424…`（2451 B, 2026-09-14）⇒ **中断点不在某一臂，而在 driver 第一条命令之前**
+    （`>> results/bm2.log` 在 `results/` 缺失时 bash 层 `rc=1`，18 个 run 静默跳过）⇒ **本环境已完成臂 = 0**。
+  - GPU：NVML **第六次**失效（`torch → is_available=False, device_count=0`），`/proc/driver/nvidia/gpus/` 仍报两块 A100
+    ⇒ 硬件在、NVML 挂，容器内无法修，需主机侧复位 ⇒ **状态未知 = 不可重跑**。
+  - `/tmp` 四件 md5 逐位未变（`bm_report.json` 57,194 B `3b6dc4e1…`）；重解 8 lm4 臂 + 7 lm5 臂 × 3 seed 与 20 条 Welch 对比，
+    `t`/`p` 与既往逐位一致。
+  - 两个核心问题**结论不变**：① `value` vs `random-matched` lm4 `final` Δ=−0.0054（t=−1.03）／anytime +0.0043／worst +0.0940，
+    lm5 −0.0274（t=−0.50）／+0.0073／−0.0034 ⇒ **符号相反、全部 |t|<2**；
+    ② `value` vs `value-nofb` lm4 −0.0024（t=−0.41），lm5 三指标 Δ 恒 0 ⇒ **`λ_fb` 在 lm5 是等价死项**。
+    |t|>=2 仍是那 4 条非价值函数红利：`value` vs `random` final **−0.0129（t=−2.53）**、vs `perm` final **+0.0210（t=+3.27）**、
+    `random-matched` vs `random` final **−0.0075（t=−6.31）**、`nonstationary` vs `fixed` worst +0.1378（t=+6.41）；lm5 一条都没有（最大 |t|=0.75）。
+  - 僵尸 24 → **1**。**未做**：不重启、不动 GPU、不写新数字。**待决（第十四次）**：pause 门控；重跑前置同上。
 
 - **2026-11-20 门控 cron 第十八次唤醒 = `DEAD`（第十二次）— benchmark 仍 0 新信息；唯一增量 = NVML **第五次**失效 + 僵尸 178→24（首次回落）**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（18 次唤醒 0 次新 benchmark 信息）。
