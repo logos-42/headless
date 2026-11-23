@@ -11,6 +11,14 @@ status: current
 
 ## 最近更新
 
+- **2026-11-23 门控 cron 第二十一次唤醒 = `UNREACHABLE → DEAD`（第十五次 DEAD）— benchmark 仍 0 新信息；唯一增量 = NVML **第八次恢复**，但两卡被他路作业 + 无主残留同时占住**
+  - 门控 diff 同型 = 6100 链路抖动恢复，**不是**新的完成/崩溃事件（21 次唤醒 0 次新 benchmark 信息）。
+  - `results/` 仍不存在、`BM2_DONE`/`bm2_driver.log` 全盘 0 命中 ⇒ 作业要求的 `tail -30` **无对象可 tail**；`bm2_value_*`/`bm2_value-nofb_*`/`bm5b_*` 全盘 0 个；driver md5 仍 `6f88c424…`（2451 B, 2026-09-14）
+    ⇒ **中断点在 driver 第一条命令之前**（`>> results/bm2.log` 在 `results/` 缺失时 bash 层 `rc=1`）⇒ **本环境已完成臂 = 0**。
+  - GPU：NVML **第八次恢复**（`is_available=True, device_count=2`），快照 GPU0 32.7 GiB/0%、GPU1 29.6 GiB/64%，`--query-compute-apps` 只认 3.9 GiB ⇒ **每卡约 29 GiB 无主残留**；另有 pid 2210 `recursive_train.py`（deepinfer, 117% CPU）在跑 ⇒ **仍不可重跑**。僵尸 1 个。
+  - `/tmp` 四件 md5 逐位未变（`bm_report.json` `3b6dc4e1…`）；重解 8 lm4 臂 + 7 lm5 臂 × 3 seed 与 20 条 Welch，`t`/`p` 逐位一致。
+  - 核心结论不变：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03）／lm5 Δ=−0.0274（t=−0.50）⇒ **符号相反、全部 |t|<2**；② `value` vs `value-nofb` lm4 −0.0024（t=−0.41）、lm5 Δ 恒 0 ⇒ **`λ_fb` 在 lm5 等价死项**。
+
 - **2026-11-23 门控 cron 第二十次唤醒 = `DEAD → UNREACHABLE`（抖动方向首次反向）— 服务器实为可达，benchmark 状态与结论均未变**
   - 门控报 `UNREACHABLE` 不成立：`nc -z …6100` 通、`ssh` 立即 `SSH_OK`（门控 `2>/dev/null` 丢 stderr 后判空）⇒ 单次 ssh 失败，非网络/ClashX 问题。
   - 真实状态仍 `DEAD` 且与既往十三轮逐项一致：无 `results/` / 无 `BM*_DONE` / 无 `bm2_driver.log`（无对象可 tail）、checkout 无 `.git`、mtime 2026-09-30、相关进程 **0** ⇒ 本环境已完成臂 = 0，性质仍是**从未在该 checkout 启动**。
