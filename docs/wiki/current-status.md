@@ -2,7 +2,7 @@
 title: Sovereign AI 当前状态
 source: session
 created: 2026-09-06
-last_confirmed: 2026-11-22
+last_confirmed: 2026-11-23
 audience: reader
 stage: draft
 tags: [status]
@@ -11,6 +11,11 @@ status: current
 
 ## 最近更新
 
+- **2026-11-23 门控 cron 第二十次唤醒 = `DEAD → UNREACHABLE`（抖动方向首次反向）— 服务器实为可达，benchmark 状态与结论均未变**
+  - 门控报 `UNREACHABLE` 不成立：`nc -z …6100` 通、`ssh` 立即 `SSH_OK`（门控 `2>/dev/null` 丢 stderr 后判空）⇒ 单次 ssh 失败，非网络/ClashX 问题。
+  - 真实状态仍 `DEAD` 且与既往十三轮逐项一致：无 `results/` / 无 `BM*_DONE` / 无 `bm2_driver.log`（无对象可 tail）、checkout 无 `.git`、mtime 2026-09-30、相关进程 **0** ⇒ 本环境已完成臂 = 0，性质仍是**从未在该 checkout 启动**。
+  - 唯一增量（运维）：NVML **第七次恢复**（`is_available=True, device_count=2`），但 GPU0 36.6 GiB / 61% util、GPU1 23.3 GiB，`--query-compute-apps` 只认 3.9 GiB（pid 1789 `gen_data_v2.py`）⇒ GPU0 约 32.7 GiB 仍是无主残留；僵尸 1 个。**仍不可重跑。**
+  - `/tmp` 定稿产物 md5 逐位未变；两核心问题数字逐位不变：① `value` vs `random-matched` lm4 Δ=**−0.0054** (t=−1.03) / lm5 Δ=**−0.0274** (t=−0.50)，符号相反且均 ns；② `value` vs `value-nofb` lm4 Δ=−0.0024 (t=−0.41)、lm5 Δ 恒 0 ⇒ `λ_fb` 在 lm5 等价死项。
 - **2026-11-22 门控 cron 第十九次唤醒 = `DEAD`（第十三次）— benchmark 仍 0 新信息；唯一增量 = NVML **第六次**失效 + 僵尸 24→1（接近清零）**
   - 门控 diff 同型（`UNREACHABLE → DEAD`）= 6100 链路抖动恢复，**不是**新的完成/崩溃事件（19 次唤醒 0 次新 benchmark 信息）。
   - 作业要求的 `tail -30 results/bm2_driver.log` **无对象可 tail**：`/work/liuyuanjie/headless` 无 `results/`、无 `BM*_DONE`、无 `bm2_driver.log`；
