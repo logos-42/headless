@@ -11,6 +11,14 @@ status: current
 
 ## 最近更新
 
+- **2026-11-25 门控 cron 第二十四次唤醒 = `UNREACHABLE → DEAD`（第十八次 DEAD）— benchmark 仍 0 新信息；唯一实质增量 = 统计表述更正：`value vs random` 的 |t|=2.53 **不显著**（df=2，p=0.127）**
+  - 门控 diff 同型 = 6100 链路抖动恢复，**不是**新的完成/崩溃事件（24 次唤醒 0 次新 benchmark 信息）。
+  - `results/` 仍不存在，`BM*_DONE` / `bm2_driver.log` / `bm2_value_*` / `bm5b_*` 全盘 0 命中 ⇒ `tail -30` 无对象可 tail；driver md5 仍 `6f88c424…`、相关进程 0 ⇒ 中断点在 driver 第一条命令之前 ⇒ **本环境已完成臂 = 0**。
+  - GPU：NVML 可用；GPU0 **35,082 MiB / 3% util**、GPU1 **18,282 MiB / 0%**，`--query-compute-apps` **空** ⇒ 两卡全为无主残留，GPU0 仅余 ~5.9 GiB ⇒ lm4 stage A/B 仍 OOM ⇒ **仍不可重跑**。僵尸 33 → 15，load average 58.85。
+  - `/tmp` 四件 md5 逐位未变（`bm_report.json` `3b6dc4e1…`）；本地独立重解 8 lm4 臂 + 7 lm5 臂 × 3 seed 与 20 条 Welch，Δ/t/p 逐位一致。
+  - **统计更正**：逐条核 df 后，`value` vs `random` `final` t=−2.53 但 **df=2.0、p=0.127 ⇒ 不显著**；而在 bm_report.json 的 20 条对比中 p<0.05 只有 3 条（`value` vs `perm` +0.0210 p=0.034、`random-matched` vs `random` −0.0075 p=0.024、`nonstationary` vs `fixed` `worst` +0.1378 p=0.0034），其中 2 条与价值函数无关。
+  - 核心结论不变：① `value` vs `random-matched` lm4 Δ=−0.0054（t=−1.03）／lm5 Δ=−0.0274（t=−0.50）⇒ 符号相反、均 ns；② `value` vs `value-nofb` lm4 −0.0024（t=−0.41）、lm5 Δ 恒 0 ⇒ **`λ_fb` 在 lm5 等价死项**。
+
 - **2026-11-25 门控 cron 第二十三次唤醒 = `UNREACHABLE → DEAD`（第十七次 DEAD）— benchmark 仍 0 新信息；唯一实质增量 = GPU 上他人作业已结束（双卡 0% util、compute-apps 空），但两卡残留 35.1/16.0 GiB 仍在**
   - 门控 diff 同型 = 6100 链路抖动恢复，**不是**新的完成/崩溃事件（23 次唤醒 0 次新 benchmark 信息）。
   - `results/` 仍不存在，`BM*_DONE`/`bm2_driver.log`/`bm5b_*` 全盘 0 命中 ⇒ 作业要求的 `tail -30` 无对象可 tail；driver md5 仍 `6f88c424…`、相关进程 0 ⇒ 中断点在 driver 第一条命令之前 ⇒ **本环境已完成臂 = 0**。
